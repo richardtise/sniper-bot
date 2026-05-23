@@ -1,17 +1,15 @@
+import os
+import re
 import requests
 import time
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-import os
 import telebot
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -21,83 +19,183 @@ SCANNER_API_KEY = os.getenv('SCANNER_API_KEY')
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 CHAINS = ["bsc", "ethereum", "base"]
-SPIKE_MULTIPLIER = 8.0
-MIN_5MIN_VOLUME = 10000
-MIN_LIQUIDITY = 30000
-ALERT_COOLDOWN_MIN = 45
+CHAIN_IDS = {"bsc": 56, "ethereum": 1, "base": 8453}
+
+SPIKE_MULTIPLIER = 5.0
+MIN_5MIN_VOL = 3000
+MIN_LIQUIDITY_USD = 10000
+MAX_WHALE_PCT = 68.0
+ALERT_COOLDOWN_MIN = 25
+CHECK_INTERVAL_SEC = 40
+HEARTBEAT_INTERVAL_SEC = 3600
 
 seen_pairs = {}
 
-def fetch_hot_pairs():
-    try:
-        resp = requests.get("https://api.dexscreener.com/latest/dex/search?q=", timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("pairs", [])
-    except Exception as e:
-        logger.warning(f"Fetch error: {e}")
-        return []
+def escape_markdown(text):
+    if not isinstance(text, str):
+        return str(text)
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+def fetch_pairs():
+    queries = ["WBNB", "USDT", "ETH", ""]
+    all_pairs = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for q in queries:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={q}"
+            resp = requests.get(url, timeout=15, headers=headers)
+            resp.raise_for_status()
+            data = resp.json().get("pairs", [])
+            all_pairs.extend(data)
+            time.sleep(0.8)
+        except Exception as e:
+            logger.error(f"DexScreener query '{q}' failed: {e}")
+
+    logger.info(f"✅ Fetched {len(all_pairs)} pairs total")
+    return all_pairs
+
 
 def volume_spike_detected(pair):
     vol = pair.get("volume", {})
     v5 = float(vol.get("m5") or 0)
     v1h = float(vol.get("h1") or 0)
-    
-    if v5 < MIN_5MIN_VOLUME:
+
+    if v5 < MIN_5MIN_VOL:
         return False
     if v1h <= 0:
-        return v5 > 20000
-    return v5 > SPIKE_MULTIPLIER * (v1h / 12.0)
+        return v5 >= MIN_5MIN_VOL * 1.8
+    expected_5m = v1h / 12.0
+    return v5 > SPIKE_MULTIPLIER * expected_5m
 
-def send_telegram_alert(pair):
-    chain = pair["chainId"]
+
+def check_whale_concentration(token_address, chain):
+    if not SCANNER_API_KEY:
+        return True, "No API key"
+
+    chain_id = CHAIN_IDS.get(chain)
+    if not chain_id:
+        return True, "Unknown chain"
+
+    try:
+        base_url = "https://api.etherscan.io/v2/api"
+        params = {
+            "chainid": chain_id,
+            "module": "token",
+            "action": "tokenholderlist",
+            "contractaddress": token_address,
+            "page": 1,
+            "offset": 10,
+            "apikey": SCANNER_API_KEY
+        }
+        resp = requests.get(base_url, params=params, timeout=12)
+        holders = resp.json().get("result", [])
+
+        top10_raw = sum(int(h.get("TokenHolderQuantity", 0)) for h in holders)
+
+        ts_params = {**params, "action": "totalsupply"}
+        ts_resp = requests.get(base_url, params=ts_params, timeout=10)
+        total_raw = int(ts_resp.json().get("result", 1))
+
+        decimals = 18
+        try:
+            info_params = {**params, "action": "tokeninfo"}
+            info_resp = requests.get(base_url, params=info_params, timeout=10)
+            result = info_resp.json().get("result")
+            if isinstance(result, list) and result:
+                decimals = int(result[0].get("decimal", 18))
+        except:
+            pass
+
+        top10 = top10_raw / (10 ** decimals)
+        total = total_raw / (10 ** decimals)
+        concentration = (top10 / total * 100) if total > 0 else 0
+
+        is_low = concentration <= MAX_WHALE_PCT
+        return is_low, f"{concentration:.1f}% in top 10"
+
+    except Exception as e:
+        logger.error(f"Whale check failed: {e}")
+        return True, "Check failed"
+
+
+def send_telegram_alert(pair, whale_info):
+    chain = pair.get("chainId")
     base = pair.get("baseToken", {})
-    msg = f"""🚨 *POTENTIAL RUNNER DETECTED!*
+    name = escape_markdown(base.get("name", "Unknown"))
+    symbol = escape_markdown(base.get("symbol", "???"))
+    v5 = pair.get("volume", {}).get("m5", 0)
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    pair_addr = pair.get("pairAddress", "")
 
-🔥 {base.get('name')} ({base.get('symbol')})
+    msg = f"""🚨 *EARLY VOLUME PICKUP!*
+
+🔥 {name} ({symbol})
 🌐 Chain: {chain.upper()}
-💰 5min Volume: ${pair.get('volume', {}).get('m5', 0):,.0f}
-📊 Liquidity: ${pair.get('liquidity', {}).get('usd', 0):,.0f}
+💰 5min Vol: ${v5:,.0f}
+📊 Liquidity: ${liq:,.0f}
+🐳 {whale_info}
 
-🔗 https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}
+🔗 [DexScreener](https://dexscreener.com/{chain}/{pair_addr})
 """
     try:
-        bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
-        logger.info(f"Alert sent for {base.get('symbol')}")
+        bot.send_message(CHAT_ID, msg, parse_mode='Markdown', disable_web_page_preview=True)
+        logger.info(f"✅ ALERT SENT → {symbol}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
+
 # ===================== MAIN LOOP =====================
-logger.info("🚀 Sniper Bot Started (Strict Mode - Only Potential Runners)")
+logger.info("🚀 Sniper Bot Started – Early Volume + Low Whale Concentration")
+
+try:
+    bot.send_message(CHAT_ID, f"✅ Bot restarted at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+except:
+    pass
+
+last_heartbeat = datetime.now(timezone.utc)
 
 while True:
-    pairs = fetch_hot_pairs()
+    pairs = fetch_pairs()
     now = datetime.now(timezone.utc)
 
-    # Cleanup
-    for k in list(seen_pairs.keys()):
-        if (now - seen_pairs[k]) >= timedelta(hours=3):
-            del seen_pairs[k]
+    seen_pairs = {k: v for k, v in seen_pairs.items() if (now - v) < timedelta(hours=2)}
+
+    alerts_sent = 0
 
     for pair in pairs:
-        if pair.get("chainId") not in CHAINS:
+        chain = pair.get("chainId")
+        if chain not in CHAINS:
             continue
-        if pair.get("liquidity", {}).get("usd", 0) < MIN_LIQUIDITY:
+
+        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+        if liquidity < MIN_LIQUIDITY_USD:
             continue
         if not volume_spike_detected(pair):
             continue
 
         pair_addr = pair.get("pairAddress")
-        if not pair_addr:
-            continue
-        if pair_addr in seen_pairs and (now - seen_pairs[pair_addr]) < timedelta(minutes=ALERT_COOLDOWN_MIN):
+        if not pair_addr or (pair_addr in seen_pairs and (now - seen_pairs[pair_addr]) < timedelta(minutes=ALERT_COOLDOWN_MIN)):
             continue
 
-        send_telegram_alert(pair)
-        seen_pairs[pair_addr] = now
-        logger.info(f"🚨 Strong signal on {pair.get('baseToken', {}).get('symbol')}")
+        token_address = pair.get("baseToken", {}).get("address")
+        if not token_address:
+            continue
 
-    logger.info(f"Scanned {len(pairs)} pairs")
-    time.sleep(60)
+        is_low, whale_info = check_whale_concentration(token_address, chain)
 
+        if is_low:
+            send_telegram_alert(pair, whale_info)
+            seen_pairs[pair_addr] = now
+            alerts_sent += 1
 
+    if (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL_SEC:
+        try:
+            bot.send_message(CHAT_ID, f"🫀 Bot alive • {len(pairs)} pairs scanned")
+            last_heartbeat = now
+        except:
+            pass
 
+    logger.info(f"Cycle done – {len(pairs)} pairs, {alerts_sent} alerts sent")
+    time.sleep(CHECK_INTERVAL_SEC)
