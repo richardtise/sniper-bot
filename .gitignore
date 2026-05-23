@@ -1,4 +1,4 @@
-.env
-venv/
+bot-env/
 __pycache__/
-*.log
+*.pyc
+.env
