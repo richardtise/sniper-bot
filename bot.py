@@ -22,9 +22,9 @@ CHAINS = ["bsc", "ethereum", "base"]
 CHAIN_IDS = {"bsc": 56, "ethereum": 1, "base": 8453}
 
 SPIKE_MULTIPLIER = 5.0
-MIN_5MIN_VOL = 3000
-MIN_LIQUIDITY_USD = 10000
-MAX_WHALE_PCT = 68.0
+MIN_5MIN_VOL = 150000
+MIN_LIQUIDITY_USD = 30000
+MAX_WHALE_PCT = 75
 ALERT_COOLDOWN_MIN = 25
 CHECK_INTERVAL_SEC = 40
 HEARTBEAT_INTERVAL_SEC = 3600
@@ -38,7 +38,7 @@ def escape_markdown(text):
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def fetch_pairs():
-    queries = ["WBNB", "USDT", "ETH", ""]
+    queries = ["WBNB", "USDT", "ETH"]
     all_pairs = []
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -47,14 +47,20 @@ def fetch_pairs():
             url = f"https://api.dexscreener.com/latest/dex/search?q={q}"
             resp = requests.get(url, timeout=15, headers=headers)
             resp.raise_for_status()
-            data = resp.json().get("pairs", [])
-            all_pairs.extend(data)
+            pairs = resp.json().get("pairs", [])
+            all_pairs.extend(pairs)
             time.sleep(0.8)
         except Exception as e:
             logger.error(f"DexScreener query '{q}' failed: {e}")
 
-    logger.info(f"✅ Fetched {len(all_pairs)} pairs total")
-    return all_pairs
+    # Deduplicate
+    unique = {}
+    for p in all_pairs:
+        addr = p.get("pairAddress")
+        if addr and addr not in unique:
+            unique[addr] = p
+    logger.info(f"✅ Fetched {len(all_pairs)} pairs, {len(unique)} unique")
+    return list(unique.values())
 
 
 def volume_spike_detected(pair):
@@ -66,20 +72,19 @@ def volume_spike_detected(pair):
         return False
     if v1h <= 0:
         return v5 >= MIN_5MIN_VOL * 1.8
-    expected_5m = v1h / 12.0
-    return v5 > SPIKE_MULTIPLIER * expected_5m
+    expected = v1h / 12.0
+    return v5 > SPIKE_MULTIPLIER * expected
 
 
 def check_whale_concentration(token_address, chain):
-    if not SCANNER_API_KEY:
-        return True, "No API key"
+    if not SCANNER_API_KEY or not token_address:
+        return True, "No API key / invalid address"
 
     chain_id = CHAIN_IDS.get(chain)
     if not chain_id:
         return True, "Unknown chain"
 
     try:
-        base_url = "https://api.etherscan.io/v2/api"
         params = {
             "chainid": chain_id,
             "module": "token",
@@ -89,19 +94,19 @@ def check_whale_concentration(token_address, chain):
             "offset": 10,
             "apikey": SCANNER_API_KEY
         }
-        resp = requests.get(base_url, params=params, timeout=12)
+        resp = requests.get(SCANNER_V2_URL, params=params, timeout=12)
         holders = resp.json().get("result", [])
 
         top10_raw = sum(int(h.get("TokenHolderQuantity", 0)) for h in holders)
 
         ts_params = {**params, "action": "totalsupply"}
-        ts_resp = requests.get(base_url, params=ts_params, timeout=10)
+        ts_resp = requests.get(SCANNER_V2_URL, params=ts_params, timeout=10)
         total_raw = int(ts_resp.json().get("result", 1))
 
         decimals = 18
         try:
             info_params = {**params, "action": "tokeninfo"}
-            info_resp = requests.get(base_url, params=info_params, timeout=10)
+            info_resp = requests.get(SCANNER_V2_URL, params=info_params, timeout=10)
             result = info_resp.json().get("result")
             if isinstance(result, list) and result:
                 decimals = int(result[0].get("decimal", 18))
@@ -149,8 +154,9 @@ def send_telegram_alert(pair, whale_info):
 # ===================== MAIN LOOP =====================
 logger.info("🚀 Sniper Bot Started – Early Volume + Low Whale Concentration")
 
+# Startup notification
 try:
-    bot.send_message(CHAT_ID, f"✅ Bot restarted at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    bot.send_message(CHAT_ID, f"✅ Bot started at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 except:
     pass
 
@@ -180,7 +186,7 @@ while True:
             continue
 
         token_address = pair.get("baseToken", {}).get("address")
-        if not token_address:
+        if not token_address or "0x" not in token_address.lower():
             continue
 
         is_low, whale_info = check_whale_concentration(token_address, chain)
@@ -192,10 +198,10 @@ while True:
 
     if (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL_SEC:
         try:
-            bot.send_message(CHAT_ID, f"🫀 Bot alive • {len(pairs)} pairs scanned")
+            bot.send_message(CHAT_ID, f"🫀 Bot is alive • {len(pairs)} pairs scanned")
             last_heartbeat = now
         except:
             pass
 
-    logger.info(f"Cycle done – {len(pairs)} pairs, {alerts_sent} alerts sent")
+    logger.info(f"Cycle done – {len(pairs)} pairs checked, {alerts_sent} alerts sent")
     time.sleep(CHECK_INTERVAL_SEC)
