@@ -3,6 +3,7 @@ import aiohttp
 import time
 import os
 import logging
+from collections import deque
 from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 from telegram import Bot
@@ -17,19 +18,30 @@ CHAT_ID = os.getenv("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
-ETHERSCAN_KEY = os.getenv("ETHERSCAN_API_KEY")
-BSCSCAN_KEY = os.getenv("BSCSCAN_API_KEY")
-BASESCAN_KEY = os.getenv("BASESCAN_API_KEY")
-SCANNER_KEY = os.getenv("SCANNER_API_KEY")
+# Single API key for all EVM explorers (Etherscan v2 works on BSCScan & BaseScan too)
+SCANNER_API_KEY = os.getenv("SCANNER_API_KEY")
+if not SCANNER_API_KEY:
+    raise ValueError("Missing SCANNER_API_KEY in .env")
 
 NETWORKS = ["ethereum", "bsc", "base"]
 SCAN_INTERVAL = 20
 TOP10_THRESHOLD = 80.0
 MIN_VOLUME_SPIKE_RATIO = 1.0
-MIN_LIQUIDITY_USD = 30000.0          # <-- NEW
+MIN_LIQUIDITY_USD = 30000.0
+HEARTBEAT_INTERVAL = 3600
 
+# Internal state
 seen_pairs = set()
 holder_cache = {}
+
+# Statistics
+total_pairs_scanned = 0
+alerts_sent = 0
+start_time = None
+last_heartbeat_time = None
+last_scan_pairs = {}
+last_scan_total = 0
+hourly_pair_counts = deque()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,31 +80,21 @@ def check_volume_spike(pair: Dict) -> Tuple[bool, float]:
     ratio = vol_m5 / vol_h1
     return ratio > MIN_VOLUME_SPIKE_RATIO, ratio
 
-# ---------- TOP 10 HOLDERS ----------
-def get_api_key(chain: str) -> str:
-    if chain == "ethereum":
-        return ETHERSCAN_KEY or SCANNER_KEY
-    elif chain == "bsc":
-        return BSCSCAN_KEY or SCANNER_KEY
-    elif chain == "base":
-        return BASESCAN_KEY or SCANNER_KEY
-    return SCANNER_KEY
-
-async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str, token: str) -> Tuple[float, bool]:
-    api_key = get_api_key(chain)
-    if not api_key:
-        return 0.0, False
-
-    base_urls = {
+# ---------- TOP 10 HOLDERS (Single API Key) ----------
+def get_explorer_base_url(chain: str) -> str:
+    return {
         "ethereum": "https://api.etherscan.io/api",
         "bsc": "https://api.bscscan.com/api",
         "base": "https://api.basescan.org/api"
-    }
-    base = base_urls.get(chain)
-    if not base:
+    }.get(chain)
+
+async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str, token: str) -> Tuple[float, bool]:
+    base_url = get_explorer_base_url(chain)
+    if not base_url:
         return 0.0, False
 
-    supply_url = f"{base}?module=stats&action=tokensupply&contractaddress={token}&apikey={api_key}"
+    # Total supply
+    supply_url = f"{base_url}?module=stats&action=tokensupply&contractaddress={token}&apikey={SCANNER_API_KEY}"
     supply_data = await fetch_json(session, supply_url)
     if not supply_data or supply_data.get("status") != "1":
         return 0.0, False
@@ -100,7 +102,8 @@ async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str,
     if total_supply == 0:
         return 0.0, False
 
-    holder_url = f"{base}?module=token&action=tokenholderlist&contractaddress={token}&page=1&offset=10&apikey={api_key}"
+    # Top 10 holders
+    holder_url = f"{base_url}?module=token&action=tokenholderlist&contractaddress={token}&page=1&offset=10&apikey={SCANNER_API_KEY}"
     holder_data = await fetch_json(session, holder_url)
     if not holder_data or holder_data.get("status") != "1":
         return 0.0, False
@@ -115,7 +118,7 @@ async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str,
 
     return current_pct, accumulating
 
-# ---------- MAIN EVALUATION (WITH LIQUIDITY FILTER) ----------
+# ---------- MAIN EVALUATION ----------
 async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[Dict]:
     chain = pair.get("chainId")
     token = pair.get("baseToken", {}).get("address")
@@ -123,7 +126,6 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[
     if not chain or not token or not pair_id:
         return None
 
-    # Liquidity filter
     liquidity = float(pair.get("liquidity", {}).get("usd", 0))
     if liquidity < MIN_LIQUIDITY_USD:
         return None
@@ -158,11 +160,13 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[
 
 # ---------- TELEGRAM ALERT ----------
 async def send_alert(alert: Dict):
+    global alerts_sent
+    alerts_sent += 1
     text = (
         f"🚨 <b>EARLY PUMP SIGNAL</b> 🚨\n\n"
         f"<b>{alert['token_name']}</b> ({alert['symbol']})\n"
         f"🔗 <b>{alert['chain']}</b>\n"
-        f"💰 Liquidity: <b>${alert['liquidity_usd']:,.0f}</b> (min $30k)\n"
+        f"💰 Liquidity: <b>${alert['liquidity_usd']:,.0f}</b>\n"
         f"📊 5m Vol: ${alert['volume_5m']:,.0f}  |  1h Vol: ${alert['volume_1h']:,.0f}\n"
         f"⚡ Volume spike: <b>{alert['spike_ratio']}x</b> (5m > 1h)\n\n"
         f"👥 Top10 holders: <b>{alert['top10_pct']}%</b>\n"
@@ -176,22 +180,76 @@ async def send_alert(alert: Dict):
     except TelegramError as e:
         logger.error(f"Telegram error: {e}")
 
+# ---------- HEARTBEAT ----------
+async def send_heartbeat():
+    uptime_sec = time.time() - start_time
+    uptime_hours = uptime_sec / 3600
+    uptime_str = f"{int(uptime_sec // 3600)}h {int((uptime_sec % 3600) // 60)}m"
+
+    # Calculate pairs scanned in the last hour
+    now = time.time()
+    while hourly_pair_counts and hourly_pair_counts[0][0] < now - 3600:
+        hourly_pair_counts.popleft()
+    pairs_last_hour = sum(cnt for _, cnt in hourly_pair_counts)
+
+    text = (
+        f"💓 <b>Bot Heartbeat</b>\n\n"
+        f"⏱ Uptime: {uptime_str} ({uptime_hours:.1f}h)\n"
+        f"🔍 Total pairs scanned: <b>{total_pairs_scanned:,}</b>\n"
+        f"📊 Pairs scanned (last hour): <b>{pairs_last_hour:,}</b>\n"
+        f"🆕 Unique pairs in cache: <b>{len(seen_pairs):,}</b>\n"
+        f"🚨 Alerts sent: <b>{alerts_sent}</b>\n"
+        f"⏱ Last scan: {last_scan_total} pairs total across all chains\n"
+        f"   └─ {', '.join([f'{net}: {last_scan_pairs.get(net,0)}' for net in NETWORKS])}\n"
+        f"⚙️ Scan interval: {SCAN_INTERVAL}s | Min liq: ${MIN_LIQUIDITY_USD:,.0f}"
+    )
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+        logger.info("Heartbeat sent")
+    except TelegramError as e:
+        logger.error(f"Heartbeat failed: {e}")
+
 # ---------- SCAN LOOP ----------
 async def scan_loop():
+    global total_pairs_scanned, last_scan_pairs, last_scan_total, alerts_sent
+    global last_heartbeat_time, hourly_pair_counts
+
     async with aiohttp.ClientSession() as session:
         while True:
+            scan_start = time.time()
+            total_this_cycle = 0
+            cycle_pair_counts = {}
+
             for network in NETWORKS:
                 try:
-                    logger.info(f"Scanning {network} (liquidity ≥ ${MIN_LIQUIDITY_USD:,.0f})...")
+                    logger.info(f"Scanning {network}...")
                     pairs = await get_all_pairs(session, network)
+                    count_network = 0
                     for pair in pairs[:300]:
+                        count_network += 1
+                        total_pairs_scanned += 1
+                        total_this_cycle += 1
                         alert = await evaluate_pair(session, pair)
                         if alert:
                             await send_alert(alert)
                             await asyncio.sleep(1)
+                    cycle_pair_counts[network] = count_network
+                    logger.info(f"Scanned {count_network} pairs on {network}")
                 except Exception as e:
                     logger.error(f"Error on {network}: {e}")
-            await asyncio.sleep(SCAN_INTERVAL)
+                    cycle_pair_counts[network] = 0
+
+            last_scan_pairs = cycle_pair_counts
+            last_scan_total = total_this_cycle
+            hourly_pair_counts.append((time.time(), total_this_cycle))
+
+            if not last_heartbeat_time or (time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL):
+                await send_heartbeat()
+                last_heartbeat_time = time.time()
+
+            elapsed = time.time() - scan_start
+            sleep_time = max(0, SCAN_INTERVAL - elapsed)
+            await asyncio.sleep(sleep_time)
 
 # ---------- STARTUP ----------
 async def startup():
@@ -201,14 +259,18 @@ async def startup():
              f"Filters:\n"
              f"• 5m volume > 1h volume spike\n"
              f"• Top10 holders > 80% and accumulating\n"
-             f"• Minimum liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
-             f"Scanning all pairs on Ethereum, BSC, Base.",
+             f"• Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
+             f"Heartbeat every {HEARTBEAT_INTERVAL//60} minutes.\n"
+             f"Using single SCANNER_API_KEY for all chains.",
         parse_mode=ParseMode.HTML
     )
 
 # ---------- MAIN ----------
 async def main():
-    logger.info("Starting two‑signal pump bot with $30k liquidity filter")
+    global start_time, last_heartbeat_time
+    start_time = time.time()
+    last_heartbeat_time = start_time
+    logger.info("Starting pump bot (single API key)")
     await startup()
     await scan_loop()
 
