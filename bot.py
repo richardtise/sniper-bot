@@ -18,7 +18,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
-# Single API key for all EVM explorers (Etherscan v2 works on BSCScan & BaseScan too)
 SCANNER_API_KEY = os.getenv("SCANNER_API_KEY")
 if not SCANNER_API_KEY:
     raise ValueError("Missing SCANNER_API_KEY in .env")
@@ -26,7 +25,8 @@ if not SCANNER_API_KEY:
 NETWORKS = ["ethereum", "bsc", "base"]
 SCAN_INTERVAL = 20
 TOP10_THRESHOLD = 80.0
-MIN_VOLUME_SPIKE_RATIO = 1.0
+MIN_VOLUME_SPIKE_RATIO = 1.0          # 5m volume > 1h volume
+MIN_1H_24H_RATIO = 0.2                # NEW: 1h volume > 20% of 24h volume
 MIN_LIQUIDITY_USD = 30000.0
 HEARTBEAT_INTERVAL = 3600
 
@@ -71,7 +71,7 @@ async def get_all_pairs(session: aiohttp.ClientSession, network: str):
     pairs.sort(key=lambda x: float(x.get("volume", {}).get("m5", 0)), reverse=True)
     return pairs
 
-# ---------- VOLUME SPIKE ----------
+# ---------- VOLUME SPIKE (5m > 1h) ----------
 def check_volume_spike(pair: Dict) -> Tuple[bool, float]:
     vol_m5 = float(pair.get("volume", {}).get("m5", 0))
     vol_h1 = float(pair.get("volume", {}).get("h1", 0))
@@ -80,7 +80,17 @@ def check_volume_spike(pair: Dict) -> Tuple[bool, float]:
     ratio = vol_m5 / vol_h1
     return ratio > MIN_VOLUME_SPIKE_RATIO, ratio
 
-# ---------- TOP 10 HOLDERS (Single API Key) ----------
+# ---------- NEW: 1h vs 24h volume ratio ----------
+def check_1h_24h_ratio(pair: Dict) -> Tuple[bool, float]:
+    vol_h1 = float(pair.get("volume", {}).get("h1", 0))
+    vol_h24 = float(pair.get("volume", {}).get("h24", 0))
+    if vol_h24 == 0:
+        # If no 24h volume, any positive 1h volume is a spike
+        return vol_h1 > 0, 999.0 if vol_h1 > 0 else 0.0
+    ratio = vol_h1 / vol_h24
+    return ratio > MIN_1H_24H_RATIO, ratio
+
+# ---------- TOP 10 HOLDERS ----------
 def get_explorer_base_url(chain: str) -> str:
     return {
         "ethereum": "https://api.etherscan.io/api",
@@ -93,7 +103,6 @@ async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str,
     if not base_url:
         return 0.0, False
 
-    # Total supply
     supply_url = f"{base_url}?module=stats&action=tokensupply&contractaddress={token}&apikey={SCANNER_API_KEY}"
     supply_data = await fetch_json(session, supply_url)
     if not supply_data or supply_data.get("status") != "1":
@@ -102,7 +111,6 @@ async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str,
     if total_supply == 0:
         return 0.0, False
 
-    # Top 10 holders
     holder_url = f"{base_url}?module=token&action=tokenholderlist&contractaddress={token}&page=1&offset=10&apikey={SCANNER_API_KEY}"
     holder_data = await fetch_json(session, holder_url)
     if not holder_data or holder_data.get("status") != "1":
@@ -136,8 +144,11 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[
     if len(seen_pairs) > 5000:
         seen_pairs.clear()
 
-    spike, ratio = check_volume_spike(pair)
-    if not spike:
+    # Check volume spikes – either 5m > 1h OR 1h > 20% of 24h
+    spike_5m_1h, spike_ratio_5m = check_volume_spike(pair)
+    spike_1h_24h, spike_ratio_1h = check_1h_24h_ratio(pair)
+    
+    if not (spike_5m_1h or spike_1h_24h):
         return None
 
     top10_pct, accumulating = await get_top10_and_accumulation(session, chain, token)
@@ -152,7 +163,9 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[
         "liquidity_usd": liquidity,
         "volume_5m": float(pair.get("volume", {}).get("m5", 0)),
         "volume_1h": float(pair.get("volume", {}).get("h1", 0)),
-        "spike_ratio": round(ratio, 2),
+        "volume_24h": float(pair.get("volume", {}).get("h24", 0)),
+        "spike_ratio_5m": round(spike_ratio_5m, 2),
+        "spike_ratio_1h_24h": round(spike_ratio_1h, 2),
         "top10_pct": round(top10_pct, 2),
         "accumulating": accumulating,
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}"
@@ -162,13 +175,22 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: Dict) -> Optional[
 async def send_alert(alert: Dict):
     global alerts_sent
     alerts_sent += 1
+    
+    # Determine which spike triggered the alert
+    trigger = []
+    if alert['spike_ratio_5m'] > 1.0:
+        trigger.append(f"5m vol {alert['spike_ratio_5m']}x > 1h")
+    if alert['spike_ratio_1h_24h'] > MIN_1H_24H_RATIO:
+        trigger.append(f"1h vol = {alert['spike_ratio_1h_24h']*100:.0f}% of 24h")
+    trigger_text = " + ".join(trigger)
+    
     text = (
         f"🚨 <b>EARLY PUMP SIGNAL</b> 🚨\n\n"
         f"<b>{alert['token_name']}</b> ({alert['symbol']})\n"
         f"🔗 <b>{alert['chain']}</b>\n"
         f"💰 Liquidity: <b>${alert['liquidity_usd']:,.0f}</b>\n"
-        f"📊 5m Vol: ${alert['volume_5m']:,.0f}  |  1h Vol: ${alert['volume_1h']:,.0f}\n"
-        f"⚡ Volume spike: <b>{alert['spike_ratio']}x</b> (5m > 1h)\n\n"
+        f"📊 5m Vol: ${alert['volume_5m']:,.0f}  |  1h Vol: ${alert['volume_1h']:,.0f}  |  24h Vol: ${alert['volume_24h']:,.0f}\n"
+        f"⚡ Volume spikes: {trigger_text}\n\n"
         f"👥 Top10 holders: <b>{alert['top10_pct']}%</b>\n"
         f"📈 Accumulating: {'✅ YES' if alert['accumulating'] else '❌ NO'}\n\n"
         f"🔗 <a href='{alert['dex_url']}'>DexScreener</a>\n\n"
@@ -186,7 +208,6 @@ async def send_heartbeat():
     uptime_hours = uptime_sec / 3600
     uptime_str = f"{int(uptime_sec // 3600)}h {int((uptime_sec % 3600) // 60)}m"
 
-    # Calculate pairs scanned in the last hour
     now = time.time()
     while hourly_pair_counts and hourly_pair_counts[0][0] < now - 3600:
         hourly_pair_counts.popleft()
@@ -201,7 +222,7 @@ async def send_heartbeat():
         f"🚨 Alerts sent: <b>{alerts_sent}</b>\n"
         f"⏱ Last scan: {last_scan_total} pairs total across all chains\n"
         f"   └─ {', '.join([f'{net}: {last_scan_pairs.get(net,0)}' for net in NETWORKS])}\n"
-        f"⚙️ Scan interval: {SCAN_INTERVAL}s | Min liq: ${MIN_LIQUIDITY_USD:,.0f}"
+        f"⚙️ Scan interval: {SCAN_INTERVAL}s | Min liq: ${MIN_LIQUIDITY_USD:,.0f} | 1h/24h threshold: {MIN_1H_24H_RATIO*100:.0f}%"
     )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
@@ -258,7 +279,8 @@ async def startup():
         text=f"✅ <b>Pump Bot Active</b>\n\n"
              f"Filters:\n"
              f"• 5m volume > 1h volume spike\n"
-             f"• Top10 holders > 80% and accumulating\n"
+             f"• <b>OR 1h volume > {MIN_1H_24H_RATIO*100:.0f}% of 24h volume</b>\n"
+             f"• Top10 holders > {TOP10_THRESHOLD}% and accumulating\n"
              f"• Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
              f"Heartbeat every {HEARTBEAT_INTERVAL//60} minutes.\n"
              f"Using single SCANNER_API_KEY for all chains.",
@@ -270,7 +292,7 @@ async def main():
     global start_time, last_heartbeat_time
     start_time = time.time()
     last_heartbeat_time = start_time
-    logger.info("Starting pump bot (single API key)")
+    logger.info("Starting pump bot with 1h/24h volume filter")
     await startup()
     await scan_loop()
 
