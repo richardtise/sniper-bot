@@ -7,13 +7,13 @@ import signal
 from collections import deque
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.error import TelegramError
 from telegram.constants import ParseMode
 from fastapi import FastAPI
 import uvicorn
-import threading
 
 load_dotenv()
 
@@ -24,25 +24,28 @@ SCANNER_API_KEY = os.getenv("SCANNER_API_KEY")
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
+if not SCANNER_API_KEY:
+    raise ValueError("Missing SCANNER_API_KEY in .env")
 
 NETWORKS = ["bsc", "ethereum", "base"]
 SCAN_INTERVAL = 30
-HEARTBEAT_INTERVAL = 3600
+HEARTBEAT_INTERVAL = 3600          # 1 hour
 
 TOP10_THRESHOLD = 80.0
-MIN_LIQUIDITY_USD = 30000.0          # <-- FIXED: back to 30k
-MIN_VOLUME_SPIKE_RATIO = 1.0
-MIN_VOLUME_RATIO_1H_24H = 0.20
+MIN_LIQUIDITY_USD = 30000.0        # $30k as you originally wanted
+MIN_VOLUME_SPIKE_RATIO = 1.0       # 5m > 1h
+MIN_VOLUME_RATIO_1H_24H = 0.20     # 1h > 20% of 24h
 
 # ===================== GLOBALS =====================
 seen_pairs = set()
-holder_cache = {}                     # token -> last top10%
+holder_cache = {}                  # token -> last top10%
 total_pairs_scanned = 0
 alerts_sent = 0
 start_time = 0.0
 last_heartbeat_time = 0.0
 shutdown_flag = False
 
+# Rate limiter for explorer APIs
 api_rate_limiter = asyncio.Semaphore(5)
 
 logging.basicConfig(
@@ -54,8 +57,19 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ===================== FASTAPI =====================
-app = FastAPI()
+# ===================== FASTAPI LIFESPAN =====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: launch bot as a background task
+    logger.info("🚀 Lifespan startup: starting bot task...")
+    bot_task = asyncio.create_task(main_bot())
+    yield
+    # Shutdown: cancel bot task gracefully
+    logger.info("Shutdown signal received, cancelling bot task...")
+    bot_task.cancel()
+    await bot_task
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 @app.get("/health")
@@ -132,7 +146,7 @@ async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional
     if len(seen_pairs) > 10000:
         seen_pairs.clear()
 
-    # Volume spike (OR)
+    # Volume spike (OR condition)
     vol5 = float(pair.get("volume", {}).get("m5", 0))
     vol1h = float(pair.get("volume", {}).get("h1", 0))
     vol24h = float(pair.get("volume", {}).get("h24", 0))
@@ -149,12 +163,11 @@ async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional
     if not spike:
         return None
 
-    # Holder concentration
     current_pct = await get_top10_percent(session, chain, token)
     if current_pct < TOP10_THRESHOLD:
         return None
 
-    # Calculate accumulation (extra info, not a gate)
+    # Calculate accumulation (extra info)
     prev_pct = holder_cache.get(token, current_pct)
     accumulating = current_pct > prev_pct
     holder_cache[token] = current_pct
@@ -181,7 +194,7 @@ async def send_alert(alert: Dict):
 
     acc_text = " (accumulating)" if alert["accumulating"] else " (not accumulating)"
     if alert.get("prev_top10_pct"):
-        acc_text += f" – previous: {alert['prev_top10_pct']}%"
+        acc_text += f" – prev: {alert['prev_top10_pct']}%"
     else:
         acc_text += " – first time seen"
 
@@ -198,7 +211,7 @@ async def send_alert(alert: Dict):
     )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        logger.info(f"✅ Alert sent → {alert['symbol']} (top10={alert['top10_pct']}%, accum={alert['accumulating']})")
+        logger.info(f"Alert sent → {alert['symbol']} (top10={alert['top10_pct']}%, accum={alert['accumulating']})")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
@@ -224,7 +237,6 @@ async def scan_loop():
         while not shutdown_flag:
             cycle_start = time.time()
 
-            # Heartbeat check
             if time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                 await send_heartbeat()
                 last_heartbeat_time = time.time()
@@ -237,24 +249,23 @@ async def scan_loop():
                 for pair in pairs:
                     if shutdown_flag:
                         break
-                    total_pairs_scanned += 1   # <-- NOW INCREMENTED
+                    total_pairs_scanned += 1
                     alert = await evaluate_token(session, pair)
                     if alert:
                         await send_alert(alert)
                         await asyncio.sleep(1)
                 logger.info(f"Scanned {len(pairs)} pairs on {network}")
 
-            # Wait for next scan
             elapsed = time.time() - cycle_start
             sleep_time = max(0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_time)
 
-# ===================== STARTUP =====================
+# ===================== BOT MAIN =====================
 async def main_bot():
     global start_time, last_heartbeat_time
     start_time = time.time()
     last_heartbeat_time = start_time
-    logger.info("🚀 Crime Pump Bot Started")
+    logger.info("🚀 Crime Pump Bot started (lifespan managed)")
     await bot.send_message(
         chat_id=CHAT_ID,
         text=(
@@ -263,36 +274,22 @@ async def main_bot():
             f"• Volume spike: 5m>1h OR 1h>20%24h\n"
             f"• Top10 holders > {TOP10_THRESHOLD}% (accumulation status extra)\n"
             f"• Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
-            f"Scanning ALL pairs (no age limit) on {', '.join(NETWORKS)}.\n"
+            f"Scanning ALL pairs on {', '.join(NETWORKS)}.\n"
             f"Heartbeat every hour."
         ),
         parse_mode=ParseMode.HTML
     )
     await scan_loop()
 
-# ===================== SHUTDOWN (Graceful) =====================
-def shutdown_handler(sig, frame):
-    global shutdown_flag
-    logger.info("Shutdown signal received – stopping bot...")
-    shutdown_flag = True
-    # Give bot time to finish current scan and send final message
-    time.sleep(3)
-    os._exit(0)
-
 # ===================== ENTRY POINT =====================
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    # Signal handlers for graceful exit
+    def signal_handler(sig, frame):
+        logger.info("Received shutdown signal, exiting...")
+        os._exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    # Run bot in background
-    def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main_bot())
-
-    threading.Thread(target=run_bot, daemon=True).start()
-
-    # Run FastAPI for Render
     port = int(os.getenv("PORT", 10000))
     logger.info(f"FastAPI server running on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
