@@ -27,24 +27,22 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 
 NETWORKS = ["bsc", "ethereum", "base"]
 SCAN_INTERVAL = 30
-HEARTBEAT_INTERVAL = 3600          # 1 hour
+HEARTBEAT_INTERVAL = 3600
 
 TOP10_THRESHOLD = 80.0
-MIN_LIQUIDITY_USD = 25000.0
-MIN_VOLUME_SPIKE_RATIO = 1.0       # 5m > 1h
-MIN_VOLUME_RATIO_1H_24H = 0.20     # 1h > 20% of 24h
+MIN_LIQUIDITY_USD = 30000.0          # <-- FIXED: back to 30k
+MIN_VOLUME_SPIKE_RATIO = 1.0
+MIN_VOLUME_RATIO_1H_24H = 0.20
 
 # ===================== GLOBALS =====================
 seen_pairs = set()
-holder_cache = {}                  # token -> last top10%
+holder_cache = {}                     # token -> last top10%
 total_pairs_scanned = 0
 alerts_sent = 0
 start_time = 0.0
 last_heartbeat_time = 0.0
 shutdown_flag = False
-hourly_pair_counts = deque(maxlen=200)
 
-# Rate limiter for explorer APIs
 api_rate_limiter = asyncio.Semaphore(5)
 
 logging.basicConfig(
@@ -56,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ===================== FASTAPI (Render Keep-Alive) =====================
+# ===================== FASTAPI =====================
 app = FastAPI()
 
 @app.get("/")
@@ -85,9 +83,7 @@ async def get_all_pairs(session: aiohttp.ClientSession, network: str) -> List[Di
     if not data or "pairs" not in data:
         return []
     pairs = data["pairs"]
-    # Sort by 5m volume (highest first) – catches active pumps early
     pairs.sort(key=lambda x: float(x.get("volume", {}).get("m5", 0)), reverse=True)
-    # Limit to top 300 to manage rate limits
     return pairs[:300]
 
 async def get_top10_percent(session: aiohttp.ClientSession, chain: str, token: str) -> float:
@@ -123,22 +119,20 @@ async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional
     chain = pair.get("chainId")
     token = pair.get("baseToken", {}).get("address")
     pair_id = pair.get("pairAddress")
-    if not chain or not token or not pair_id:
+    if not all([chain, token, pair_id]):
         return None
 
-    # Liquidity filter
     liquidity = float(pair.get("liquidity", {}).get("usd", 0))
     if liquidity < MIN_LIQUIDITY_USD:
         return None
 
-    # Deduplicate
     if pair_id in seen_pairs:
         return None
     seen_pairs.add(pair_id)
     if len(seen_pairs) > 10000:
         seen_pairs.clear()
 
-    # Volume spike detection (OR condition)
+    # Volume spike (OR)
     vol5 = float(pair.get("volume", {}).get("m5", 0))
     vol1h = float(pair.get("volume", {}).get("h1", 0))
     vol24h = float(pair.get("volume", {}).get("h24", 0))
@@ -160,12 +154,11 @@ async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional
     if current_pct < TOP10_THRESHOLD:
         return None
 
-    # Calculate accumulation status (extra info, not a gate)
+    # Calculate accumulation (extra info, not a gate)
     prev_pct = holder_cache.get(token, current_pct)
     accumulating = current_pct > prev_pct
     holder_cache[token] = current_pct
 
-    # Alert always sent if top10 >= threshold, regardless of accumulating
     return {
         "token_name": pair.get("baseToken", {}).get("name", "Unknown"),
         "symbol": pair.get("baseToken", {}).get("symbol", "???"),
@@ -186,9 +179,9 @@ async def send_alert(alert: Dict):
     global alerts_sent
     alerts_sent += 1
 
-    acc_text = " (accumulating)" if alert["accumulating"] else " (not accumulating or stable)"
+    acc_text = " (accumulating)" if alert["accumulating"] else " (not accumulating)"
     if alert.get("prev_top10_pct"):
-        acc_text += f" – prev: {alert['prev_top10_pct']}%"
+        acc_text += f" – previous: {alert['prev_top10_pct']}%"
     else:
         acc_text += " – first time seen"
 
@@ -200,8 +193,8 @@ async def send_alert(alert: Dict):
         f"📊 5m Vol: <b>${alert['vol_5m']:,.0f}</b>  |  1h Vol: ${alert['vol_1h']:,.0f}  |  24h Vol: ${alert['vol_24h']:,.0f}\n"
         f"⚡ Spike: <b>{alert['spike_type']}</b>\n"
         f"👥 Top10 holders: <b>{alert['top10_pct']}%</b>{acc_text}\n\n"
-        f"🔗 <a href='{alert['dex_url']}'>View on DexScreener</a>\n\n"
-        f"<i>⚠️ Extremely high risk – verify sell before buying.</i>"
+        f"🔗 <a href='{alert['dex_url']}'>DexScreener</a>\n\n"
+        f"<i>⚠️ Extremely high risk – verify you can sell before buying.</i>"
     )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -224,7 +217,7 @@ async def send_heartbeat():
     except Exception as e:
         logger.error(f"Heartbeat failed: {e}")
 
-# ===================== MAIN SCAN LOOP =====================
+# ===================== SCAN LOOP =====================
 async def scan_loop():
     global total_pairs_scanned, last_heartbeat_time
     async with aiohttp.ClientSession() as session:
@@ -241,19 +234,17 @@ async def scan_loop():
                     break
                 logger.info(f"Scanning {network}...")
                 pairs = await get_all_pairs(session, network)
-                network_count = 0
                 for pair in pairs:
                     if shutdown_flag:
                         break
-                    network_count += 1
-                    total_pairs_scanned += 1
+                    total_pairs_scanned += 1   # <-- NOW INCREMENTED
                     alert = await evaluate_token(session, pair)
                     if alert:
                         await send_alert(alert)
-                        await asyncio.sleep(1)   # avoid Telegram flood
-                logger.info(f"Scanned {network_count} pairs on {network}")
+                        await asyncio.sleep(1)
+                logger.info(f"Scanned {len(pairs)} pairs on {network}")
 
-            # Wait until next full scan
+            # Wait for next scan
             elapsed = time.time() - cycle_start
             sleep_time = max(0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_time)
@@ -279,26 +270,27 @@ async def main_bot():
     )
     await scan_loop()
 
-# ===================== ENTRY POINT =====================
+# ===================== SHUTDOWN (Graceful) =====================
 def shutdown_handler(sig, frame):
     global shutdown_flag
     logger.info("Shutdown signal received – stopping bot...")
     shutdown_flag = True
+    # Give bot time to finish current scan and send final message
     time.sleep(3)
     os._exit(0)
 
+# ===================== ENTRY POINT =====================
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Run bot in background daemon thread with proper event loop
+    # Run bot in background
     def run_bot():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(main_bot())
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    threading.Thread(target=run_bot, daemon=True).start()
 
     # Run FastAPI for Render
     port = int(os.getenv("PORT", 10000))
