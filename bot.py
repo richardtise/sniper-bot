@@ -5,7 +5,7 @@ import os
 import logging
 import signal
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Bot
@@ -17,38 +17,34 @@ import threading
 
 load_dotenv()
 
-# ---------- CONFIGURATION ----------
+# ===================== CONFIG =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+SCANNER_API_KEY = os.getenv("SCANNER_API_KEY")
+
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
-SCANNER_API_KEY = os.getenv("SCANNER_API_KEY")
-if not SCANNER_API_KEY:
-    raise ValueError("Missing SCANNER_API_KEY in .env")
-
-NETWORKS = ["ethereum", "bsc", "base"]
+NETWORKS = ["bsc", "ethereum", "base"]
 SCAN_INTERVAL = 30
-HEARTBEAT_INTERVAL = 3600
+HEARTBEAT_INTERVAL = 3600          # 1 hour
+
 TOP10_THRESHOLD = 80.0
-MIN_LIQUIDITY_USD = 30000.0
-SEEN_PAIRS_CLEANUP = 10000
+MIN_LIQUIDITY_USD = 25000.0
+MIN_VOLUME_SPIKE_RATIO = 1.0       # 5m > 1h
+MIN_VOLUME_RATIO_1H_24H = 0.20     # 1h > 20% of 24h
 
-# Volume spike conditions (OR)
-MIN_VOLUME_SPIKE_RATIO_5M_1H = 1.0       # 5m > 1h
-MIN_VOLUME_RATIO_1H_24H = 0.20          # 1h > 20% of 24h
-
-# Internal state
+# ===================== GLOBALS =====================
 seen_pairs = set()
-holder_cache = {}
+holder_cache = {}                  # token -> last top10%
 total_pairs_scanned = 0
 alerts_sent = 0
 start_time = 0.0
 last_heartbeat_time = 0.0
 shutdown_flag = False
-hourly_pair_counts = deque()
-last_scan_stats = {"total": 0, "per_network": {}}
+hourly_pair_counts = deque(maxlen=200)
 
+# Rate limiter for explorer APIs
 api_rate_limiter = asyncio.Semaphore(5)
 
 logging.basicConfig(
@@ -60,99 +56,69 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- FASTAPI ----------
+# ===================== FASTAPI (Render Keep-Alive) =====================
 app = FastAPI()
 
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    uptime_sec = time.time() - start_time
-    uptime_str = f"{int(uptime_sec//3600)}h {int((uptime_sec%3600)//60)}m"
+    uptime = (time.time() - start_time) / 3600
     return {
         "status": "alive",
-        "uptime": uptime_str,
-        "total_pairs_scanned": total_pairs_scanned,
-        "alerts_sent": alerts_sent,
-        "time": datetime.now(timezone.utc).isoformat()
+        "uptime_hours": round(uptime, 2),
+        "pairs_scanned": total_pairs_scanned,
+        "alerts_sent": alerts_sent
     }
 
-# ---------- HELPERS ----------
+# ===================== HELPERS =====================
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout=15):
     try:
         async with session.get(url, timeout=timeout) as resp:
             if resp.status == 200:
                 return await resp.json()
-    except Exception as e:
-        logger.debug(f"Fetch error {url}: {e}")
-    return None
+    except Exception:
+        return None
 
-async def get_all_pairs(session: aiohttp.ClientSession, network: str) -> list:
+async def get_all_pairs(session: aiohttp.ClientSession, network: str) -> List[Dict]:
     url = f"https://api.dexscreener.com/latest/dex/search?q=/{network}/"
     data = await fetch_json(session, url)
     if not data or "pairs" not in data:
         return []
     pairs = data["pairs"]
+    # Sort by 5m volume (highest first) – catches active pumps early
     pairs.sort(key=lambda x: float(x.get("volume", {}).get("m5", 0)), reverse=True)
-    return pairs
+    # Limit to top 300 to manage rate limits
+    return pairs[:300]
 
-# ---------- VOLUME SPIKE (OR CONDITION) ----------
-def check_volume_spike(pair: Dict) -> Tuple[bool, float, str]:
-    vol_m5 = float(pair.get("volume", {}).get("m5", 0))
-    vol_h1 = float(pair.get("volume", {}).get("h1", 0))
-    vol_h24 = float(pair.get("volume", {}).get("h24", 0))
-
-    # Condition A: 5m > 1h
-    ratio_a = vol_m5 / vol_h1 if vol_h1 > 0 else (999.0 if vol_m5 > 0 else 0)
-    cond_a = ratio_a > MIN_VOLUME_SPIKE_RATIO_5M_1H
-
-    # Condition B: 1h > 20% of 24h
-    ratio_b = vol_h1 / vol_h24 if vol_h24 > 0 else (999.0 if vol_h1 > 0 else 0)
-    cond_b = ratio_b > MIN_VOLUME_RATIO_1H_24H
-
-    if cond_a:
-        return True, ratio_a, "5m>1h"
-    if cond_b:
-        return True, ratio_b, "1h>20%24h"
-    return False, 0, ""
-
-# ---------- HOLDER CONCENTRATION ----------
-def get_explorer_base_url(chain: str) -> str:
-    return {
-        "ethereum": "https://api.etherscan.io/api",
+async def get_top10_percent(session: aiohttp.ClientSession, chain: str, token: str) -> float:
+    base = {
         "bsc": "https://api.bscscan.com/api",
+        "ethereum": "https://api.etherscan.io/api",
         "base": "https://api.basescan.org/api"
     }.get(chain)
-
-async def get_top10_and_accumulation(session: aiohttp.ClientSession, chain: str, token: str) -> Tuple[float, bool]:
-    base_url = get_explorer_base_url(chain)
-    if not base_url:
-        return 0.0, False
+    if not base:
+        return 0.0
 
     async with api_rate_limiter:
-        supply_url = f"{base_url}?module=stats&action=tokensupply&contractaddress={token}&apikey={SCANNER_API_KEY}"
+        supply_url = f"{base}?module=stats&action=tokensupply&contractaddress={token}&apikey={SCANNER_API_KEY}"
+        holder_url = f"{base}?module=token&action=tokenholderlist&contractaddress={token}&page=1&offset=10&apikey={SCANNER_API_KEY}"
+
         supply_data = await fetch_json(session, supply_url)
         if not supply_data or supply_data.get("status") != "1":
-            return 0.0, False
+            return 0.0
         total_supply = float(supply_data.get("result", 0))
         if total_supply == 0:
-            return 0.0, False
+            return 0.0
 
-        holder_url = f"{base_url}?module=token&action=tokenholderlist&contractaddress={token}&page=1&offset=10&apikey={SCANNER_API_KEY}"
         holder_data = await fetch_json(session, holder_url)
         if not holder_data or holder_data.get("status") != "1":
-            return 0.0, False
+            return 0.0
 
         holders = holder_data.get("result", [])
-        top10_balance = sum(float(h.get("balance", 0)) for h in holders)
-        current_pct = (top10_balance / total_supply) * 100
+        top10_balance = sum(float(h.get("balance", 0)) for h in holders[:10])
+        return (top10_balance / total_supply) * 100
 
-        prev_pct = holder_cache.get(token, current_pct)
-        accumulating = current_pct > prev_pct
-        holder_cache[token] = current_pct
-
-        return current_pct, accumulating
-
-# ---------- EVALUATION ----------
+# ===================== EVALUATION =====================
 async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional[Dict]:
     chain = pair.get("chainId")
     token = pair.get("baseToken", {}).get("address")
@@ -160,178 +126,181 @@ async def evaluate_token(session: aiohttp.ClientSession, pair: Dict) -> Optional
     if not chain or not token or not pair_id:
         return None
 
+    # Liquidity filter
     liquidity = float(pair.get("liquidity", {}).get("usd", 0))
     if liquidity < MIN_LIQUIDITY_USD:
         return None
 
+    # Deduplicate
     if pair_id in seen_pairs:
         return None
     seen_pairs.add(pair_id)
-    if len(seen_pairs) > SEEN_PAIRS_CLEANUP:
+    if len(seen_pairs) > 10000:
         seen_pairs.clear()
 
-    spike, ratio, trigger = check_volume_spike(pair)
+    # Volume spike detection (OR condition)
+    vol5 = float(pair.get("volume", {}).get("m5", 0))
+    vol1h = float(pair.get("volume", {}).get("h1", 0))
+    vol24h = float(pair.get("volume", {}).get("h24", 0))
+
+    spike = False
+    trigger = ""
+    if vol1h > 0 and vol5 / vol1h >= MIN_VOLUME_SPIKE_RATIO:
+        spike = True
+        trigger = "5m>1h"
+    elif vol24h > 0 and vol1h / vol24h >= MIN_VOLUME_RATIO_1H_24H:
+        spike = True
+        trigger = "1h>20%24h"
+
     if not spike:
         return None
 
-    top10_pct, accumulating = await get_top10_and_accumulation(session, chain, token)
-    if top10_pct <= TOP10_THRESHOLD:
+    # Holder concentration
+    current_pct = await get_top10_percent(session, chain, token)
+    if current_pct < TOP10_THRESHOLD:
         return None
 
+    # Calculate accumulation status (extra info, not a gate)
+    prev_pct = holder_cache.get(token, current_pct)
+    accumulating = current_pct > prev_pct
+    holder_cache[token] = current_pct
+
+    # Alert always sent if top10 >= threshold, regardless of accumulating
     return {
         "token_name": pair.get("baseToken", {}).get("name", "Unknown"),
         "symbol": pair.get("baseToken", {}).get("symbol", "???"),
-        "address": token,
         "chain": chain.upper(),
-        "liquidity_usd": liquidity,
-        "volume_5m": float(pair.get("volume", {}).get("m5", 0)),
-        "volume_1h": float(pair.get("volume", {}).get("h1", 0)),
-        "volume_24h": float(pair.get("volume", {}).get("h24", 0)),
-        "spike_ratio": round(ratio, 2),
-        "trigger_type": trigger,
-        "top10_pct": round(top10_pct, 2),
+        "liquidity": liquidity,
+        "vol_5m": vol5,
+        "vol_1h": vol1h,
+        "vol_24h": vol24h,
+        "spike_type": trigger,
+        "top10_pct": round(current_pct, 2),
+        "prev_top10_pct": round(prev_pct, 2) if prev_pct != current_pct else None,
         "accumulating": accumulating,
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}"
     }
 
-# ---------- ALERT ----------
+# ===================== ALERT =====================
 async def send_alert(alert: Dict):
     global alerts_sent
     alerts_sent += 1
+
+    acc_text = " (accumulating)" if alert["accumulating"] else " (not accumulating or stable)"
+    if alert.get("prev_top10_pct"):
+        acc_text += f" – prev: {alert['prev_top10_pct']}%"
+    else:
+        acc_text += " – first time seen"
+
     text = (
         f"🚨 <b>EARLY PUMP SIGNAL</b> 🚨\n\n"
         f"<b>{alert['token_name']}</b> ({alert['symbol']})\n"
-        f"🔗 <b>{alert['chain']}</b>\n"
-        f"💰 Liquidity: <b>${alert['liquidity_usd']:,.0f}</b>\n"
-        f"📊 5m Vol: ${alert['volume_5m']:,.0f}  |  1h Vol: ${alert['volume_1h']:,.0f}  |  24h Vol: ${alert['volume_24h']:,.0f}\n"
-        f"⚡ Volume spike: <b>{alert['spike_ratio']}x</b> ({alert['trigger_type']})\n\n"
-        f"👥 Top10 holders: <b>{alert['top10_pct']}%</b>\n"
-        f"📈 Accumulating: {'✅ YES' if alert['accumulating'] else '❌ NO'}\n\n"
-        f"🔗 <a href='{alert['dex_url']}'>DexScreener</a>\n\n"
-        f"<i>⚠️ Extremely high risk – verify you can sell before buying.</i>"
+        f"🔗 Chain: <b>{alert['chain']}</b>\n"
+        f"💰 Liquidity: <b>${alert['liquidity']:,.0f}</b>\n"
+        f"📊 5m Vol: <b>${alert['vol_5m']:,.0f}</b>  |  1h Vol: ${alert['vol_1h']:,.0f}  |  24h Vol: ${alert['vol_24h']:,.0f}\n"
+        f"⚡ Spike: <b>{alert['spike_type']}</b>\n"
+        f"👥 Top10 holders: <b>{alert['top10_pct']}%</b>{acc_text}\n\n"
+        f"🔗 <a href='{alert['dex_url']}'>View on DexScreener</a>\n\n"
+        f"<i>⚠️ Extremely high risk – verify sell before buying.</i>"
     )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        logger.info(f"Alert sent for {alert['symbol']} ({alert['trigger_type']})")
-    except TelegramError as e:
+        logger.info(f"✅ Alert sent → {alert['symbol']} (top10={alert['top10_pct']}%, accum={alert['accumulating']})")
+    except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-# ---------- HEARTBEAT ----------
+# ===================== HEARTBEAT =====================
 async def send_heartbeat():
-    uptime_sec = time.time() - start_time
-    uptime_hours = uptime_sec / 3600
-    uptime_str = f"{int(uptime_sec//3600)}h {int((uptime_sec%3600)//60)}m"
-
-    now = time.time()
-    while hourly_pair_counts and hourly_pair_counts[0][0] < now - 3600:
-        hourly_pair_counts.popleft()
-    pairs_last_hour = sum(cnt for _, cnt in hourly_pair_counts)
-
+    uptime = (time.time() - start_time) / 3600
     text = (
-        f"💓 <b>Bot Heartbeat</b>\n\n"
-        f"⏱ Uptime: {uptime_str} ({uptime_hours:.1f}h)\n"
-        f"🔍 Total pairs scanned: <b>{total_pairs_scanned:,}</b>\n"
-        f"📊 Pairs scanned (last hour): <b>{pairs_last_hour:,}</b>\n"
-        f"🚨 Alerts sent: <b>{alerts_sent}</b>\n"
-        f"🆕 Unique pairs in cache: <b>{len(seen_pairs):,}</b>\n"
-        f"⚙️ Last scan: {last_scan_stats['total']} pairs\n"
-        f"   └─ {', '.join([f'{net}: {last_scan_stats["per_network"].get(net,0)}' for net in NETWORKS])}\n"
-        f"🔁 Scan interval: {SCAN_INTERVAL}s | Min liq: ${MIN_LIQUIDITY_USD:,.0f}"
+        f"🫀 <b>Bot Heartbeat</b> 🫀\n"
+        f"Uptime: <b>{uptime:.1f} hours</b>\n"
+        f"Pairs scanned (total): <b>{total_pairs_scanned:,}</b>\n"
+        f"Alerts sent: <b>{alerts_sent}</b>"
     )
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
         logger.info("Heartbeat sent")
-    except TelegramError as e:
+    except Exception as e:
         logger.error(f"Heartbeat failed: {e}")
 
-# ---------- SCAN LOOP ----------
+# ===================== MAIN SCAN LOOP =====================
 async def scan_loop():
-    global total_pairs_scanned, last_scan_stats, hourly_pair_counts, last_heartbeat_time
+    global total_pairs_scanned, last_heartbeat_time
     async with aiohttp.ClientSession() as session:
         while not shutdown_flag:
-            scan_start = time.time()
-            total_this_cycle = 0
-            cycle_counts = {net: 0 for net in NETWORKS}
+            cycle_start = time.time()
 
-            for network in NETWORKS:
-                try:
-                    logger.info(f"Scanning {network}...")
-                    pairs = await get_all_pairs(session, network)
-                    for pair in pairs:
-                        if shutdown_flag:
-                            break
-                        cycle_counts[network] += 1
-                        total_pairs_scanned += 1
-                        total_this_cycle += 1
-                        alert = await evaluate_token(session, pair)
-                        if alert:
-                            await send_alert(alert)
-                            await asyncio.sleep(1)
-                    logger.info(f"Scanned {cycle_counts[network]} pairs on {network}")
-                except Exception as e:
-                    logger.error(f"Error scanning {network}: {e}")
-                    cycle_counts[network] = 0
-
-            last_scan_stats = {"total": total_this_cycle, "per_network": cycle_counts}
-            hourly_pair_counts.append((time.time(), total_this_cycle))
-
+            # Heartbeat check
             if time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                 await send_heartbeat()
                 last_heartbeat_time = time.time()
 
-            elapsed = time.time() - scan_start
+            for network in NETWORKS:
+                if shutdown_flag:
+                    break
+                logger.info(f"Scanning {network}...")
+                pairs = await get_all_pairs(session, network)
+                network_count = 0
+                for pair in pairs:
+                    if shutdown_flag:
+                        break
+                    network_count += 1
+                    total_pairs_scanned += 1
+                    alert = await evaluate_token(session, pair)
+                    if alert:
+                        await send_alert(alert)
+                        await asyncio.sleep(1)   # avoid Telegram flood
+                logger.info(f"Scanned {network_count} pairs on {network}")
+
+            # Wait until next full scan
+            elapsed = time.time() - cycle_start
             sleep_time = max(0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_time)
 
-# ---------- STARTUP ----------
-async def startup_message():
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            f"✅ <b>Crime Pump Bot Active</b>\n\n"
-            f"<b>Filters:</b>\n"
-            f"• Volume spike (OR):\n"
-            f"   - 5m > 1h   OR\n"
-            f"   - 1h > 20% of 24h\n"
-            f"• Top10 holders > {TOP10_THRESHOLD}% and accumulating\n"
-            f"• Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
-            f"<b>Scanning ALL pairs</b> (no age limit) on Ethereum, BSC, Base.\n"
-            f"Heartbeat every {HEARTBEAT_INTERVAL//60} minutes."
-        ),
-        parse_mode=ParseMode.HTML
-    )
-
-# ---------- BOT THREAD ----------
+# ===================== STARTUP =====================
 async def main_bot():
     global start_time, last_heartbeat_time
     start_time = time.time()
     last_heartbeat_time = start_time
-    logger.info("🚀 Pump bot starting (full scan, OR volume conditions)")
-    await startup_message()
+    logger.info("🚀 Crime Pump Bot Started")
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text=(
+            "✅ <b>Crime Pump Bot</b> has started successfully.\n\n"
+            f"<b>Filters:</b>\n"
+            f"• Volume spike: 5m>1h OR 1h>20%24h\n"
+            f"• Top10 holders > {TOP10_THRESHOLD}% (accumulation status extra)\n"
+            f"• Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n\n"
+            f"Scanning ALL pairs (no age limit) on {', '.join(NETWORKS)}.\n"
+            f"Heartbeat every hour."
+        ),
+        parse_mode=ParseMode.HTML
+    )
     await scan_loop()
 
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(main_bot())
-    loop.run_forever()
-
-# ---------- SHUTDOWN ----------
+# ===================== ENTRY POINT =====================
 def shutdown_handler(sig, frame):
     global shutdown_flag
-    logger.info("Shutdown signal received, stopping bot...")
+    logger.info("Shutdown signal received – stopping bot...")
     shutdown_flag = True
-    time.sleep(5)
+    time.sleep(3)
     os._exit(0)
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
+    # Run bot in background daemon thread with proper event loop
+    def run_bot():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main_bot())
+
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
+    # Run FastAPI for Render
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"Starting FastAPI health server on port {port}")
+    logger.info(f"FastAPI server running on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
