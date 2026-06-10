@@ -2,3 +2,5 @@ bot-env/
 __pycache__/
 *.pyc
 .env
+pump_bot.log
+crime_pump.log
