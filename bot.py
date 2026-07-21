@@ -19,9 +19,9 @@ Required env vars:
   TELEGRAM_TOKEN   — Telegram bot token
   CHAT_ID          — Telegram chat ID for alerts
   MORALIS_API_KEY  — Moralis API key (free tier, for holder data)
-  COINGECKO_API_KEY— (Optional) CoinGecko demo API key for higher rate limits
+  COINGECKO_API_KEY— CoinGecko demo API key for higher rate limits
 
-Author: AI-assisted redesign from v1 hard-filter architecture
+Author: Redesign from v1 hard-filter architecture
 ================================================================================
 """
 
