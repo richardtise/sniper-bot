@@ -5,14 +5,16 @@ PUMP SIGNAL BOT v3 — Balanced Hunter for Sustained Pumps
 ================================================================================
 Optimized to catch the "bulk of the move" (1hr - 24hr pumps).
 
-Key improvements over earlier versions:
+Key features:
   • Phase-gated API evaluation (saves Moralis/CoinGecko by filtering junk first)
-  • Configurable max tax tolerance (default 0%, but you can set MAX_ALLOWED_TAX)
-  • Added 6h/24h volume momentum for longer pumps
-  • $10k minimum liquidity, strict security, holder & CEX scoring
-  • No permanent dedup (tokens re-evaluated every cycle)
+  • Configurable max tax tolerance (default 0%)
+  • $10k minimum liquidity (filters micro-cap rugs)
+  • Strict security via GoPlusLabs (honeypot, taxes, whitelist, pausable, etc.)
+  • Holder concentration & CEX detection as bonus points
+  • No permanent dedup — tokens re-evaluated every cycle
   • Parallel evaluation (scans 300 pairs in ~3 seconds)
   • Age-aware volume math (correct for tokens <1h old)
+  • Alerts include contract address and market cap
 
 Required env vars:
   TELEGRAM_TOKEN   — Telegram bot token
@@ -52,13 +54,12 @@ CHAT_ID = os.getenv("CHAT_ID")
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
-# Optional: allow small tax tolerance (default 0)
 MAX_ALLOWED_TAX = float(os.getenv("MAX_ALLOWED_TAX", "0"))
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
-# Networks (Keep Robinhood disabled by default)
+# Networks
 NETWORKS = ["bsc", "ethereum", "base"]  # Add "robinhood" if you accept risk
 
 # Chain mappings
@@ -126,10 +127,8 @@ API_TIMEOUT = 10
 CONCURRENT_API_LIMIT = 15
 COINGECKO_CALLS_PER_MINUTE = 25 if COINGECKO_API_KEY else 10
 
-# --- Phase gate: minimum base score before checking holders/CEX ---
 PHASE1_MIN_SCORE = 25
 
-# --- Debug ---
 VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -146,16 +145,13 @@ logger = logging.getLogger("pump_bot_v3")
 bot = Bot(token=TELEGRAM_TOKEN)
 api_semaphore = asyncio.Semaphore(CONCURRENT_API_LIMIT)
 
-# Caches
 security_cache: Dict[str, Tuple[dict, float]] = {}
 holder_cache: Dict[str, Tuple[Tuple[float, float, float], float]] = {}
 coingecko_id_map: Dict[str, Dict[str, str]] = {}
 coingecko_ticker_cache: Dict[str, Tuple[dict, float]] = {}
 
-# DB
 db_conn: Optional[sqlite3.Connection] = None
 
-# Stats
 total_pairs_scanned = 0
 tokens_evaluated = 0
 alerts_sent = 0
@@ -301,7 +297,7 @@ async def get_all_pairs(session, network):
 async def get_token_security(session, chain, token):
     goplus_chain = CHAIN_TO_GOPLUS_ID.get(chain)
     if not goplus_chain:
-        return None  # Chain not supported by GoPlus
+        return None
 
     cache_key = f"{goplus_chain}:{token.lower()}"
     now = time.time()
@@ -379,7 +375,6 @@ async def get_holder_concentration(session, chain, token):
 
     holder_cache[cache_key] = ((pct10, pct50, pct100), now)
 
-    # Lazy eviction
     stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
     for k in stale:
         del holder_cache[k]
@@ -604,7 +599,6 @@ async def evaluate_token(session, pair):
 
     tokens_evaluated += 1
 
-    # Basic viability
     liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
     if liquidity < MIN_LIQUIDITY_USD:
         return None
@@ -633,18 +627,20 @@ async def evaluate_token(session, pair):
     chg_1h = float(pair.get("priceChange", {}).get("h1") or 0)
     chg_6h = float(pair.get("priceChange", {}).get("h6") or 0)
 
+    market_cap = float(pair.get("marketCap") or 0)
+
     pair_created = pair.get("pairCreatedAt")
     age_minutes = (time.time() - pair_created / 1000) / 60 if pair_created else None
 
     score = 0
     penalties = 0
 
-    # ── 1. Volume components ──
+    # 1. Volume components
     score += score_volume_liquidity(vol_5m, liquidity)
     score += score_5m_1h(vol_5m, vol_1h, age_minutes)
     score += score_1h_24h(vol_1h, vol_24h, age_minutes)
 
-    # ── 2. Buy pressure 5m ──
+    # 2. Buy pressure 5m
     total_5m = buys_5m + sells_5m
     if total_5m > 0:
         buy_ratio_5m = buys_5m / total_5m
@@ -663,7 +659,7 @@ async def evaluate_token(session, pair):
     else:
         penalties += PENALTY_LOW_TX_5M
 
-    # ── 3. Buy pressure 1h (only if age > 60 min) ──
+    # 3. Buy pressure 1h (only if age > 60 min)
     total_1h = buys_1h + sells_1h
     if age_minutes is not None and age_minutes > 60 and total_1h > 0:
         buy_ratio_1h = buys_1h / total_1h
@@ -678,13 +674,12 @@ async def evaluate_token(session, pair):
         if total_1h < 10:
             penalties += PENALTY_LOW_TX_1H
 
-    # ── 4. Price momentum ──
+    # 4. Price momentum
     score += score_price(chg_5m, chg_1h, chg_6h, age_minutes)
 
-    # ── 5. Security (GoPlus) ──
+    # 5. Security
     security = await get_token_security(session, chain, token)
     if security:
-        # Check for disqualifying red flags
         if security.get("is_honeypot"):
             return None
         if security.get("buy_tax", 0) > MAX_ALLOWED_TAX or security.get("sell_tax", 0) > MAX_ALLOWED_TAX:
@@ -700,31 +695,27 @@ async def evaluate_token(session, pair):
             security.get("transfer_pausable"),
         ]):
             return None
-
-        # Clean security earns points
         score += SECURITY_PTS
     else:
-        # No security data: no points, no penalty (could be unsupported chain or new token)
         pass
 
-    # ── Phase gate: only proceed to holders/CEX if base score high enough ──
+    # Phase gate
     base_score = score - penalties
     if base_score < PHASE1_MIN_SCORE:
         if VERBOSE_LOGGING:
             logger.info(f"Phase gate skip {symbol}: base_score={base_score}")
         return None
 
-    # ── 6. Holder concentration (Moralis) ──
+    # 6. Holder concentration
     top10, top50, top100 = await get_holder_concentration(session, chain, token)
     holder_pts = score_holder(top10, top50, top100)
     score += holder_pts
 
-    # ── 7. CEX listings (CoinGecko) ──
+    # 7. CEX listings
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
     score += cex_pts
 
-    # ── Final score with penalties ──
     total_score = max(0, score - penalties)
 
     if VERBOSE_LOGGING:
@@ -747,6 +738,7 @@ async def evaluate_token(session, pair):
         "total_score": total_score,
         "vol_5m": vol_5m,
         "liquidity": liquidity,
+        "market_cap": market_cap,
         "buys_5m": buys_5m,
         "sells_5m": sells_5m,
         "buys_1h": buys_1h,
@@ -781,6 +773,7 @@ async def send_alert(alert):
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
         f"🕒 Age: <b>{alert['age_minutes']:.0f} min</b>\n\n"
         f"<b>💰 Liquidity:</b> ${alert['liquidity']:,.0f}\n"
+        f"<b>💎 Market Cap:</b> ${alert['market_cap']:,.0f}\n"
         f"<b>📈 Volume (5m):</b> ${alert['vol_5m']:,.0f}\n"
         f"<b>💹 Price Δ 5m:</b> {alert['chg_5m']:+.1f}%\n"
         f"<b>💹 Price Δ 1h:</b> {alert['chg_1h']:+.1f}%\n"
@@ -823,9 +816,27 @@ async def bot_task():
     logger.info("🚀 Pump Bot v3 starting...")
 
     async with aiohttp.ClientSession() as session:
-        # Preload CoinGecko ID map if API key present
         if COINGECKO_API_KEY:
             await build_coingecko_id_map(session)
+
+        # Startup message
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"✅ <b>Pump Bot v3</b> started\n"
+                    f"Scan interval: {SCAN_INTERVAL}s\n"
+                    f"Networks: {', '.join(NETWORKS).upper()}\n"
+                    f"Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n"
+                    f"Alert threshold: {ALERT_THRESHOLD}\n"
+                    f"Max allowed tax: {MAX_ALLOWED_TAX}%\n"
+                    f"Moralis: {'✅' if MORALIS_API_KEY else '❌'} | "
+                    f"CoinGecko: {'✅' if COINGECKO_API_KEY else '⚪ free tier'}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"Startup message failed: {e}")
 
         while not shutdown_flag:
             cycle_start = time.time()
