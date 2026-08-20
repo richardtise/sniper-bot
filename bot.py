@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-PUMP SIGNAL BOT v3 — Balanced Hunter for Sustained Pumps
+PUMP SIGNAL BOT v4 — Onchain-First Runner Hunter
 ================================================================================
-Optimized to catch the "bulk of the move" (1hr - 24hr pumps).
+Core thesis: Catch onchain accumulation BEFORE CEX validation.
 
-Key features:
-  • Phase-gated API evaluation (saves Moralis/CoinGecko by filtering junk first)
-  • Configurable max tax tolerance (default 0%)
-  • $10k minimum liquidity (filters micro-cap rugs)
-  • Strict security via GoPlusLabs (honeypot, taxes, whitelist, pausable, etc.)
-  • Holder concentration & CEX detection as bonus points
-  • No permanent dedup — tokens re-evaluated every cycle
-  • Parallel evaluation (scans 300 pairs in ~3 seconds)
-  • Age-aware volume math (correct for tokens <1h old)
-  • Alerts include contract address and market cap
+Changes from v3:
+  • Onchain signals weighted heavily (volume, holders, buy pressure, momentum)
+  • CEX/perps reduced to a 5-point bonus, not a gate
+  • Robinhood Chain support (chainId: "robinhood")
+  • Blockscout API for Robinhood security + holder data (GoPlus doesn't cover it)
+  • More sensitive volume scoring for early accumulation detection
+  • Phase gate lowered so more tokens get fully evaluated
 
 Required env vars:
   TELEGRAM_TOKEN   — Telegram bot token
   CHAT_ID          — Telegram chat ID
-  MORALIS_API_KEY  — optional but recommended for holder data
-  COINGECKO_API_KEY— optional for CEX detection
+  MORALIS_API_KEY  — optional, for BSC/Eth/Base holder data
+  COINGECKO_API_KEY— optional, for CEX bonus detection
 
-Optional env var:
-  MAX_ALLOWED_TAX  — e.g. "0.5" to allow up to 0.5% tax (default "0")
+Optional:
+  MAX_ALLOWED_TAX  — default "0" (set higher for memecoin tolerance)
+  VERBOSE_LOGGING  — "true" to see every token's score breakdown
 ================================================================================
 """
 
@@ -55,12 +53,13 @@ MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 MAX_ALLOWED_TAX = float(os.getenv("MAX_ALLOWED_TAX", "0"))
+VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
-# Networks
-NETWORKS = ["bsc", "ethereum", "base"]  # Add "robinhood" if you accept risk
+# Networks — robinhood added
+NETWORKS = ["bsc", "ethereum", "base", "robinhood"]
 
 # Chain mappings
 CHAIN_TO_MORALIS = {"bsc": "bsc", "ethereum": "eth", "base": "base"}
@@ -68,8 +67,15 @@ CHAIN_TO_COINGECKO_PLATFORM = {
     "bsc": "binance-smart-chain",
     "ethereum": "ethereum",
     "base": "base",
+    "robinhood": "robinhood",  # may not be in CoinGecko yet, handled gracefully
 }
 CHAIN_TO_GOPLUS_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
+# Robinhood has no GoPlus support yet
+
+# Blockscout explorers for custom security
+BLOCKSCOUT_URLS = {
+    "robinhood": "https://robinhoodchain.blockscout.com/api/v2",
+}
 
 # --- Timing ---
 SCAN_INTERVAL = 30
@@ -80,46 +86,54 @@ MIN_LIQUIDITY_USD = 10_000.0
 MIN_VOL_5M_USD = 100.0
 MIN_PRICE = 1e-12
 
-# --- Scoring weights (max total = 100) ---
-# Volume & momentum (25)
-VOLUME_LIQUIDITY_PTS = 10
-VOLUME_5M_1H_PTS = 7
-VOLUME_1H_24H_PTS = 8
+# Robinhood is higher risk — stricter liquidity gate
+ROBINHOOD_MIN_LIQUIDITY_USD = 20_000.0
+ROBINHOOD_MIN_PAIR_AGE_MIN = 10.0  # avoid instant honeypots
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCORING WEIGHTS (Total = 100) — ONCHAIN FIRST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Volume & momentum (30) — THE PRIMARY SIGNAL
+VOL_LIQUIDITY_PTS = 10
+VOL_5M_1H_PTS = 8
+VOL_1H_6H_PTS = 7
+VOL_6H_24H_PTS = 5
 
 # Buy pressure (20)
 BUY_PRESSURE_5M_PTS = 12
 BUY_PRESSURE_1H_PTS = 8
 
-# Holder concentration (15)
-HOLDER_TOP10_PTS = 8
-HOLDER_TOP50_PTS = 4
-HOLDER_TOP100_PTS = 3
-
-# CEX listings (10)
-CEX_LISTING_PTS = 5
-CEX_PERPS_PTS = 3
-CEX_TIER1_PTS = 2
+# Holder concentration (20) — WHALE ACCUMULATION
+HOLDER_TOP10_PTS = 10
+HOLDER_TOP50_PTS = 6
+HOLDER_TOP100_PTS = 4
 
 # Price momentum (15)
 PRICE_5M_PTS = 6
 PRICE_1H_PTS = 5
 PRICE_6H_PTS = 4
 
-# Security (15)
-SECURITY_PTS = 15
+# Security (10) — gate, not bonus
+SECURITY_PTS = 10
+
+# CEX listings (5) — BONUS ONLY, NOT CORE
+CEX_LISTING_PTS = 3
+CEX_PERPS_PTS = 2
 
 # --- Penalties ---
-PENALTY_SELL_PRESSURE_5M = 20
-PENALTY_SELL_PRESSURE_1H = 15
-PENALTY_LOW_TX_5M = 10
-PENALTY_LOW_TX_1H = 5
+PENALTY_SELL_PRESSURE_5M = 15
+PENALTY_SELL_PRESSURE_1H = 10
+PENALTY_LOW_TX_5M = 8
+PENALTY_LOW_TX_1H = 4
+PENALTY_UNVERIFIED_CONTRACT = 8  # Robinhood heuristic
 
 # --- Alert threshold ---
-ALERT_THRESHOLD = 55
+ALERT_THRESHOLD = 50
 
 # --- Cooldown ---
 RE_ALERT_COOLDOWN_HOURS = 4
-SCORE_IMPROVEMENT_THRESHOLD = 15
+SCORE_IMPROVEMENT_THRESHOLD = 12
 
 # --- API settings ---
 MAX_RETRIES = 2
@@ -127,9 +141,8 @@ API_TIMEOUT = 10
 CONCURRENT_API_LIMIT = 15
 COINGECKO_CALLS_PER_MINUTE = 25 if COINGECKO_API_KEY else 10
 
-PHASE1_MIN_SCORE = 25
-
-VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
+# Phase 1 gate — must score this much on onchain data alone before burning API calls on holders/CEX
+PHASE1_MIN_SCORE = 20
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING & GLOBALS
@@ -138,9 +151,9 @@ VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("pump_bot_v3.log"), logging.StreamHandler()],
+    handlers=[logging.FileHandler("pump_bot_v4.log"), logging.StreamHandler()],
 )
-logger = logging.getLogger("pump_bot_v3")
+logger = logging.getLogger("pump_bot_v4")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 api_semaphore = asyncio.Semaphore(CONCURRENT_API_LIMIT)
@@ -159,7 +172,7 @@ start_time = 0.0
 last_heartbeat_time = 0.0
 shutdown_flag = False
 
-DB_PATH = "pump_bot_v3.db"
+DB_PATH = "pump_bot_v4.db"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -202,7 +215,7 @@ def db_record_alert(chain, token_address, symbol, score):
         logger.warning(f"DB alert upsert failed: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# API HELPERS & PAIR DISCOVERY
+# API HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 coingecko_calls_this_minute = 0
@@ -233,11 +246,19 @@ async def fetch_json(session, url, headers=None, use_coingecko_limiter=False):
                     elif resp.status == 429:
                         await asyncio.sleep(2 ** attempt)
                     else:
+                        if VERBOSE_LOGGING:
+                            logger.debug(f"HTTP {resp.status} for {url[:80]}")
                         return None
-            except Exception:
+            except Exception as e:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(1)
+                elif VERBOSE_LOGGING:
+                    logger.debug(f"Fetch failed for {url[:80]}: {e}")
         return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAIR DISCOVERY (DEXSCREENER)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def get_all_pairs(session, network):
     pairs = []
@@ -249,7 +270,7 @@ async def get_all_pairs(session, network):
             seen.add(addr)
             pairs.append(p)
 
-    # Latest pairs (primary)
+    # 1. Latest pairs for the chain
     url = f"https://api.dexscreener.com/latest/dex/pairs/{network}?page=0&pageSize=300"
     data = await fetch_json(session, url)
     if data and "pairs" in data:
@@ -257,7 +278,7 @@ async def get_all_pairs(session, network):
             if p.get("chainId") == network:
                 await add_pair(p)
 
-    # Top boosts
+    # 2. Top boosts
     boost_data = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
     if boost_data and isinstance(boost_data, list):
         tasks = []
@@ -272,7 +293,7 @@ async def get_all_pairs(session, network):
                         if p.get("chainId") == network:
                             await add_pair(p)
 
-    # Latest profiles
+    # 3. Latest profiles
     profiles_data = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
     if profiles_data and isinstance(profiles_data, list):
         tasks = []
@@ -291,15 +312,19 @@ async def get_all_pairs(session, network):
     return pairs[:300]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXTERNAL APIS (GOPLUS, MORALIS, COINGECKO)
+# SECURITY CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def get_token_security(session, chain, token):
+    """GoPlus for supported chains, Blockscout for Robinhood."""
+    if chain == "robinhood":
+        return await get_robinhood_security(session, token)
+
     goplus_chain = CHAIN_TO_GOPLUS_ID.get(chain)
     if not goplus_chain:
         return None
 
-    cache_key = f"{goplus_chain}:{token.lower()}"
+    cache_key = f"goplus:{goplus_chain}:{token.lower()}"
     now = time.time()
     if cache_key in security_cache:
         cached, ts = security_cache[cache_key]
@@ -332,18 +357,82 @@ async def get_token_security(session, chain, token):
         "slippage_modifiable": result.get("slippage_modifiable") == "1",
         "transfer_pausable": result.get("transfer_pausable") == "1",
         "lp_locked": result.get("is_lp_locked") == "1",
+        "source": "goplus",
     }
     security_cache[cache_key] = (security, now)
     return security
 
+async def get_robinhood_security(session, token):
+    """Blockscout-based security heuristics for Robinhood Chain."""
+    cache_key = f"robinhood_sec:{token.lower()}"
+    now = time.time()
+    if cache_key in security_cache:
+        cached, ts = security_cache[cache_key]
+        if now - ts < 900:
+            return cached
+
+    base = BLOCKSCOUT_URLS["robinhood"]
+    security = {
+        "is_honeypot": False,
+        "buy_tax": 0,
+        "sell_tax": 0,
+        "is_whitelisted": False,
+        "is_blacklisted": False,
+        "is_open_source": False,
+        "is_proxy": False,
+        "can_take_back_ownership": False,
+        "owner_change_balance": False,
+        "is_mintable": False,
+        "slippage_modifiable": False,
+        "transfer_pausable": False,
+        "lp_locked": False,
+        "is_verified": False,
+        "source": "blockscout",
+    }
+
+    # Check if contract is verified
+    url = f"{base}/smart-contracts/{token}"
+    data = await fetch_json(session, url)
+    if data:
+        security["is_verified"] = data.get("is_verified", False)
+        security["is_open_source"] = data.get("is_verified", False)
+        # If it's a proxy, flag it
+        security["is_proxy"] = data.get("proxy_type") is not None
+
+    # Check token info for additional heuristics
+    url2 = f"{base}/tokens/{token}"
+    token_data = await fetch_json(session, url2)
+    if token_data:
+        # If total supply is 0 or null, suspicious
+        supply = token_data.get("total_supply")
+        if supply is None or str(supply) in ("0", "null", ""):
+            security["is_honeypot"] = True
+
+    # Heuristic: unverified contract on Robinhood = higher risk
+    if not security["is_verified"]:
+        # Don't auto-reject, but let the scoring penalty handle it
+        pass
+
+    security_cache[cache_key] = (security, now)
+    return security
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOLDER CONCENTRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def get_holder_concentration(session, chain, token):
+    if chain == "robinhood":
+        return await get_robinhood_holders(session, token)
+    return await get_moralis_holders(session, chain, token)
+
+async def get_moralis_holders(session, chain, token):
     if not MORALIS_API_KEY:
         return 0.0, 0.0, 0.0
     moralis_chain = CHAIN_TO_MORALIS.get(chain)
     if not moralis_chain:
         return 0.0, 0.0, 0.0
 
-    cache_key = f"{moralis_chain}:{token.lower()}"
+    cache_key = f"moralis:{moralis_chain}:{token.lower()}"
     now = time.time()
     if cache_key in holder_cache:
         (top10, top50, top100), ts = holder_cache[cache_key]
@@ -375,11 +464,63 @@ async def get_holder_concentration(session, chain, token):
 
     holder_cache[cache_key] = ((pct10, pct50, pct100), now)
 
+    # Prune stale entries
     stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
     for k in stale:
         del holder_cache[k]
 
     return pct10, pct50, pct100
+
+async def get_robinhood_holders(session, token):
+    """Use Blockscout API for Robinhood holder data."""
+    cache_key = f"robinhood_holders:{token.lower()}"
+    now = time.time()
+    if cache_key in holder_cache:
+        (top10, top50, top100), ts = holder_cache[cache_key]
+        if now - ts < 600:
+            return top10, top50, top100
+
+    base = BLOCKSCOUT_URLS["robinhood"]
+    url = f"{base}/tokens/{token}/holders"
+    data = await fetch_json(session, url)
+
+    if not data or "items" not in data:
+        holder_cache[cache_key] = ((0.0, 0.0, 0.0), now)
+        return 0.0, 0.0, 0.0
+
+    items = data["items"]
+    if not items:
+        holder_cache[cache_key] = ((0.0, 0.0, 0.0), now)
+        return 0.0, 0.0, 0.0
+
+    # Get token total supply
+    token_info = await fetch_json(session, f"{base}/tokens/{token}")
+    total_supply = 0.0
+    if token_info:
+        try:
+            total_supply = float(token_info.get("total_supply") or 0)
+        except (ValueError, TypeError):
+            total_supply = 0.0
+
+    if total_supply == 0:
+        holder_cache[cache_key] = ((0.0, 0.0, 0.0), now)
+        return 0.0, 0.0, 0.0
+
+    balances = [float(h.get("value", 0)) for h in items]
+    top10 = sum(balances[:10])
+    top50 = sum(balances[:50]) if len(balances) >= 50 else sum(balances)
+    top100 = sum(balances[:100]) if len(balances) >= 100 else sum(balances)
+
+    pct10 = (top10 / total_supply) * 100
+    pct50 = (top50 / total_supply) * 100
+    pct100 = (top100 / total_supply) * 100
+
+    holder_cache[cache_key] = ((pct10, pct50, pct100), now)
+    return pct10, pct50, pct100
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CEX LISTINGS (BONUS ONLY)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 KNOWN_CEX_NAMES = {
     "binance", "coinbase", "okx", "bybit", "kraken", "kucoin", "bitfinex",
@@ -470,54 +611,72 @@ async def get_cex_listings(session, chain, token):
     return cex_count, has_perps, tier1_count
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SCORING FUNCTIONS
+# SCORING ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def score_volume_liquidity(vol_5m, liquidity):
     ratio = vol_5m / liquidity if liquidity > 0 else 0
     if ratio >= 1.0:
-        return VOLUME_LIQUIDITY_PTS
+        return VOL_LIQUIDITY_PTS
     elif ratio >= 0.5:
-        return VOLUME_LIQUIDITY_PTS * 0.8
+        return VOL_LIQUIDITY_PTS * 0.8
     elif ratio >= 0.25:
-        return VOLUME_LIQUIDITY_PTS * 0.6
+        return VOL_LIQUIDITY_PTS * 0.6
     elif ratio >= 0.1:
-        return VOLUME_LIQUIDITY_PTS * 0.4
+        return VOL_LIQUIDITY_PTS * 0.4
     else:
-        return VOLUME_LIQUIDITY_PTS * 0.2
+        return VOL_LIQUIDITY_PTS * 0.2
 
 def score_5m_1h(vol_5m, vol_1h, age_minutes):
+    """Detect early burst. 5m is 8.3% of 1h baseline."""
     if age_minutes is not None and age_minutes > 10 and vol_1h > 0:
         ratio = vol_5m / vol_1h
         normalized = ratio / 0.0833 if ratio > 0 else 0
         if normalized >= 8:
-            return VOLUME_5M_1H_PTS
+            return VOL_5M_1H_PTS
         elif normalized >= 4:
-            return VOLUME_5M_1H_PTS * 0.8
+            return VOL_5M_1H_PTS * 0.75
         elif normalized >= 2:
-            return VOLUME_5M_1H_PTS * 0.6
+            return VOL_5M_1H_PTS * 0.5
         elif normalized >= 1:
-            return VOLUME_5M_1H_PTS * 0.4
+            return VOL_5M_1H_PTS * 0.25
     elif age_minutes is not None and age_minutes <= 10:
         if vol_1h > 0 and vol_5m / vol_1h > 0.9:
-            return VOLUME_5M_1H_PTS * 0.4
+            return VOL_5M_1H_PTS * 0.3
     return 0
 
-def score_1h_24h(vol_1h, vol_24h, age_minutes):
-    if age_minutes is not None and age_minutes > 120 and vol_24h > 0:
-        ratio = vol_1h / vol_24h
-        normalized = ratio / 0.0417 if ratio > 0 else 0
-        if normalized >= 8:
-            return VOLUME_1H_24H_PTS
-        elif normalized >= 4:
-            return VOLUME_1H_24H_PTS * 0.8
+def score_1h_6h(vol_1h, vol_6h, age_minutes):
+    """Detect mid-term accumulation. 1h is 16.7% of 6h baseline."""
+    if age_minutes is not None and age_minutes > 60 and vol_6h > 0:
+        ratio = vol_1h / vol_6h
+        normalized = ratio / 0.1667 if ratio > 0 else 0
+        if normalized >= 6:
+            return VOL_1H_6H_PTS
+        elif normalized >= 3:
+            return VOL_1H_6H_PTS * 0.75
+        elif normalized >= 1.5:
+            return VOL_1H_6H_PTS * 0.5
+        elif normalized >= 1.0:
+            return VOL_1H_6H_PTS * 0.25
+    elif age_minutes is not None and age_minutes <= 60:
+        if vol_6h > 0 and vol_1h / vol_6h > 0.8:
+            return VOL_1H_6H_PTS * 0.3
+    return 0
+
+def score_6h_24h(vol_6h, vol_24h, age_minutes):
+    """Detect longer-term buildup. 6h is 25% of 24h baseline."""
+    if age_minutes is not None and age_minutes > 360 and vol_24h > 0:
+        ratio = vol_6h / vol_24h
+        normalized = ratio / 0.25 if ratio > 0 else 0
+        if normalized >= 4:
+            return VOL_6H_24H_PTS
         elif normalized >= 2:
-            return VOLUME_1H_24H_PTS * 0.6
-        elif normalized >= 1:
-            return VOLUME_1H_24H_PTS * 0.4
-    elif age_minutes is not None and age_minutes <= 120:
-        if vol_24h > 0 and vol_1h / vol_24h > 0.8:
-            return VOLUME_1H_24H_PTS * 0.5
+            return VOL_6H_24H_PTS * 0.6
+        elif normalized >= 1.2:
+            return VOL_6H_24H_PTS * 0.3
+    elif age_minutes is not None and age_minutes <= 360:
+        if vol_24h > 0 and vol_6h / vol_24h > 0.8:
+            return VOL_6H_24H_PTS * 0.3
     return 0
 
 def score_holder(top10, top50, top100):
@@ -550,8 +709,7 @@ def score_cex(cex_count, has_perps, tier1):
     pts = min(cex_count, CEX_LISTING_PTS)
     if has_perps:
         pts += CEX_PERPS_PTS
-    pts += min(tier1, CEX_TIER1_PTS)
-    return pts
+    return min(pts, 5)  # Hard cap at 5 — it's a bonus
 
 def score_price(chg_5m, chg_1h, chg_6h, age_minutes):
     pts = 0
@@ -599,8 +757,10 @@ async def evaluate_token(session, pair):
 
     tokens_evaluated += 1
 
+    # Chain-specific liquidity gates
+    min_liq = ROBINHOOD_MIN_LIQUIDITY_USD if chain == "robinhood" else MIN_LIQUIDITY_USD
     liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
-    if liquidity < MIN_LIQUIDITY_USD:
+    if liquidity < min_liq:
         return None
 
     price = float(pair.get("priceUsd") or 0)
@@ -632,15 +792,20 @@ async def evaluate_token(session, pair):
     pair_created = pair.get("pairCreatedAt")
     age_minutes = (time.time() - pair_created / 1000) / 60 if pair_created else None
 
+    # Robinhood: skip very fresh pairs (honeypot filter)
+    if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
+        return None
+
     score = 0
     penalties = 0
 
-    # 1. Volume components
+    # 1. Volume components (30 pts max)
     score += score_volume_liquidity(vol_5m, liquidity)
     score += score_5m_1h(vol_5m, vol_1h, age_minutes)
-    score += score_1h_24h(vol_1h, vol_24h, age_minutes)
+    score += score_1h_6h(vol_1h, vol_6h, age_minutes)
+    score += score_6h_24h(vol_6h, vol_24h, age_minutes)
 
-    # 2. Buy pressure 5m
+    # 2. Buy pressure 5m (12 pts)
     total_5m = buys_5m + sells_5m
     if total_5m > 0:
         buy_ratio_5m = buys_5m / total_5m
@@ -659,7 +824,7 @@ async def evaluate_token(session, pair):
     else:
         penalties += PENALTY_LOW_TX_5M
 
-    # 3. Buy pressure 1h (only if age > 60 min)
+    # 3. Buy pressure 1h (8 pts, only if age > 60 min)
     total_1h = buys_1h + sells_1h
     if age_minutes is not None and age_minutes > 60 and total_1h > 0:
         buy_ratio_1h = buys_1h / total_1h
@@ -674,44 +839,51 @@ async def evaluate_token(session, pair):
         if total_1h < 10:
             penalties += PENALTY_LOW_TX_1H
 
-    # 4. Price momentum
+    # 4. Price momentum (15 pts)
     score += score_price(chg_5m, chg_1h, chg_6h, age_minutes)
 
-    # 5. Security
+    # 5. Security (10 pts) — strict for supported chains, heuristic for Robinhood
     security = await get_token_security(session, chain, token)
     if security:
         if security.get("is_honeypot"):
             return None
         if security.get("buy_tax", 0) > MAX_ALLOWED_TAX or security.get("sell_tax", 0) > MAX_ALLOWED_TAX:
             return None
-        if any([
-            security.get("is_whitelisted"),
-            security.get("is_blacklisted"),
-            security.get("is_proxy"),
-            security.get("can_take_back_ownership"),
-            security.get("owner_change_balance"),
-            security.get("is_mintable"),
-            security.get("slippage_modifiable"),
-            security.get("transfer_pausable"),
-        ]):
-            return None
+        # For standard chains, reject on dangerous flags
+        if chain != "robinhood":
+            if any([
+                security.get("is_whitelisted"),
+                security.get("is_blacklisted"),
+                security.get("is_proxy"),
+                security.get("can_take_back_ownership"),
+                security.get("owner_change_balance"),
+                security.get("is_mintable"),
+                security.get("slippage_modifiable"),
+                security.get("transfer_pausable"),
+            ]):
+                return None
+        else:
+            # Robinhood: unverified contract penalty instead of auto-reject
+            if not security.get("is_verified", False):
+                penalties += PENALTY_UNVERIFIED_CONTRACT
+
         score += SECURITY_PTS
     else:
-        pass
+        pass  # No security data available, don't penalize
 
-    # Phase gate
+    # Phase gate — must show strong onchain signals before we burn API calls
     base_score = score - penalties
     if base_score < PHASE1_MIN_SCORE:
         if VERBOSE_LOGGING:
-            logger.info(f"Phase gate skip {symbol}: base_score={base_score}")
+            logger.info(f"Phase gate skip {symbol}@{chain}: base_score={base_score:.1f}")
         return None
 
-    # 6. Holder concentration
+    # 6. Holder concentration (20 pts) — whale accumulation
     top10, top50, top100 = await get_holder_concentration(session, chain, token)
     holder_pts = score_holder(top10, top50, top100)
     score += holder_pts
 
-    # 7. CEX listings
+    # 7. CEX listings (5 pts max) — BONUS, not core
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
     score += cex_pts
@@ -720,10 +892,12 @@ async def evaluate_token(session, pair):
 
     if VERBOSE_LOGGING:
         logger.info(
-            f"{symbol} score={total_score} | liq_ratio={vol_5m/liquidity if liquidity>0 else 0:.2f} "
-            f"5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} 1h/24h={vol_1h/vol_24h if vol_24h>0 else 0:.2f} "
-            f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} age={age_minutes:.0f}m "
-            f"top10={top10:.1f}% cex={cex_count} perps={has_perps} base={base_score}"
+            f"{symbol}@{chain} score={total_score:.0f} | "
+            f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
+            f"1h/6h={vol_1h/vol_6h if vol_6h>0 else 0:.2f} 6h/24h={vol_6h/vol_24h if vol_24h>0 else 0:.2f} | "
+            f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} | "
+            f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={top100:.1f}% | "
+            f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties}"
         )
 
     if total_score < ALERT_THRESHOLD:
@@ -762,13 +936,29 @@ async def evaluate_token(session, pair):
 async def send_alert(alert):
     global alerts_sent
     sec = alert.get("security") or {}
-    pct10, pct50, pct100 = alert.get("holder_pct", (0,0,0))
+    pct10, pct50, pct100 = alert.get("holder_pct", (0, 0, 0))
 
     buy_pct_5m = (alert['buys_5m'] / (alert['buys_5m'] + alert['sells_5m']) * 100) if (alert['buys_5m'] + alert['sells_5m']) > 0 else 0
     buy_pct_1h = (alert['buys_1h'] / (alert['buys_1h'] + alert['sells_1h']) * 100) if (alert['buys_1h'] + alert['sells_1h']) > 0 else 0
 
+    # Build security text
+    if sec.get("source") == "blockscout":
+        sec_text = (
+            f"<b>🔒 Security (Blockscout):</b>\n"
+            f"  Verified: {'✅' if sec.get('is_verified') else '⚠️ No'}\n"
+            f"  Proxy: {'❌ YES' if sec.get('is_proxy') else '✅ No'}\n"
+        )
+    else:
+        sec_text = (
+            f"<b>🔒 Security (GoPlus):</b> {'✅' if sec else '❓'}\n"
+            f"  Honeypot: {'✅ No' if not sec or not sec.get('is_honeypot') else '❌ YES'}\n"
+            f"  Buy Tax: {sec.get('buy_tax', 0):.1f}%\n"
+            f"  Sell Tax: {sec.get('sell_tax', 0):.1f}%\n"
+            f"  Transfer Pausable: {'❌ YES' if sec and sec.get('transfer_pausable') else '✅ No'}\n"
+        )
+
     text = (
-        f"🚨 <b>PUMP SIGNAL — Score {alert['total_score']}/100</b>\n\n"
+        f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']}/100</b>\n\n"
         f"<b>{alert['name']}</b> ({alert['symbol']})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
         f"🕒 Age: <b>{alert['age_minutes']:.0f} min</b>\n\n"
@@ -780,17 +970,12 @@ async def send_alert(alert):
         f"<b>💹 Price Δ 6h:</b> {alert['chg_6h']:+.1f}%\n\n"
         f"<b>🟢 Buy Pressure 5m:</b> {buy_pct_5m:.1f}% ({alert['buys_5m']}B / {alert['sells_5m']}S)\n"
         f"<b>🟢 Buy Pressure 1h:</b> {buy_pct_1h:.1f}% ({alert['buys_1h']}B / {alert['sells_1h']}S)\n\n"
-        f"<b>🔒 Security:</b> {'✅' if security else '❓'}\n"
-        f"  Honeypot: {'✅ No' if not security or not security.get('is_honeypot') else '❌ YES'}\n"
-        f"  Buy Tax: {security.get('buy_tax', 0):.1f}%\n"
-        f"  Sell Tax: {security.get('sell_tax', 0):.1f}%\n"
-        f"  Whitelisted: {'❌ YES' if security and security.get('is_whitelisted') else '✅ No'}\n"
-        f"  Transfer Pausable: {'❌ YES' if security and security.get('transfer_pausable') else '✅ No'}\n\n"
+        f"{sec_text}\n"
         f"<b>👥 Holder Concentration:</b>\n"
         f"  Top 10: {pct10:.1f}%\n"
         f"  Top 50: {pct50:.1f}%\n"
         f"  Top 100: {pct100:.1f}%\n\n"
-        f"<b>🏛 CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'}, tier1: {alert['tier1']})\n\n"
+        f"<b>🏛 CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})\n\n"
         f"📝 <b>Contract:</b> <code>{alert['token_address']}</code>\n\n"
         f"🔗 <a href='{alert['dex_url']}'>DexScreener</a>"
     )
@@ -798,7 +983,7 @@ async def send_alert(alert):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         alerts_sent += 1
-        logger.info(f"✅ ALERT #{alerts_sent} sent → {alert['symbol']} score={alert['total_score']}")
+        logger.info(f"✅ ALERT #{alerts_sent} sent → {alert['symbol']}@{alert['chain']} score={alert['total_score']}")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
 
@@ -813,7 +998,7 @@ async def bot_task():
     start_time = time.time()
     last_heartbeat_time = start_time
 
-    logger.info("🚀 Pump Bot v3 starting...")
+    logger.info("🚀 Pump Bot v4 starting (onchain-first)...")
 
     async with aiohttp.ClientSession() as session:
         if COINGECKO_API_KEY:
@@ -824,11 +1009,10 @@ async def bot_task():
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
-                    f"✅ <b>Pump Bot v3</b> started\n"
+                    f"✅ <b>Pump Bot v4</b> started (Onchain-First)\n"
                     f"Scan interval: {SCAN_INTERVAL}s\n"
                     f"Networks: {', '.join(NETWORKS).upper()}\n"
-                    f"Min liquidity: ${MIN_LIQUIDITY_USD:,.0f}\n"
-                    f"Alert threshold: {ALERT_THRESHOLD}\n"
+                    f"Alert threshold: {ALERT_THRESHOLD}/100\n"
                     f"Max allowed tax: {MAX_ALLOWED_TAX}%\n"
                     f"Moralis: {'✅' if MORALIS_API_KEY else '❌'} | "
                     f"CoinGecko: {'✅' if COINGECKO_API_KEY else '⚪ free tier'}"
@@ -846,7 +1030,7 @@ async def bot_task():
                 uptime = (time.time() - start_time) / 3600
                 await bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"🫀 <b>Bot v3 Heartbeat</b>\nUptime: {uptime:.1f}h\nPairs scanned: {total_pairs_scanned}\nAlerts sent: {alerts_sent}",
+                    text=f"🫀 <b>Bot v4 Heartbeat</b>\nUptime: {uptime:.1f}h\nPairs scanned: {total_pairs_scanned}\nAlerts sent: {alerts_sent}",
                     parse_mode=ParseMode.HTML
                 )
                 last_heartbeat_time = time.time()
@@ -856,6 +1040,7 @@ async def bot_task():
                     break
                 pairs = await get_all_pairs(session, network)
                 total_pairs_scanned += len(pairs)
+                logger.info(f"🔍 {network}: {len(pairs)} pairs to evaluate")
 
                 tasks = [evaluate_token(session, p) for p in pairs]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -914,5 +1099,5 @@ async def health_check():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"🚀 Starting Pump Bot v3 on port {port}")
+    logger.info(f"🚀 Starting Pump Bot v4 on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
