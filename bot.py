@@ -107,7 +107,7 @@ WETH = {
     "robinhood": os.getenv("ROBINHOOD_WNATIVE", ""),
 }
 
-NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "RBH"}
+NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
 NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
 
 V3_FEE_TIERS = [3000, 10000, 500]
@@ -143,7 +143,7 @@ DEFAULT_BUY_AMOUNTS = {
     "ethereum": [0.001, 0.003, 0.005, 0.01],
     "bsc": [0.01, 0.03, 0.05, 0.1],
     "base": [0.001, 0.003, 0.005, 0.01],
-    "robinhood": [0.5, 1.0, 2.0, 5.0],
+    "robinhood": [0.001, 0.003, 0.005, 0.01],
 }
 
 DEFAULT_TP_LEVELS = [
