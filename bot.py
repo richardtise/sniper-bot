@@ -110,7 +110,13 @@ WETH = {
 NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
 NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
 
-V3_FEE_TIERS = [3000, 10000, 500]
+V3_FEE_TIERS_BY_CHAIN = {
+    "ethereum": [500, 3000, 10000, 100], #uniswap V3 standard tiers
+    "base": [500, 3000, 10000, 100],
+    "bsc": [500, 2500, 10000, 100], #PancakeSwap V3
+    "robinhood": [500, 3000, 10000, 100],
+}
+V3_FEE_TIERS = [500, 3000, 10000, 100, 2500]
 
 SCAN_INTERVAL = 30
 HEARTBEAT_INTERVAL = 3600
@@ -1030,43 +1036,88 @@ async def estimate_output_fallback(w3, chain, token_in, token_out, amount_in, pr
         logger.debug(f"Fallback estimation failed: {e}")
         return None
 
-async def try_v3_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, slippage, price_native=None, token_decimals=None):
+async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
+                      is_eth_input, slippage, price_native=None, token_decimals=None):
+    """
+    Quote ALL fee tiers first via QuoterV2, pick the best, submit ONE transaction.
+    No fallback estimates — if the quoter can't find a pool, we don't swap.
+    """
     router_addr = ROUTERS_V3.get(chain)
     if not router_addr or not Web3.is_address(router_addr):
-        return False, f"No V3 router for {chain}", 0
+        return False, f"No V3 router configured for {chain}", 0
+
     router = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=V3_ROUTER_ABI)
-    for fee in V3_FEE_TIERS:
+    
+    # Using the original variable name!
+    fee_tiers = V3_FEE_TIERS
+
+    # ── Phase 1: Quote every fee tier (no transactions submitted) ──────────
+    best_amount_out = 0
+    best_fee = None
+    quotes_tried = []
+
+    for fee in fee_tiers:
         amount_out = await quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee)
-        if amount_out is None and price_native and token_decimals:
-            amount_out = await estimate_output_fallback(w3, chain, token_in, token_out, amount_in, price_native, token_decimals)
-        if amount_out is None: continue
-        amount_out_min = int(amount_out * (1 - slippage / 100))
-        if amount_out_min <= 0: amount_out_min = 1
-        params = (
-            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out),
-            fee, Web3.to_checksum_address(WALLET_ADDRESS),
-            amount_in, amount_out_min, 0
-        )
-        try:
-            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS)
-            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
-            tx_dict = {'from': WALLET_ADDRESS, 'gas': 350000, 'gasPrice': int(gas_price * 1.2), 'nonce': nonce}
-            if is_eth_input: tx_dict['value'] = amount_in
-            tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
-            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.raw_transaction)
-            logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={fee} | minOut={amount_out_min}")
-            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
-            if receipt.status != 1:
-                return False, f"Tx failed: {tx_hash.hex()}", 0
-            return True, tx_hash.hex(), amount_out
-        except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in ["invalid fee", "no pool", "revert"]):
-                continue
-            logger.error(f"V3 swap failed for fee={fee}: {e}")
-            return False, str(e), 0
-    return False, "No valid V3 pool found for any fee tier", 0
+        if amount_out and amount_out > 0:
+            quotes_tried.append(f"fee={fee} → {amount_out}")
+            if amount_out > best_amount_out:
+                best_amount_out = amount_out
+                best_fee = fee
+        else:
+            quotes_tried.append(f"fee={fee} → no pool")
+
+    # ── No valid quote found → fail gracefully (NO transaction submitted) ──
+    if best_fee is None or best_amount_out == 0:
+        detail = " | ".join(quotes_tried)
+        logger.warning(f"No V3 pool found for {chain} token={token_out[:10]}... tried: {detail}")
+        return False, f"No V3 pool found on {chain} (tried fees {fee_tiers})", 0
+
+    # ── Phase 2: Submit ONE transaction with the best quote ────────────────
+    amount_out_min = int(best_amount_out * (1 - slippage / 100))
+    if amount_out_min <= 0:
+        amount_out_min = 1
+
+    params = (
+        Web3.to_checksum_address(token_in),
+        Web3.to_checksum_address(token_out),
+        best_fee,
+        Web3.to_checksum_address(WALLET_ADDRESS),
+        amount_in,
+        amount_out_min,
+        0,  # sqrtPriceLimitX96 = 0 (no limit)
+    )
+
+    try:
+        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS)
+        gas_price = await asyncio.to_thread(w3.eth.gas_price)
+        tx_dict = {
+            'from': WALLET_ADDRESS,
+            'gas': 350000,
+            'gasPrice': int(gas_price * 1.2),
+            'nonce': nonce,
+        }
+        if is_eth_input:
+            tx_dict['value'] = amount_in
+
+        tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.rawTransaction)
+
+        logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={best_fee} | minOut={amount_out_min}")
+
+        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+
+        if receipt.status != 1:
+            logger.error(f"V3 swap REVERTED on-chain: {tx_hash.hex()} | fee={best_fee}")
+            return False, f"Tx reverted on-chain (hash: {tx_hash.hex()})", 0
+
+        logger.info(f"V3 swap CONFIRMED: {tx_hash.hex()} | fee={best_fee}")
+        return True, tx_hash.hex(), best_amount_out
+
+    except Exception as e:
+        err = str(e)
+        logger.error(f"V3 swap exception for fee={best_fee}: {err}")
+        return False, err, 0
 
 async def execute_buy(chain: str, token_address: str, amount_native: float, slippage: float = None, price_native: float = None):
     if slippage is None:
