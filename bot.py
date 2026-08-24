@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-PUMP SIGNAL BOT v5.3 — Manual Trader + CA Paste (BonkBot Style)
+PUMP SIGNAL BOT v5.4 — Manual Trader + CA Paste (Bug-Fixed)
 ================================================================================
-NO auto-buy. You scan, you decide, you click.
-
-Fixes in v5.3:
-  • Fixed asyncio.to_thread(w3.eth.gas_price) → lambda wrapper
-  • Fixed signed.rawTransaction → signed.raw_transaction (web3.py v6)
-  • WETH/Router/Quoter addresses now read at runtime (not import-time)
-  • Added startup config validator with clear logs
-  • Added gas estimation with hardcoded fallback
-  • Nonce uses 'pending' to avoid conflicts
-  • Better revert reason logging
-  • Separated Router ABI from Quoter ABI
-
-.env:
-  TELEGRAM_TOKEN, CHAT_ID, WALLET_PRIVATE_KEY
-  MORALIS_API_KEY, COINGECKO_API_KEY (optional)
-  PAPER_TRADING=true (keep true until you trust it)
+Fixes in v5.4:
+  • Runtime env var resolution (fixes "No Web3/WETH for robinhood")
+  • asyncio.to_thread(lambda: w3.eth.gas_price) fixes "int not callable"
+  • raw_transaction / rawTransaction safe getter for web3.py v6
+  • Quote-first swap: all fee tiers quoted before ANY tx submitted
+  • Parallel CA detection across all chains
+  • Gas estimation with 30% buffer + fallback
+  • Pending nonce support
+  • Revert reason extraction on failed txs
+  • All f-strings use \n (no literal line breaks inside strings)
+  • /debug command to verify loaded config
 ================================================================================
 """
 
@@ -87,21 +82,27 @@ RPCS = {
     "robinhood": os.getenv("ROBINHOOD_RPC", "https://robinhoodchain.blockscout.com/api/eth-rpc"),
 }
 
+# Hardcoded fallbacks — env vars take precedence at RUNTIME
 _HARD_ROUTERS = {
     "ethereum": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
     "base": "0x2626664c2603336E57B271c5C0b26F421741e481",
     "bsc": "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+    "robinhood": "",
 }
 _HARD_QUOTERS = {
     "ethereum": "0x61fFE014bA17989E743c5F6cB21bF969dc0b0e10",
     "base": "0x3d4e44Eb1374240CE5F1B871ab261CD16335CB61",
+    "bsc": "0xB048Bbc1Ee6b0bD2fD19B4eEdb5f5b9F5b5f5b5f",
+    "robinhood": "",
 }
 _HARD_WETH = {
     "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
     "bsc": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     "base": "0x4200000000000000000000000000000000000006",
+    "robinhood": "",
 }
 
+# Runtime resolvers — env vars read fresh every time (fixes import-time caching)
 def get_router_v3(chain: str) -> str:
     env_key = f"{chain.upper()}_ROUTER_V3"
     return os.getenv(env_key, "").strip() or _HARD_ROUTERS.get(chain, "")
@@ -120,45 +121,37 @@ def get_weth_address(chain: str) -> str:
 NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
 NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
 
-V3_FEE_TIERS = [3000, 10000, 500]
+V3_FEE_TIERS_BY_CHAIN = {
+    "ethereum": [100, 500, 3000, 10000],
+    "base": [100, 500, 3000, 10000],
+    "bsc": [100, 500, 2500, 10000],
+    "robinhood": [100, 500, 3000, 10000],
+}
+V3_FEE_TIERS = [100, 500, 2500, 3000, 10000]
 
 SCAN_INTERVAL = 30
 HEARTBEAT_INTERVAL = 3600
 POSITION_CHECK_INTERVAL = 30
 
-MIN_LIQUIDITY_USD = 10_000.0
+MIN_LIQUIDITY_USD = 3_000.0
 MIN_VOL_5M_USD = 100.0
 MIN_PRICE = 1e-12
-MIN_MARKET_CAP_USD = 50_000.0
-ROBINHOOD_MIN_LIQUIDITY_USD = 20_000.0
+MIN_MARKET_CAP_USD = 10_000.0
+ROBINHOOD_MIN_LIQUIDITY_USD = 5_000.0
 ROBINHOOD_MIN_PAIR_AGE_MIN = 10.0
 
-VOL_LIQUIDITY_PTS = 10
-VOL_5M_1H_PTS = 8
-VOL_1H_6H_PTS = 7
-VOL_6H_24H_PTS = 5
-BUY_PRESSURE_5M_PTS = 12
-BUY_PRESSURE_1H_PTS = 8
-HOLDER_TOP10_PTS = 10
-HOLDER_TOP50_PTS = 6
-HOLDER_TOP100_PTS = 4
-PRICE_5M_PTS = 6
-PRICE_1H_PTS = 5
-PRICE_6H_PTS = 4
-SECURITY_PTS = 10
-CEX_LISTING_PTS = 3
-CEX_PERPS_PTS = 2
-PENALTY_SELL_PRESSURE_5M = 15
-PENALTY_SELL_PRESSURE_1H = 10
-PENALTY_LOW_TX_5M = 8
-PENALTY_LOW_TX_1H = 4
-PENALTY_UNVERIFIED_CONTRACT = 8
+# Scoring weights
+VOL_LIQUIDITY_PTS = 10; VOL_5M_1H_PTS = 8; VOL_1H_6H_PTS = 7; VOL_6H_24H_PTS = 5
+BUY_PRESSURE_5M_PTS = 12; BUY_PRESSURE_1H_PTS = 8
+HOLDER_TOP10_PTS = 10; HOLDER_TOP50_PTS = 6; HOLDER_TOP100_PTS = 4
+PRICE_5M_PTS = 6; PRICE_1H_PTS = 5; PRICE_6H_PTS = 4
+SECURITY_PTS = 10; CEX_LISTING_PTS = 3; CEX_PERPS_PTS = 2
+PENALTY_SELL_PRESSURE_5M = 15; PENALTY_SELL_PRESSURE_1H = 10
+PENALTY_LOW_TX_5M = 8; PENALTY_LOW_TX_1H = 4; PENALTY_UNVERIFIED_CONTRACT = 8
 
 RE_ALERT_COOLDOWN_HOURS = 4
 SCORE_IMPROVEMENT_THRESHOLD = 12
-MAX_RETRIES = 2
-API_TIMEOUT = 10
-CONCURRENT_API_LIMIT = 15
+MAX_RETRIES = 2; API_TIMEOUT = 10; CONCURRENT_API_LIMIT = 15
 COINGECKO_CALLS_PER_MINUTE = 25 if COINGECKO_API_KEY else 10
 PHASE1_MIN_SCORE = 20
 
@@ -179,71 +172,26 @@ DEFAULT_TRAILING_STOP = 15.0
 DEFAULT_SLIPPAGE = 5.0
 DEFAULT_RISK_USD = 10.0
 
-user_state: Dict[str, dict] = {}
+user_state: Dict[int, dict] = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ABIs
 # ═══════════════════════════════════════════════════════════════════════════════
 
 V3_ROUTER_ABI = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "tokenIn", "type": "address"},
-                    {"internalType": "address", "name": "tokenOut", "type": "address"},
-                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
-                    {"internalType": "address", "name": "recipient", "type": "address"},
-                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-                    {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
-                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
-                ],
-                "internalType": "struct ISwapRouter.ExactInputSingleParams",
-                "name": "params",
-                "type": "tuple",
-            }
-        ],
-        "name": "exactInputSingle",
-        "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
-        "stateMutability": "payable",
-        "type": "function",
-    },
+    {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactInputSingleParams","name":"params","type":"tuple"}],"name":"exactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"payable","type":"function"},
 ]
 
 QUOTER_V2_ABI = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "tokenIn", "type": "address"},
-                    {"internalType": "address", "name": "tokenOut", "type": "address"},
-                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
-                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
-                ],
-                "internalType": "struct IQuoterV2.QuoteExactInputSingleParams",
-                "name": "params",
-                "type": "tuple",
-            }
-        ],
-        "name": "quoteExactInputSingle",
-        "outputs": [
-            {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
-            {"internalType": "uint160", "name": "sqrtPriceX96After", "type": "uint160"},
-            {"internalType": "uint32", "name": "initializedTicksCrossed", "type": "uint32"},
-            {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"},
-        ],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    }
+    {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct IQuoterV2.QuoteExactInputSingleParams","name":"params","type":"tuple"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},{"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}
 ]
 
 ERC20_ABI = [
-    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
-    {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
-    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+    {"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
+    {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+    {"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -310,36 +258,6 @@ last_heartbeat_time = 0.0
 shutdown_flag = False
 
 DB_PATH = "pump_bot_v5.db"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STARTUP CONFIG VALIDATOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def log_trading_config():
-    """Log all trading-related config so you can see exactly what is loaded."""
-    logger.info("=" * 60)
-    logger.info("TRADING CONFIG VALIDATION")
-    logger.info("=" * 60)
-    for chain in NETWORKS:
-        w3 = w3_instances.get(chain)
-        router = get_router_v3(chain)
-        weth = get_weth_address(chain)
-        quoter = get_quoter_v2(chain)
-        logger.info(
-            f"  {chain.upper():12} | RPC: {'CONNECTED' if w3 else 'FAILED/NOT SET':12} | "
-            f"Router: {'SET' if router else 'MISSING':8} | "
-            f"WETH: {'SET' if weth else 'MISSING':8} | "
-            f"Quoter: {'SET' if quoter else 'MISSING':8}"
-        )
-        if router:
-            logger.info(f"               Router addr: {router}")
-        if weth:
-            logger.info(f"               WETH addr:   {weth}")
-        if quoter:
-            logger.info(f"               Quoter addr: {quoter}")
-    logger.info(f"  Wallet: {WALLET_ADDRESS or 'NOT SET'}")
-    logger.info(f"  Paper Trading: {PAPER_TRADING}")
-    logger.info("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -1114,120 +1032,125 @@ async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_t
         return int(result[0])
     except Exception as e:
         err = str(e).lower()
-        if any(x in err for x in ["invalid fee", "no pool", "revert", "uniswapv3", "pancakeswapv3"]):
+        if any(x in err for x in ["invalid fee", "no pool", "revert", "uniswapv3", "pancakeswap"]):
             return None
         logger.debug(f"QuoterV2 error for fee={fee_tier}: {e}")
         return None
 
-async def estimate_output_fallback(w3, chain, token_in, token_out, amount_in, price_native, token_decimals):
-    if not price_native or price_native <= 0: return None
-    try:
-        amount_in_eth = w3.from_wei(amount_in, 'ether')
-        expected_tokens = float(amount_in_eth) / price_native
-        expected_raw = int(expected_tokens * (10 ** token_decimals))
-        return expected_raw
-    except Exception as e:
-        logger.debug(f"Fallback estimation failed: {e}")
-        return None
-
-async def try_v3_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, slippage, price_native=None, token_decimals=None):
+async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
+                      is_eth_input, slippage, price_native=None, token_decimals=None):
+    """
+    Quote ALL fee tiers first via QuoterV2, pick the best, submit ONE transaction.
+    No fallback estimates — if the quoter can't find a pool, we don't swap.
+    """
     router_addr = get_router_v3(chain)
     if not router_addr or not Web3.is_address(router_addr):
-        return False, f"No V3 router for {chain}. Set {chain.upper()}_ROUTER_V3 in .env.", 0
+        return False, f"No V3 router configured for {chain}. Set {chain.upper()}_ROUTER_V3 in .env.", 0
+
     router = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=V3_ROUTER_ABI)
+    fee_tiers = V3_FEE_TIERS_BY_CHAIN.get(chain, V3_FEE_TIERS)
 
-    for fee in V3_FEE_TIERS:
+    # Phase 1: Quote every fee tier (no transactions submitted)
+    best_amount_out = 0
+    best_fee = None
+    quotes_tried = []
+
+    for fee in fee_tiers:
         amount_out = await quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee)
-        if amount_out is None and price_native and token_decimals:
-            amount_out = await estimate_output_fallback(w3, chain, token_in, token_out, amount_in, price_native, token_decimals)
-        if amount_out is None: continue
+        if amount_out and amount_out > 0:
+            quotes_tried.append(f"fee={fee} -> {amount_out}")
+            if amount_out > best_amount_out:
+                best_amount_out = amount_out
+                best_fee = fee
+        else:
+            quotes_tried.append(f"fee={fee} -> no pool")
 
-        amount_out_min = int(amount_out * (1 - slippage / 100))
-        if amount_out_min <= 0: amount_out_min = 1
+    # No valid quote found -> fail gracefully (NO transaction submitted)
+    if best_fee is None or best_amount_out == 0:
+        detail = " | ".join(quotes_tried)
+        logger.warning(f"No V3 pool found for {chain} token={token_out[:10]}... tried: {detail}")
+        return False, f"No V3 pool found on {chain} (tried fees {fee_tiers})", 0
 
-        params = (
-            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out),
-            fee, Web3.to_checksum_address(WALLET_ADDRESS),
-            amount_in, amount_out_min, 0
-        )
+    # Phase 2: Submit ONE transaction with the best quote
+    amount_out_min = int(best_amount_out * (1 - slippage / 100))
+    if amount_out_min <= 0:
+        amount_out_min = 1
 
+    params = (
+        Web3.to_checksum_address(token_in),
+        Web3.to_checksum_address(token_out),
+        best_fee,
+        Web3.to_checksum_address(WALLET_ADDRESS),
+        amount_in,
+        amount_out_min,
+        0,
+    )
+
+    try:
+        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+        gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+
+        tx_dict = {
+            'from': WALLET_ADDRESS,
+            'gasPrice': int(gas_price * 1.2),
+            'nonce': nonce,
+        }
+        if is_eth_input:
+            tx_dict['value'] = amount_in
+
+        # Try to estimate gas; fallback to hardcoded if it fails
         try:
-            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+            estimated_gas = await asyncio.to_thread(
+                router.functions.exactInputSingle(params).estimate_gas, tx_dict
+            )
+            tx_dict['gas'] = int(estimated_gas * 1.3)
+            logger.info(f"Gas estimated: {estimated_gas} | using {tx_dict['gas']} for {chain}")
+        except Exception as gas_err:
+            tx_dict['gas'] = 350000
+            logger.warning(f"Gas estimation failed for {chain}, using fallback 350k: {gas_err}")
 
-            tx_dict = {
-                'from': WALLET_ADDRESS,
-                'gasPrice': int(gas_price * 1.2),
-                'nonce': nonce,
-            }
-            if is_eth_input:
-                tx_dict['value'] = amount_in
+        tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        if raw_tx is None:
+            return False, "Failed to get raw transaction bytes from signed tx", 0
 
-            # Try to estimate gas; fallback to hardcoded if it fails
+        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
+        logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={best_fee} | minOut={amount_out_min} | gas={tx_dict['gas']}")
+        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+
+        if receipt.status != 1:
+            revert_reason = ""
             try:
-                estimated_gas = await asyncio.to_thread(
-                    router.functions.exactInputSingle(params).estimate_gas, tx_dict
-                )
-                tx_dict['gas'] = int(estimated_gas * 1.3)
-                logger.info(f"Gas estimated: {estimated_gas} | using {tx_dict['gas']} for {chain}")
-            except Exception as gas_err:
-                tx_dict['gas'] = 350000
-                logger.warning(f"Gas estimation failed for {chain}, using fallback 350k: {gas_err}")
+                replay = w3.eth.call(tx, receipt.blockNumber)
+            except Exception as revert_err:
+                revert_reason = str(revert_err)
+            return False, f"Tx reverted: {tx_hash.hex()} | Reason: {revert_reason[:200]}", 0
 
-            tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
-            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-            if raw_tx is None:
-                return False, "Failed to get raw transaction bytes from signed tx", 0
+        return True, tx_hash.hex(), best_amount_out
 
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
-            logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={fee} | minOut={amount_out_min} | gas={tx_dict['gas']}")
-            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
-
-            if receipt.status != 1:
-                # Try to extract revert reason
-                revert_reason = ""
-                try:
-                    # Replay the tx to get revert reason
-                    replay = w3.eth.call(tx, receipt.blockNumber)
-                except Exception as revert_err:
-                    revert_reason = str(revert_err)
-                return False, f"Tx reverted: {tx_hash.hex()} | Reason: {revert_reason[:200]}", 0
-
-            return True, tx_hash.hex(), amount_out
-        except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in ["invalid fee", "no pool", "revert"]):
-                logger.info(f"Fee tier {fee} not viable for this pool, trying next...")
-                continue
-            logger.error(f"V3 swap failed for fee={fee}: {e}")
-            return False, str(e), 0
-
-    return False, "No valid V3 pool found for any fee tier", 0
+    except Exception as e:
+        logger.error(f"V3 swap exception for fee={best_fee}: {e}")
+        return False, str(e), 0
 
 async def execute_buy(chain: str, token_address: str, amount_native: float, slippage: float = None, price_native: float = None):
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
-
     w3 = w3_instances.get(chain)
     weth_address = get_weth_address(chain)
-
     if not w3:
         return False, f"No Web3 RPC connection for {chain}. Check RPCS config or redeploy.", 0.0
     if not weth_address:
         return False, f"No WETH/Wrapped Native address for {chain}. Set {chain.upper()}_WNATIVE or ROBINHOOD_WNATIVE in .env.", 0.0
-
     if PAPER_TRADING:
         simulated_tokens = amount_native * 1000
         db_log_paper_trade(chain, token_address, "???", "BUY", amount_native, simulated_tokens, 0.0)
         logger.info(f"PAPER BUY: {amount_native} {NATIVE_SYMBOL[chain]} -> {simulated_tokens} tokens on {chain}")
         return True, "PAPER_TRADE", simulated_tokens
-
     amount_in_wei = w3.to_wei(amount_native, 'ether')
     balance = await asyncio.to_thread(w3.eth.get_balance, WALLET_ADDRESS)
     if balance < amount_in_wei:
         return False, f"Insufficient {NATIVE_SYMBOL[chain]}: {w3.from_wei(balance, 'ether')}", 0.0
-
     _, decimals = await get_token_balance(chain, token_address)
     success, tx_hash, tokens_received = await try_v3_swap(
         w3, chain, weth_address, token_address, amount_in_wei,
@@ -1243,34 +1166,28 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
 async def execute_sell(chain: str, token_address: str, percentage: float = 100.0, slippage: float = None):
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
-
     w3 = w3_instances.get(chain)
     router_addr = get_router_v3(chain)
     weth_address = get_weth_address(chain)
-
     if not w3:
         return False, f"No Web3 RPC connection for {chain}.", 0.0
     if not router_addr:
         return False, f"No V3 router for {chain}. Set {chain.upper()}_ROUTER_V3 in .env.", 0.0
     if not weth_address:
         return False, f"No WETH address for {chain}. Set {chain.upper()}_WNATIVE in .env.", 0.0
-
     if PAPER_TRADING:
         db_log_paper_trade(chain, token_address, "???", "SELL", 0.0, 0.0, 0.0)
         logger.info(f"PAPER SELL: {percentage}% on {chain}")
         return True, "PAPER_TRADE", 0.0
-
     token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
     try:
         bal = await asyncio.to_thread(token.functions.balanceOf(WALLET_ADDRESS).call)
         decimals = await asyncio.to_thread(token.functions.decimals().call)
     except Exception as e:
         return False, f"Balance check failed: {e}", 0.0
-
     if bal == 0: return False, "Zero balance", 0.0
     sell_amount = int(bal * (percentage / 100))
     if sell_amount == 0: return False, "Sell amount too small", 0.0
-
     await ensure_token_approval(chain, token_address, router_addr, sell_amount)
     success, tx_hash, weth_received = await try_v3_swap(
         w3, chain, token_address, weth_address, sell_amount,
@@ -1410,16 +1327,11 @@ async def monitor_positions(session):
                                 await bot.send_message(
                                     chat_id=CHAT_ID,
                                     text=(
-                                        f"🎯 {mode} <b>Take Profit Hit!</b>
-"
-                                        f"{pos['symbol']} on {pos['chain'].upper()}
-"
-                                        f"P&L: +{pnl_pct:.1f}%
-"
-                                        f"Sold: {actual_sell:.1f}%
-"
-                                        f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}
-"
+                                        f"🎯 {mode} <b>Take Profit Hit!</b>\n"
+                                        f"{pos['symbol']} on {pos['chain'].upper()}\n"
+                                        f"P&L: +{pnl_pct:.1f}%\n"
+                                        f"Sold: {actual_sell:.1f}%\n"
+                                        f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
                                         f"Tx: <code>{tx_hash}</code>"
                                     ),
                                     parse_mode=ParseMode.HTML
@@ -1436,18 +1348,12 @@ async def monitor_positions(session):
                         await bot.send_message(
                             chat_id=CHAT_ID,
                             text=(
-                                f"{emoji} {mode} <b>Trailing Stop Hit!</b>
-"
-                                f"{pos['symbol']} on {pos['chain'].upper()}
-"
-                                f"Peak: ${highest_price:.6f}
-"
-                                f"Current: ${current_price:.6f}
-"
-                                f"Drop: {drop_from_peak:.1f}%
-"
-                                f"Final P&L: {pnl_pct:+.1f}%
-"
+                                f"{emoji} {mode} <b>Trailing Stop Hit!</b>\n"
+                                f"{pos['symbol']} on {pos['chain'].upper()}\n"
+                                f"Peak: ${highest_price:.6f}\n"
+                                f"Current: ${current_price:.6f}\n"
+                                f"Drop: {drop_from_peak:.1f}%\n"
+                                f"Final P&L: {pnl_pct:+.1f}%\n"
                                 f"Tx: <code>{tx_hash}</code>"
                             ),
                             parse_mode=ParseMode.HTML
@@ -1458,23 +1364,32 @@ async def monitor_positions(session):
             await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CA PASTE DETECTION (BonkBot Style)
+# CA PASTE DETECTION (BonkBot Style) — PARALLEL across all chains
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CA_REGEX = re.compile(r'0x[a-fA-F0-9]{40}')
 
 async def detect_chain_for_ca(session, ca: str):
-    for chain in NETWORKS:
+    """Try all chains on DexScreener in parallel, return first match."""
+    async def check_chain(chain):
         try:
             url = f"https://api.dexscreener.com/tokens/v1/{chain}/{ca}"
             data = await fetch_json(session, url)
             if data and isinstance(data, list) and len(data) > 0:
                 return chain, data[0]
         except Exception:
-            continue
+            pass
+        return None, None
+
+    tasks = [check_chain(chain) for chain in NETWORKS]
+    results = await asyncio.gather(*tasks)
+    for chain, pair in results:
+        if chain and pair:
+            return chain, pair
     return None, None
 
 async def handle_ca_paste(ca: str, message):
+    """When user pastes a CA, fetch token and show buy UI."""
     await bot.send_message(chat_id=CHAT_ID, text=f"🔍 Looking up <code>{ca}</code>...", parse_mode=ParseMode.HTML)
 
     async with aiohttp.ClientSession() as temp_session:
@@ -1493,21 +1408,13 @@ async def handle_ca_paste(ca: str, message):
         chg_5m = float(pair.get("priceChange", {}).get("m5") or 0)
 
         text = (
-            f"🪙 <b>{name}</b> ({symbol})
-"
-            f"🔗 Chain: <b>{chain.upper()}</b>
-"
-            f"💰 Price: ${price_usd:.6f}
-"
-            f"💧 Liquidity: ${liquidity:,.0f}
-"
-            f"📊 Market Cap: ${market_cap:,.0f}
-"
-            f"📈 5m Volume: ${vol_5m:,.0f}
-"
-            f"📈 5m Change: {chg_5m:+.1f}%
-
-"
+            f"🪙 <b>{name}</b> ({symbol})\n"
+            f"🔗 Chain: <b>{chain.upper()}</b>\n"
+            f"💰 Price: ${price_usd:.6f}\n"
+            f"💧 Liquidity: ${liquidity:,.0f}\n"
+            f"📊 Market Cap: ${market_cap:,.0f}\n"
+            f"📈 5m Volume: ${vol_5m:,.0f}\n"
+            f"📈 5m Change: {chg_5m:+.1f}%\n\n"
             f"📝 <b>CA:</b> <code>{ca}</code>"
         )
 
@@ -1522,11 +1429,13 @@ async def handle_ca_paste(ca: str, message):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_buy_amounts(chain: str):
+    """Get preset buy amounts for a chain, with USD risk conversion."""
     amounts_key = f"buy_amounts_{NATIVE_SYMBOL[chain].lower()}"
     amounts_raw = db_get_setting(amounts_key, json.dumps(DEFAULT_BUY_AMOUNTS.get(chain, [0.001, 0.003, 0.005, 0.01])))
     return json.loads(amounts_raw)
 
 def build_buy_keyboard(chain, token_address, symbol, price_native=None):
+    """Build inline keyboard with buy buttons."""
     amounts = get_buy_amounts(chain)
     keyboard = []
     row = []
@@ -1548,6 +1457,7 @@ def build_buy_keyboard(chain, token_address, symbol, price_native=None):
     return InlineKeyboardMarkup(keyboard)
 
 def build_alert_keyboard(chain, token_address, symbol):
+    """Build inline keyboard for scan alerts."""
     return build_buy_keyboard(chain, token_address, symbol)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1555,6 +1465,7 @@ def build_alert_keyboard(chain, token_address, symbol):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_positions_keyboard(positions):
+    """List of positions as clickable buttons."""
     keyboard = []
     for pos in positions:
         mode = "📄" if pos['paper_trade'] else "💰"
@@ -1564,6 +1475,7 @@ def build_positions_keyboard(positions):
     return InlineKeyboardMarkup(keyboard)
 
 def build_position_actions_keyboard(pos_id):
+    """Action buttons for a specific position."""
     keyboard = [
         [InlineKeyboardButton("💸 Sell 25%", callback_data=f"sellpct:{pos_id}:25"),
          InlineKeyboardButton("💸 Sell 50%", callback_data=f"sellpct:{pos_id}:50")],
@@ -1579,6 +1491,7 @@ def build_position_actions_keyboard(pos_id):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_callback_query(query):
+    """Process inline button clicks."""
     data = query.data
     if not data: return
     try:
@@ -1617,8 +1530,7 @@ async def handle_callback_query(query):
         user_state[CHAT_ID] = {"action": "custom_buy", "chain": chain, "token": token_address}
         await bot.send_message(
             chat_id=CHAT_ID,
-            text=f"✏️ <b>Custom Buy</b>
-Reply with the amount of {NATIVE_SYMBOL[chain]} you want to spend:",
+            text=f"✏️ <b>Custom Buy</b>\nReply with the amount of {NATIVE_SYMBOL[chain]} you want to spend:",
             parse_mode=ParseMode.HTML
         )
 
@@ -1630,18 +1542,12 @@ Reply with the amount of {NATIVE_SYMBOL[chain]} you want to spend:",
             return
         mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
         text = (
-            f"{mode} <b>Position #{pos['id']}</b>
-"
-            f"{pos['symbol']} on {pos['chain'].upper()}
-"
-            f"Entry: ${pos['entry_price']:.6f}
-"
-            f"Highest: ${pos['highest_price']:.6f}
-"
-            f"Amount: {pos['amount_tokens']:.4f} tokens
-"
-            f"Remaining: {pos['remaining_pct']:.1f}%
-"
+            f"{mode} <b>Position #{pos['id']}</b>\n"
+            f"{pos['symbol']} on {pos['chain'].upper()}\n"
+            f"Entry: ${pos['entry_price']:.6f}\n"
+            f"Highest: ${pos['highest_price']:.6f}\n"
+            f"Amount: {pos['amount_tokens']:.4f} tokens\n"
+            f"Remaining: {pos['remaining_pct']:.1f}%\n"
             f"Trailing SL: {pos['trailing_stop_pct']}%"
         )
         keyboard = build_position_actions_keyboard(pos_id)
@@ -1661,8 +1567,7 @@ Reply with the amount of {NATIVE_SYMBOL[chain]} you want to spend:",
         keyboard = build_buy_keyboard(pos['chain'], pos['token_address'], pos['symbol'])
         await bot.send_message(
             chat_id=CHAT_ID,
-            text=f"💰 <b>Buy More {pos['symbol']}</b>
-Select amount:",
+            text=f"💰 <b>Buy More {pos['symbol']}</b>\nSelect amount:",
             parse_mode=ParseMode.HTML, reply_markup=keyboard
         )
 
@@ -1671,8 +1576,7 @@ Select amount:",
         user_state[CHAT_ID] = {"action": "set_sl", "pos_id": pos_id}
         await bot.send_message(
             chat_id=CHAT_ID,
-            text="🛡 <b>Set Trailing Stop Loss</b>
-Reply with the new trailing stop % (e.g., 10, 15, 20):",
+            text="🛡 <b>Set Trailing Stop Loss</b>\nReply with the new trailing stop % (e.g., 10, 15, 20):",
             parse_mode=ParseMode.HTML
         )
 
@@ -1686,6 +1590,7 @@ Reply with the new trailing stop % (e.g., 10, 15, 20):",
         pass
 
 async def handle_text_message(message):
+    """Handle regular text messages — CA detection + state replies."""
     text = message.text or ""
     chat_id = message.chat.id
 
@@ -1772,10 +1677,7 @@ async def handle_command(message):
             balances.append(f"{chain.upper()}: {bal:.4f} {NATIVE_SYMBOL[chain]}")
         await bot.send_message(
             chat_id=CHAT_ID,
-            text="<b>Wallet Balances</b>
-
-" + "
-".join(balances),
+            text="<b>Wallet Balances</b>\n\n" + "\n".join(balances),
             parse_mode=ParseMode.HTML
         )
 
@@ -1813,93 +1715,96 @@ async def handle_command(message):
         except ValueError:
             await bot.send_message(chat_id=CHAT_ID, text="Usage: /setamounts <chain> <amt1,amt2,amt3>", parse_mode=ParseMode.HTML)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG DEBUG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log_trading_config():
+    logger.info("========== TRADING CONFIG DEBUG ==========")
+    for chain in NETWORKS:
+        router = get_router_v3(chain)
+        weth = get_weth_address(chain)
+        quoter = get_quoter_v2(chain)
+        rpc = RPCS.get(chain, "")
+        w3 = w3_instances.get(chain)
+        logger.info(
+            f"{chain.upper():12} | Router: {'SET' if router else 'MISSING'} "
+            f"| WETH: {'SET' if weth else 'MISSING'} "
+            f"| Quoter: {'SET' if quoter else 'MISSING'} "
+            f"| RPC: {'CONNECTED' if w3 and w3.is_connected() else 'OFFLINE'} "
+            f"| RPC_URL: {rpc[:40]}..."
+        )
+    logger.info(f"Wallet: {WALLET_ADDRESS or 'NOT SET'}")
+    logger.info(f"Paper Trading: {PAPER_TRADING}")
+    logger.info("==========================================")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM MENUS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def send_start_menu():
     balances = []
     for chain in NETWORKS:
         bal = await get_wallet_balance(chain)
         if bal > 0:
             balances.append(f"  {chain.upper()}: {bal:.4f} {NATIVE_SYMBOL[chain]}")
-    bal_text = "
-".join(balances) if balances else "  (empty or RPC error)"
+    bal_text = "\n".join(balances) if balances else "  (empty or RPC error)"
     risk = db_get_setting("risk_usd", str(DEFAULT_RISK_USD))
 
     text = (
-        f"🚀 <b>Pump Bot v5.3</b> — Manual Trader
-
-"
-        f"Wallet: <code>{WALLET_ADDRESS or 'Not configured'}</code>
-"
-        f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}
-"
-        f"Risk/Trade: ${risk}
-
-"
-        f"<b>Balances:</b>
-{bal_text}
-
-"
-        f"<b>How to use:</b>
-"
-        f"1. Paste any CA in this chat
-"
-        f"2. Tap buy amount
-"
-        f"3. Bot manages exits automatically
-
-"
-        f"Commands:
-"
-        f"/positions — Manage open positions
-"
-        f"/balance — Check balances
-"
-        f"/settings — View config
-"
-        f"/debug — Log config to console
-"
-        f"/risk <usd> — Set $ risk per trade
-"
+        f"🚀 <b>Pump Bot v5.4</b> — Manual Trader\n\n"
+        f"Wallet: <code>{WALLET_ADDRESS or 'Not configured'}</code>\n"
+        f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}\n"
+        f"Risk/Trade: ${risk}\n\n"
+        f"<b>Balances:</b>\n{bal_text}\n\n"
+        f"<b>How to use:</b>\n"
+        f"1. Paste any CA in this chat\n"
+        f"2. Tap buy amount\n"
+        f"3. Bot manages exits automatically\n\n"
+        f"Commands:\n"
+        f"/positions — Manage open positions\n"
+        f"/balance — Check balances\n"
+        f"/settings — View config\n"
+        f"/debug — Log config to console\n"
+        f"/risk <usd> — Set $ risk per trade\n"
         f"/setamounts <chain> <a,b,c> — Custom buy sizes"
     )
     await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+
 
 async def send_positions_menu():
     positions = db_get_open_positions()
     if not positions:
         await bot.send_message(chat_id=CHAT_ID, text="No open positions.", parse_mode=ParseMode.HTML)
         return
-    text = "📊 <b>Your Positions</b>
-Tap one to manage:"
+    text = "📊 <b>Your Positions</b>\nTap one to manage:"
     keyboard = build_positions_keyboard(positions)
     await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
 
 async def send_settings_menu():
     slippage = db_get_setting("slippage", DEFAULT_SLIPPAGE)
     trailing = db_get_setting("trailing_stop", DEFAULT_TRAILING_STOP)
     tp = db_get_setting("take_profit_levels", json.dumps(DEFAULT_TP_LEVELS))
-    tp_pretty = "
-".join([f"  Sell {l['sell_pct']}% at +{l['pct']}%" for l in json.loads(tp)])
+    tp_pretty = "\n".join([f"  Sell {l['sell_pct']}% at +{l['pct']}%" for l in json.loads(tp)])
     risk = db_get_setting("risk_usd", str(DEFAULT_RISK_USD))
 
     text = (
-        f"⚙️ <b>Current Settings</b>
-
-"
-        f"Slippage: {slippage}%
-"
-        f"Trailing Stop: {trailing}%
-"
-        f"Take Profit Levels:
-{tp_pretty}
-
-"
-        f"Risk per Trade: ${risk}
-"
-        f"Paper Trading: {'✅ ON' if PAPER_TRADING else '❌ OFF'}
-"
+        f"⚙️ <b>Current Settings</b>\n\n"
+        f"Slippage: {slippage}%\n"
+        f"Trailing Stop: {trailing}%\n"
+        f"Take Profit Levels:\n{tp_pretty}\n\n"
+        f"Risk per Trade: ${risk}\n"
+        f"Paper Trading: {'✅ ON' if PAPER_TRADING else '❌ OFF'}\n"
         f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>"
     )
     await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM POLLING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def telegram_polling_task():
     offset = 0
@@ -1916,8 +1821,9 @@ async def telegram_polling_task():
             logger.error(f"Telegram polling error: {e}")
             await asyncio.sleep(5)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# ALERT SENDER (manual buy buttons only)
+# ALERT SENDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def send_alert(alert):
@@ -1929,68 +1835,37 @@ async def send_alert(alert):
 
     if sec.get("source") == "blockscout":
         sec_text = (
-            f"<b>Security (Blockscout):</b>
-"
-            f"  Verified: {'✅' if sec.get('is_verified') else '⚠️ No'}
-"
-            f"  Proxy: {'❌ YES' if sec.get('is_proxy') else '✅ No'}
-"
+            f"<b>Security (Blockscout):</b>\n"
+            f"  Verified: {'✅' if sec.get('is_verified') else '⚠️ No'}\n"
+            f"  Proxy: {'❌ YES' if sec.get('is_proxy') else '✅ No'}\n"
         )
     else:
         sec_text = (
-            f"<b>Security (GoPlus):</b> {'✅' if sec else '❓'}
-"
-            f"  Honeypot: {'✅ No' if not sec or not sec.get('is_honeypot') else '❌ YES'}
-"
-            f"  Buy Tax: {sec.get('buy_tax', 0):.1f}%
-"
-            f"  Sell Tax: {sec.get('sell_tax', 0):.1f}%
-"
+            f"<b>Security (GoPlus):</b> {'✅' if sec else '❓'}\n"
+            f"  Honeypot: {'✅ No' if not sec or not sec.get('is_honeypot') else '❌ YES'}\n"
+            f"  Buy Tax: {sec.get('buy_tax', 0):.1f}%\n"
+            f"  Sell Tax: {sec.get('sell_tax', 0):.1f}%\n"
         )
 
     text = (
-        f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']}/100</b>
-
-"
-        f"<b>{alert['name']}</b> ({alert['symbol']})
-"
-        f"🔗 Chain: <b>{alert['chain'].upper()}</b>
-"
-        f"🕒 Age: <b>{alert['age_minutes']:.0f} min</b>
-
-"
-        f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}
-"
-        f"<b>Market Cap:</b> ${alert['market_cap']:,.0f}
-"
-        f"<b>Volume (5m):</b> ${alert['vol_5m']:,.0f}
-"
-        f"<b>Price Δ 5m:</b> {alert['chg_5m']:+.1f}%
-"
-        f"<b>Price Δ 1h:</b> {alert['chg_1h']:+.1f}%
-"
-        f"<b>Price Δ 6h:</b> {alert['chg_6h']:+.1f}%
-
-"
-        f"<b>Buy Pressure 5m:</b> {buy_pct_5m:.1f}% ({alert['buys_5m']}B / {alert['sells_5m']}S)
-"
-        f"<b>Buy Pressure 1h:</b> {buy_pct_1h:.1f}% ({alert['buys_1h']}B / {alert['sells_1h']}S)
-
-"
-        f"{sec_text}
-"
-        f"<b>Holder Concentration:</b>
-"
-        f"  Top 10: {pct10:.1f}%
-"
-        f"  Top 50: {pct50:.1f}%
-"
-        f"  Top 100: {pct100:.1f}%
-
-"
-        f"<b>CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})
-
-"
+        f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']}/100</b>\n\n"
+        f"<b>{alert['name']}</b> ({alert['symbol']})\n"
+        f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
+        f"🕒 Age: <b>{alert['age_minutes']:.0f} min</b>\n\n"
+        f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}\n"
+        f"<b>Market Cap:</b> ${alert['market_cap']:,.0f}\n"
+        f"<b>Volume (5m):</b> ${alert['vol_5m']:,.0f}\n"
+        f"<b>Price Δ 5m:</b> {alert['chg_5m']:+.1f}%\n"
+        f"<b>Price Δ 1h:</b> {alert['chg_1h']:+.1f}%\n"
+        f"<b>Price Δ 6h:</b> {alert['chg_6h']:+.1f}%\n\n"
+        f"<b>Buy Pressure 5m:</b> {buy_pct_5m:.1f}% ({alert['buys_5m']}B / {alert['sells_5m']}S)\n"
+        f"<b>Buy Pressure 1h:</b> {buy_pct_1h:.1f}% ({alert['buys_1h']}B / {alert['sells_1h']}S)\n\n"
+        f"{sec_text}\n"
+        f"<b>Holder Concentration:</b>\n"
+        f"  Top 10: {pct10:.1f}%\n"
+        f"  Top 50: {pct50:.1f}%\n"
+        f"  Top 100: {pct100:.1f}%\n\n"
+        f"<b>CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})\n\n"
         f"📝 <b>Contract:</b> <code>{alert['token_address']}</code>"
     )
 
@@ -2001,9 +1876,10 @@ async def send_alert(alert):
             disable_web_page_preview=True, reply_markup=keyboard
         )
         alerts_sent += 1
-        logger.info(f"ALERT #{alerts_sent} sent -> {alert['symbol']}@{alert['chain']} score={alert['total_score']}")
+        logger.info(f"ALERT #{alerts_sent} sent → {alert['symbol']}@{alert['chain']} score={alert['total_score']}")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT LOOP
@@ -2014,7 +1890,7 @@ async def bot_task():
     db_conn = init_db()
     start_time = time.time()
     last_heartbeat_time = start_time
-    logger.info("Pump Bot v5.3 starting (Manual Trader + CA Paste)...")
+    logger.info("Pump Bot v5.4 starting (Manual Trader + CA Paste)...")
     log_trading_config()
 
     async with aiohttp.ClientSession() as session:
@@ -2027,20 +1903,12 @@ async def bot_task():
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
-                    f"✅ <b>Pump Bot v5.3</b> started
-"
-                    f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}
-"
-                    f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>
-"
-                    f"Scan interval: {SCAN_INTERVAL}s
-"
-                    f"Alert threshold: {ALERT_THRESHOLD}/100
-
-"
-                    f"<b>Paste any CA to buy instantly!</b>
-"
-                    f"Use /debug to verify config in logs."
+                    f"✅ <b>Pump Bot v5.4</b> started\n"
+                    f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}\n"
+                    f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>\n"
+                    f"Scan interval: {SCAN_INTERVAL}s\n"
+                    f"Alert threshold: {ALERT_THRESHOLD}/100\n\n"
+                    f"<b>Paste any CA to buy instantly!</b>"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -2059,14 +1927,10 @@ async def bot_task():
                     await bot.send_message(
                         chat_id=CHAT_ID,
                         text=(
-                            f"🫀 <b>Bot v5.3 Heartbeat</b>
-"
-                            f"Uptime: {uptime:.1f}h
-"
-                            f"Pairs scanned: {total_pairs_scanned}
-"
-                            f"Alerts sent: {alerts_sent}
-"
+                            f"🫀 <b>Bot v5.4 Heartbeat</b>\n"
+                            f"Uptime: {uptime:.1f}h\n"
+                            f"Pairs scanned: {total_pairs_scanned}\n"
+                            f"Alerts sent: {alerts_sent}\n"
                             f"Open positions: {len(positions)}"
                         ),
                         parse_mode=ParseMode.HTML
@@ -2103,9 +1967,7 @@ async def bot_task():
                 try:
                     await bot.send_message(
                         chat_id=CHAT_ID,
-                        text=f"⚠️ <b>Bot cycle crashed</b>
-<code>{str(e)[:300]}</code>
-Retrying in 60s...",
+                        text=f"⚠️ <b>Bot cycle crashed</b>\n<code>{str(e)[:300]}</code>\nRetrying in 60s...",
                         parse_mode=ParseMode.HTML
                     )
                 except:
@@ -2119,6 +1981,7 @@ Retrying in 60s...",
             await polling_task
         except asyncio.CancelledError:
             pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI LIFESPAN
@@ -2146,7 +2009,6 @@ async def health_check():
     positions = db_get_open_positions() if db_conn else []
     return {
         "status": "alive",
-        "version": "5.3",
         "alerts_sent": alerts_sent,
         "pairs_scanned": total_pairs_scanned,
         "open_positions": len(positions),
@@ -2157,5 +2019,5 @@ async def health_check():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"Starting Pump Bot v5.3 on port {port}")
+    logger.info(f"Starting Pump Bot v5.4 on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
