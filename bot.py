@@ -195,7 +195,7 @@ V3_ROUTER_ABI = [
 ]
 
 QUOTER_V2_ABI = [
-    {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct IQuoterV2.QuoteExactInputSingleParams","name":"params","type":"tuple"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},{"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}
+    {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct IQuoterV2.QuoteExactInputSingleParams","name":"params","type":"tuple"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},{"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}
 ]
 
 ERC20_ABI = [
@@ -1041,7 +1041,7 @@ async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_t
         return None
     try:
         quoter = w3.eth.contract(address=Web3.to_checksum_address(quoter_addr), abi=QUOTER_V2_ABI)
-        params = (Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), fee_tier, amount_in, 0)
+        params = (Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), amount_in, fee_tier, 0)
         result = await asyncio.to_thread(quoter.functions.quoteExactInputSingle(params).call)
         amount_out = int(result[0])
         logger.info(f"QuoterV2 success {chain} fee={fee_tier}: {amount_out}")
