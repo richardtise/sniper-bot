@@ -76,7 +76,7 @@ CHAIN_TO_GOPLUS_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
 BLOCKSCOUT_URLS = {"robinhood": "https://robinhoodchain.blockscout.com/api/v2"}
 
 RPCS = {
-    "ethereum": os.getenv("ETH_RPC", "https://eth.llamarpc.com"),
+    "ethereum": os.getenv("ETH_RPC", "https://ethereum-rpc.publicnode.com"),
     "bsc": os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/"),
     "base": os.getenv("BASE_RPC", "https://mainnet.base.org"),
     "robinhood": os.getenv("ROBINHOOD_RPC", "https://robinhoodchain.blockscout.com/api/eth-rpc"),
@@ -91,7 +91,7 @@ _HARD_ROUTERS = {
 }
 _HARD_QUOTERS = {
     "ethereum": "0x61fFE014bA17989E743c5F6cB21bF969dc0b0e10",
-    "base": "0x3d4e44Eb1374240CE5F1B871ab261CD16335CB61",
+    "base": "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
     "bsc": "0xB048Bbc1Ee6b0bD2fD19B4eEdb5f5b9F5b5f5b5f",
     "robinhood": "",
 }
@@ -102,17 +102,29 @@ _HARD_WETH = {
     "robinhood": "",
 }
 
+# Env prefix mapping — matches what v5.2 used and what users actually set
+_CHAIN_ENV_PREFIX = {
+    "ethereum": "ETH",
+    "bsc": "BSC",
+    "base": "BASE",
+    "robinhood": "ROBINHOOD",
+}
+
+def _env_key(chain: str, suffix: str) -> str:
+    prefix = _CHAIN_ENV_PREFIX.get(chain, chain.upper())
+    return f"{prefix}_{suffix}"
+
 # Runtime resolvers — env vars read fresh every time (fixes import-time caching)
 def get_router_v3(chain: str) -> str:
-    env_key = f"{chain.upper()}_ROUTER_V3"
+    env_key = _env_key(chain, "ROUTER_V3")
     return os.getenv(env_key, "").strip() or _HARD_ROUTERS.get(chain, "")
 
 def get_quoter_v2(chain: str) -> str:
-    env_key = f"{chain.upper()}_QUOTER_V2"
+    env_key = _env_key(chain, "QUOTER_V2")
     return os.getenv(env_key, "").strip() or _HARD_QUOTERS.get(chain, "")
 
 def get_weth_address(chain: str) -> str:
-    env_key = f"{chain.upper()}_WNATIVE"
+    env_key = _env_key(chain, "WNATIVE")
     addr = os.getenv(env_key, "").strip()
     if addr:
         return addr
@@ -1370,22 +1382,30 @@ async def monitor_positions(session):
 CA_REGEX = re.compile(r'0x[a-fA-F0-9]{40}')
 
 async def detect_chain_for_ca(session, ca: str):
-    """Try all chains on DexScreener in parallel, return first match."""
-    async def check_chain(chain):
+    """Try all chains on DexScreener sequentially, return first match."""
+    for chain in NETWORKS:
         try:
             url = f"https://api.dexscreener.com/tokens/v1/{chain}/{ca}"
             data = await fetch_json(session, url)
             if data and isinstance(data, list) and len(data) > 0:
+                logger.info(f"CA found on {chain}: {ca[:20]}...")
                 return chain, data[0]
-        except Exception:
-            pass
-        return None, None
-
-    tasks = [check_chain(chain) for chain in NETWORKS]
-    results = await asyncio.gather(*tasks)
-    for chain, pair in results:
-        if chain and pair:
-            return chain, pair
+        except Exception as e:
+            logger.debug(f"CA check failed for {chain}: {e}")
+            continue
+    # Fallback: try DexScreener search API
+    try:
+        search_url = f"https://api.dexscreener.com/latest/dex/search?q={ca}"
+        search_data = await fetch_json(session, search_url)
+        if search_data and "pairs" in search_data and len(search_data["pairs"]) > 0:
+            pair = search_data["pairs"][0]
+            chain = pair.get("chainId")
+            if chain in NETWORKS:
+                logger.info(f"CA found via search on {chain}: {ca[:20]}...")
+                return chain, pair
+    except Exception as e:
+        logger.debug(f"CA search fallback failed: {e}")
+    logger.warning(f"CA not found on any chain: {ca[:20]}...")
     return None, None
 
 async def handle_ca_paste(ca: str, message):
@@ -1395,7 +1415,7 @@ async def handle_ca_paste(ca: str, message):
     async with aiohttp.ClientSession() as temp_session:
         chain, pair = await detect_chain_for_ca(temp_session, ca)
         if not chain or not pair:
-            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Token not found on any supported chain.", parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Token not found on any supported chain.\nTried: {', '.join(NETWORKS)}", parse_mode=ParseMode.HTML)
             return
 
         symbol = pair.get("baseToken", {}).get("symbol", "???")
