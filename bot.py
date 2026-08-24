@@ -79,7 +79,7 @@ RPCS = {
     "ethereum": os.getenv("ETH_RPC", "https://ethereum-rpc.publicnode.com"),
     "bsc": os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/"),
     "base": os.getenv("BASE_RPC", "https://mainnet.base.org"),
-    "robinhood": os.getenv("ROBINHOOD_RPC", "https://robinhoodchain.blockscout.com/api/eth-rpc"),
+    "robinhood": os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
 }
 
 # Hardcoded fallbacks — env vars take precedence at RUNTIME
@@ -1036,17 +1036,22 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
 
 async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_tier):
     quoter_addr = get_quoter_v2(chain)
-    if not quoter_addr or not Web3.is_address(quoter_addr): return None
+    if not quoter_addr or not Web3.is_address(quoter_addr):
+        logger.warning(f"QuoterV2 not configured for {chain}")
+        return None
     try:
         quoter = w3.eth.contract(address=Web3.to_checksum_address(quoter_addr), abi=QUOTER_V2_ABI)
         params = (Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), fee_tier, amount_in, 0)
         result = await asyncio.to_thread(quoter.functions.quoteExactInputSingle(params).call)
-        return int(result[0])
+        amount_out = int(result[0])
+        logger.info(f"QuoterV2 success {chain} fee={fee_tier}: {amount_out}")
+        return amount_out
     except Exception as e:
         err = str(e).lower()
-        if any(x in err for x in ["invalid fee", "no pool", "revert", "uniswapv3", "pancakeswap"]):
+        # Log ALL quoter errors so we can see what's actually happening
+        logger.info(f"QuoterV2 call failed {chain} fee={fee_tier}: {e}")
+        if any(x in err for x in ["invalid fee", "no pool", "revert", "uniswapv3", "pancakeswap", "quoter", "execution reverted"]):
             return None
-        logger.debug(f"QuoterV2 error for fee={fee_tier}: {e}")
         return None
 
 async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
@@ -1081,7 +1086,7 @@ async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
     if best_fee is None or best_amount_out == 0:
         detail = " | ".join(quotes_tried)
         logger.warning(f"No V3 pool found for {chain} token={token_out[:10]}... tried: {detail}")
-        return False, f"No V3 pool found on {chain} (tried fees {fee_tiers})", 0
+        return False, f"No V3 pool found on {chain} (tried fees {fee_tiers}) — check Render logs for QuoterV2 errors", 0
 
     # Phase 2: Submit ONE transaction with the best quote
     amount_out_min = int(best_amount_out * (1 - slippage / 100))
