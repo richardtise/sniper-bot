@@ -984,7 +984,7 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
         )
         if allowance >= amount: return None
         nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS)
-        gas_price = await asyncio.to_thread(w3.eth.gas_price)
+        gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
         approve_tx = token.functions.approve(
             Web3.to_checksum_address(spender), 2**256 - 1
         ).build_transaction({
@@ -1049,12 +1049,12 @@ async def try_v3_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, s
         )
         try:
             nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS)
-            gas_price = await asyncio.to_thread(w3.eth.gas_price)
+            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
             tx_dict = {'from': WALLET_ADDRESS, 'gas': 350000, 'gasPrice': int(gas_price * 1.2), 'nonce': nonce}
             if is_eth_input: tx_dict['value'] = amount_in
             tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
             signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.rawTransaction)
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.raw_transaction)
             logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={fee} | minOut={amount_out_min}")
             receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
             if receipt.status != 1:
