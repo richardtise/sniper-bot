@@ -102,6 +102,13 @@ _HARD_WETH = {
     "robinhood": "",
 }
 
+_HARD_V2_ROUTERS = {
+    "ethereum": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+    "bsc": "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+    "base": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
+    "robinhood": "",
+}
+
 # Env prefix mapping — matches what v5.2 used and what users actually set
 _CHAIN_ENV_PREFIX = {
     "ethereum": "ETH",
@@ -129,6 +136,10 @@ def get_weth_address(chain: str) -> str:
     if addr:
         return addr
     return _HARD_WETH.get(chain, "") or os.getenv("ROBINHOOD_WNATIVE", "").strip()
+
+def get_v2_router(chain: str) -> str:
+    env_key = _env_key(chain, "ROUTER_V2")
+    return os.getenv(env_key, "").strip() or _HARD_V2_ROUTERS.get(chain, "")
 
 NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
 NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
@@ -206,6 +217,12 @@ ERC20_ABI = [
     {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
 ]
 
+V2_ROUTER_ABI = [
+    {"inputs":[{"internalType":"uint256","name":"amountOutMin","type":"uint256"},{"internalType":"address[]","name":"path","type":"address[]"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"swapExactETHForTokens","outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],"stateMutability":"payable","type":"function"},
+    {"inputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMin","type":"uint256"},{"internalType":"address[]","name":"path","type":"address[]"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"swapExactTokensForETH","outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"address[]","name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],"stateMutability":"view","type":"function"},
+]
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING & GLOBALS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -219,6 +236,7 @@ logger = logging.getLogger("pump_bot_v5")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 api_semaphore = asyncio.Semaphore(CONCURRENT_API_LIMIT)
+web3_semaphore = asyncio.Semaphore(3)  # Limit concurrent RPC calls to prevent 429s
 
 security_cache: Dict[str, Tuple[dict, float]] = {}
 holder_cache: Dict[str, Tuple[Tuple[float, float, float], float]] = {}
@@ -1005,25 +1023,27 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
     if not w3 or not PRIVATE_KEY: return None
     try:
         token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-        allowance = await asyncio.to_thread(
-            token.functions.allowance(WALLET_ADDRESS, Web3.to_checksum_address(spender)).call
-        )
+        async with web3_semaphore:
+            allowance = await asyncio.to_thread(
+                token.functions.allowance(WALLET_ADDRESS, Web3.to_checksum_address(spender)).call
+            )
         if allowance >= amount: return None
-        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-        gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
-        approve_tx = token.functions.approve(
-            Web3.to_checksum_address(spender), 2**256 - 1
-        ).build_transaction({
-            'from': WALLET_ADDRESS, 'gas': 100000,
-            'gasPrice': int(gas_price * 1.1), 'nonce': nonce,
-        })
-        signed = w3.eth.account.sign_transaction(approve_tx, PRIVATE_KEY)
-        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        if raw_tx is None:
-            logger.error("Approval failed: could not get raw transaction bytes")
-            return None
-        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
-        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+        async with web3_semaphore:
+            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+            approve_tx = token.functions.approve(
+                Web3.to_checksum_address(spender), 2**256 - 1
+            ).build_transaction({
+                'from': WALLET_ADDRESS, 'gas': 100000,
+                'gasPrice': int(gas_price * 1.1), 'nonce': nonce,
+            })
+            signed = w3.eth.account.sign_transaction(approve_tx, PRIVATE_KEY)
+            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+            if raw_tx is None:
+                logger.error("Approval failed: could not get raw transaction bytes")
+                return None
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
+            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
         if receipt.status == 1:
             logger.info(f"Approval confirmed: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -1040,18 +1060,16 @@ async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_t
         logger.warning(f"QuoterV2 not configured for {chain}")
         return None
     try:
-        quoter = w3.eth.contract(address=Web3.to_checksum_address(quoter_addr), abi=QUOTER_V2_ABI)
-        params = (Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), amount_in, fee_tier, 0)
-        result = await asyncio.to_thread(quoter.functions.quoteExactInputSingle(params).call)
-        amount_out = int(result[0])
-        logger.info(f"QuoterV2 success {chain} fee={fee_tier}: {amount_out}")
-        return amount_out
+        async with web3_semaphore:
+            quoter = w3.eth.contract(address=Web3.to_checksum_address(quoter_addr), abi=QUOTER_V2_ABI)
+            params = (Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), amount_in, fee_tier, 0)
+            result = await asyncio.to_thread(quoter.functions.quoteExactInputSingle(params).call)
+            amount_out = int(result[0])
+            logger.info(f"QuoterV2 success {chain} fee={fee_tier}: {amount_out}")
+            return amount_out
     except Exception as e:
         err = str(e).lower()
-        # Log ALL quoter errors so we can see what's actually happening
-        logger.info(f"QuoterV2 call failed {chain} fee={fee_tier}: {e}")
-        if any(x in err for x in ["invalid fee", "no pool", "revert", "uniswapv3", "pancakeswap", "quoter", "execution reverted"]):
-            return None
+        logger.debug(f"QuoterV2 call failed {chain} fee={fee_tier}: {e}")
         return None
 
 async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
@@ -1150,6 +1168,62 @@ async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
         logger.error(f"V3 swap exception for fee={best_fee}: {e}")
         return False, str(e), 0
 
+
+async def try_v2_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, slippage):
+    """Fallback V2 swap using Uniswap/PancakeSwap V2 Router."""
+    v2_router_addr = get_v2_router(chain)
+    if not v2_router_addr or not Web3.is_address(v2_router_addr):
+        return False, f"No V2 router configured for {chain}", 0
+
+    router = w3.eth.contract(address=Web3.to_checksum_address(v2_router_addr), abi=V2_ROUTER_ABI)
+    path = [Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)]
+    deadline = int(time.time()) + 300
+
+    try:
+        async with web3_semaphore:
+            # Quote first
+            amounts_out = await asyncio.to_thread(router.functions.getAmountsOut(amount_in, path).call)
+            if not amounts_out or len(amounts_out) < 2:
+                return False, "V2 getAmountsOut failed", 0
+            expected_out = amounts_out[-1]
+            amount_out_min = int(expected_out * (1 - slippage / 100))
+            if amount_out_min <= 0:
+                amount_out_min = 1
+
+            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+
+            tx_dict = {
+                'from': WALLET_ADDRESS,
+                'gasPrice': int(gas_price * 1.2),
+                'nonce': nonce,
+                'gas': 250000,
+            }
+
+            if is_eth_input:
+                tx_dict['value'] = amount_in
+                tx = router.functions.swapExactETHForTokens(amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
+            else:
+                tx = router.functions.swapExactTokensForETH(amount_in, amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
+
+            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+            if raw_tx is None:
+                return False, "Failed to get raw transaction bytes from signed tx", 0
+
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
+            logger.info(f"V2 swap tx sent: {tx_hash.hex()} | minOut={amount_out_min} | gas={tx_dict['gas']}")
+            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+
+            if receipt.status != 1:
+                return False, f"V2 tx reverted: {tx_hash.hex()}", 0
+
+            return True, tx_hash.hex(), expected_out
+
+    except Exception as e:
+        logger.error(f"V2 swap exception: {e}")
+        return False, str(e), 0
+
 async def execute_buy(chain: str, token_address: str, amount_native: float, slippage: float = None, price_native: float = None):
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
@@ -1175,10 +1249,20 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
     )
     if success:
         human_tokens = tokens_received / (10 ** decimals) if tokens_received > 0 else 0
-        logger.info(f"Buy confirmed: {human_tokens} tokens for {amount_native} {NATIVE_SYMBOL[chain]}")
+        logger.info(f"V3 Buy confirmed: {human_tokens} tokens for {amount_native} {NATIVE_SYMBOL[chain]}")
         return True, tx_hash, human_tokens
     else:
-        return False, tx_hash, 0.0
+        # Fallback to V2
+        logger.info(f"V3 failed, trying V2 fallback for {chain} {token_address[:10]}...")
+        success2, tx_hash2, tokens_received2 = await try_v2_swap(
+            w3, chain, weth_address, token_address, amount_in_wei,
+            is_eth_input=True, slippage=slippage
+        )
+        if success2:
+            human_tokens = tokens_received2 / (10 ** decimals) if tokens_received2 > 0 else 0
+            logger.info(f"V2 Buy confirmed: {human_tokens} tokens for {amount_native} {NATIVE_SYMBOL[chain]}")
+            return True, tx_hash2, human_tokens
+        return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
 async def execute_sell(chain: str, token_address: str, percentage: float = 100.0, slippage: float = None):
     if slippage is None:
@@ -1212,10 +1296,20 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
     )
     if success:
         native_received = w3.from_wei(weth_received, 'ether') if weth_received > 0 else 0
-        logger.info(f"Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
+        logger.info(f"V3 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
         return True, tx_hash, float(native_received)
     else:
-        return False, tx_hash, 0.0
+        # Fallback to V2
+        logger.info(f"V3 sell failed, trying V2 fallback for {chain} {token_address[:10]}...")
+        success2, tx_hash2, weth_received2 = await try_v2_swap(
+            w3, chain, token_address, weth_address, sell_amount,
+            is_eth_input=False, slippage=slippage
+        )
+        if success2:
+            native_received = w3.from_wei(weth_received2, 'ether') if weth_received2 > 0 else 0
+            logger.info(f"V2 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
+            return True, tx_hash2, float(native_received)
+        return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
 async def open_position(chain, token_address, symbol, amount_native, price_usd, price_native=None):
     trailing_stop = float(db_get_setting("trailing_stop", DEFAULT_TRAILING_STOP))
