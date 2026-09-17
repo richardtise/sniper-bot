@@ -44,6 +44,18 @@ except ImportError:
 
 load_dotenv()
 
+try:
+    import signals
+    SIGNALS_AVAILABLE = True
+except ImportError:
+    SIGNALS_AVAILABLE = False
+
+try:
+    import discovery
+    DISCOVERY_AVAILABLE = True
+except ImportError:
+    DISCOVERY_AVAILABLE = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -59,6 +71,18 @@ MAX_ALLOWED_TAX = float(os.getenv("MAX_ALLOWED_TAX", "0"))
 VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 
 ALERT_THRESHOLD = int(os.getenv("MIN_SCORE", os.getenv("ALERT_THRESHOLD", "65")))
+
+# Opt-in runner/false-positive signal engine (see signals.py) and GeckoTerminal
+# discovery (see discovery.py). Both default OFF so behaviour is unchanged
+# until you turn them on in .env.
+USE_SIGNALS = os.getenv("USE_SIGNALS", "false").lower() == "true" and SIGNALS_AVAILABLE
+USE_GECKOTERMINAL = os.getenv("USE_GECKOTERMINAL", "false").lower() == "true" and DISCOVERY_AVAILABLE
+
+# Optional Telegram allowlist. Empty -> only CHAT_ID is accepted. Set this when
+# CHAT_ID is a group so other members cannot run /sell, /risk, /setamounts.
+ALLOWED_USER_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
+}
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
@@ -82,24 +106,28 @@ RPCS = {
     "robinhood": os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
 }
 
-# Hardcoded fallbacks — env vars take precedence at RUNTIME
+# Hardcoded fallbacks — env vars take precedence at RUNTIME.
+# NOTE: these must match the 7-field exactInputSingle ABI below. The old
+# Ethereum SwapRouter (0xE592427A...) uses an 8-field struct WITH deadline and
+# silently failed every quote; SwapRouter02 (0x68b34658...) is the correct one.
+# The old Ethereum quoter (0x...dc0b0e10) was not a deployed contract at all.
 _HARD_ROUTERS = {
-    "ethereum": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+    "ethereum": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
     "base": "0x2626664c2603336E57B271c5C0b26F421741e481",
     "bsc": "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
-    "robinhood": "",
+    "robinhood": "0xcaf681a66d020601342297493863e78c959e5cb2",
 }
 _HARD_QUOTERS = {
-    "ethereum": "0x61fFE014bA17989E743c5F6cB21bF969dc0b0e10",
+    "ethereum": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "base": "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
-    "bsc": "0xB048Bbc1Ee6b0bD2fD19B4eEdb5f5b9F5b5f5b5f",
-    "robinhood": "",
+    "bsc": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+    "robinhood": "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
 }
 _HARD_WETH = {
     "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
     "bsc": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     "base": "0x4200000000000000000000000000000000000006",
-    "robinhood": "",
+    "robinhood": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
 }
 
 _HARD_V2_ROUTERS = {
@@ -152,6 +180,15 @@ V3_FEE_TIERS_BY_CHAIN = {
 }
 V3_FEE_TIERS = [100, 500, 2500, 3000, 10000]
 
+# Intermediate tokens tried when a direct V2 path has no pool (e.g. a token that
+# only has a USDC pair). Direct path is always tried first.
+V2_HOP_STABLES = {
+    "ethereum": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    "bsc": ["0x55d398326f99059fF775485246999027B3197955", "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"],
+    "base": ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"],
+    "robinhood": [],
+}
+
 SCAN_INTERVAL = 30
 HEARTBEAT_INTERVAL = 3600
 POSITION_CHECK_INTERVAL = 30
@@ -196,6 +233,23 @@ DEFAULT_SLIPPAGE = 5.0
 DEFAULT_RISK_USD = 10.0
 
 user_state: Dict[int, dict] = {}
+
+# Signal engine state (only populated when USE_SIGNALS=true).
+SIGNAL_FILTERS = signals.Filters.from_env() if SIGNALS_AVAILABLE else None
+PAIR_HISTORY = signals.PairHistory() if SIGNALS_AVAILABLE else None
+
+
+def is_authorized(chat_id, user_id=None) -> bool:
+    """Only the configured chat (and allowlisted users) may control the bot."""
+    if str(chat_id).strip() != str(CHAT_ID).strip():
+        return False
+    if ALLOWED_USER_IDS and user_id is not None:
+        try:
+            if int(user_id) not in ALLOWED_USER_IDS:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ABIs
@@ -447,6 +501,8 @@ def prune_caches():
     stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
     for k in stale:
         del holder_cache[k]
+    if PAIR_HISTORY is not None:
+        PAIR_HISTORY.prune(now)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API HELPERS
@@ -494,7 +550,33 @@ async def fetch_json(session, url, headers=None, use_coingecko_limiter=False):
 # PAIR DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_gt_client = None
+
+async def get_geckoterminal_pairs(session, network):
+    """Candidate discovery via GeckoTerminal (see discovery.py).
+
+    Replaces the DexScreener `latest/dex/pairs/{chain}` call, which 404s and
+    silently left the scanner with only paid boost/profile tokens.
+    """
+    global _gt_client
+    sources = tuple(
+        s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending").split(",") if s.strip()
+    )
+    fetcher = lambda url: fetch_json(session, url)  # noqa: E731
+    if _gt_client is None:
+        _gt_client = discovery.GeckoTerminal(fetcher)
+    else:
+        _gt_client.fetch = fetcher
+    pairs = await _gt_client.candidates(network, kinds=sources)
+    pairs.sort(key=lambda x: float((x.get("volume") or {}).get("m5", 0) or 0), reverse=True)
+    logger.info(f"{network}: {len(pairs)} GeckoTerminal candidates ({','.join(sources)})")
+    return pairs[:300]
+
+
 async def get_all_pairs(session, network):
+    if USE_GECKOTERMINAL:
+        return await get_geckoterminal_pairs(session, network)
+
     pairs = []
     seen = set()
     async def add_pair(p):
@@ -580,6 +662,13 @@ async def get_token_security(session, chain, token):
         "slippage_modifiable": result.get("slippage_modifiable") == "1",
         "transfer_pausable": result.get("transfer_pausable") == "1",
         "lp_locked": result.get("is_lp_locked") == "1",
+        # Extra GoPlus flags that signals.py uses to catch rugs the old subset missed.
+        "hidden_owner": result.get("hidden_owner") == "1",
+        "cannot_sell_all": result.get("cannot_sell_all") == "1",
+        "selfdestruct": result.get("selfdestruct") == "1",
+        "trading_cooldown": result.get("trading_cooldown") == "1",
+        "holder_count": int(float(result.get("holder_count", "0") or 0)),
+        "creator_percent": float(result.get("creator_percent", "0") or 0),
         "source": "goplus",
     }
     security_cache[cache_key] = (security, now)
@@ -948,6 +1037,16 @@ async def evaluate_token(session, pair):
     else:
         return None
 
+    # ── Optional signal engine (signals.py): reject rugs before enrichment ──
+    verdict = None
+    if USE_SIGNALS:
+        verdict = signals.evaluate(pair, security=security, filters=SIGNAL_FILTERS)
+        PAIR_HISTORY.observe(pair, security=security, score=score - penalties)
+        if verdict.rejected:
+            if VERBOSE_LOGGING:
+                logger.info(f"Signal reject {symbol}@{chain}: {','.join(verdict.reject_reasons)}")
+            return None
+
     base_score = score - penalties
     if base_score < PHASE1_MIN_SCORE:
         if VERBOSE_LOGGING:
@@ -963,6 +1062,8 @@ async def evaluate_token(session, pair):
     score += cex_pts
 
     total_score = max(0, score - penalties)
+    if verdict is not None:
+        total_score = max(0.0, total_score + verdict.bonus - verdict.penalty)
 
     if VERBOSE_LOGGING:
         logger.info(
@@ -990,6 +1091,9 @@ async def evaluate_token(session, pair):
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}",
         "price_usd": price,
         "price_native": float(pair.get("priceNative") or 0),
+        "signal_bonus": verdict.bonus if verdict else 0.0,
+        "signal_penalty": verdict.penalty if verdict else 0.0,
+        "signal_notes": verdict.notes if verdict else [],
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1169,22 +1273,50 @@ async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
         return False, str(e), 0
 
 
+async def quote_v2_best_path(router, chain: str, token_in: str, token_out: str, amount_in: int):
+    """Try direct + multi-hop V2 paths, return (path, amounts) with best output.
+
+    Many runner tokens only have a stablecoin pair, so a direct WNATIVE route
+    fails even though a two-hop route exists. This is why 'no quote' was common.
+    """
+    def cs(addr): return Web3.to_checksum_address(addr)
+    weth = get_weth_address(chain)
+    candidates = [[cs(token_in), cs(token_out)]]
+    for mid in ([weth] if weth else []) + V2_HOP_STABLES.get(chain, []):
+        if not mid:
+            continue
+        if mid.lower() in (token_in.lower(), token_out.lower()):
+            continue
+        candidates.append([cs(token_in), cs(mid), cs(token_out)])
+
+    best = None
+    for path in candidates:
+        try:
+            amounts = await asyncio.to_thread(router.functions.getAmountsOut(amount_in, path).call)
+            if amounts and len(amounts) == len(path) and int(amounts[-1]) > 0:
+                if best is None or int(amounts[-1]) > int(best[1][-1]):
+                    best = (path, [int(a) for a in amounts])
+        except Exception:
+            continue
+    return best
+
+
 async def try_v2_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, slippage):
-    """Fallback V2 swap using Uniswap/PancakeSwap V2 Router."""
+    """Fallback V2 swap using Uniswap/PancakeSwap V2 Router (with multi-hop)."""
     v2_router_addr = get_v2_router(chain)
     if not v2_router_addr or not Web3.is_address(v2_router_addr):
         return False, f"No V2 router configured for {chain}", 0
 
     router = w3.eth.contract(address=Web3.to_checksum_address(v2_router_addr), abi=V2_ROUTER_ABI)
-    path = [Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)]
     deadline = int(time.time()) + 300
 
     try:
         async with web3_semaphore:
-            # Quote first
-            amounts_out = await asyncio.to_thread(router.functions.getAmountsOut(amount_in, path).call)
-            if not amounts_out or len(amounts_out) < 2:
-                return False, "V2 getAmountsOut failed", 0
+            # Quote first, across direct and multi-hop paths
+            best = await quote_v2_best_path(router, chain, token_in, token_out, amount_in)
+            if not best:
+                return False, f"No V2 route on {chain} (tried direct + WNATIVE/stable hops)", 0
+            path, amounts_out = best
             expected_out = amounts_out[-1]
             amount_out_min = int(expected_out * (1 - slippage / 100))
             if amount_out_min <= 0:
@@ -1397,7 +1529,13 @@ async def sell_position_pct(pos_id: int, pct: float):
 async def get_token_price_usd(session, chain, token_address):
     try:
         url = f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}"
-        data = await fetch_json(session, url)
+        if session is None:
+            # sell_position_pct calls this without a session; without the
+            # temporary one the fetch always failed and P&L was recorded as 0.
+            async with aiohttp.ClientSession() as temp_session:
+                data = await fetch_json(temp_session, url)
+        else:
+            data = await fetch_json(session, url)
         if data and isinstance(data, list) and len(data) > 0:
             return float(data[0].get("priceUsd") or 0)
     except Exception as e:
@@ -1804,7 +1942,7 @@ async def handle_command(message):
         await send_settings_menu()
 
     elif cmd == "/debug":
-        log_trading_config()
+        await log_trading_config()
         await bot.send_message(
             chat_id=CHAT_ID,
             text="✅ Config logged to console. Check your Render logs.",
@@ -1838,7 +1976,20 @@ async def handle_command(message):
 # CONFIG DEBUG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def log_trading_config():
+async def address_has_code(chain: str, addr: str) -> bool:
+    """True if the address is a deployed contract. Catches typo'd router/quoter
+    addresses that pass Web3.is_address but silently return no quotes."""
+    w3 = w3_instances.get(chain)
+    if not w3 or not addr or not Web3.is_address(addr):
+        return False
+    try:
+        code = await asyncio.to_thread(w3.eth.get_code, Web3.to_checksum_address(addr))
+        return len(code) > 0
+    except Exception:
+        return False
+
+
+async def log_trading_config():
     logger.info("========== TRADING CONFIG DEBUG ==========")
     for chain in NETWORKS:
         router = get_router_v3(chain)
@@ -1846,10 +1997,16 @@ def log_trading_config():
         quoter = get_quoter_v2(chain)
         rpc = RPCS.get(chain, "")
         w3 = w3_instances.get(chain)
+
+        def status(addr, deployed):
+            if not addr:
+                return "MISSING"
+            return "OK" if deployed else "NO CODE ⚠"
+
         logger.info(
-            f"{chain.upper():12} | Router: {'SET' if router else 'MISSING'} "
-            f"| WETH: {'SET' if weth else 'MISSING'} "
-            f"| Quoter: {'SET' if quoter else 'MISSING'} "
+            f"{chain.upper():12} | Router: {status(router, await address_has_code(chain, router))} "
+            f"| WETH: {status(weth, await address_has_code(chain, weth))} "
+            f"| Quoter: {status(quoter, await address_has_code(chain, quoter))} "
             f"| RPC: {'CONNECTED' if w3 and w3.is_connected() else 'OFFLINE'} "
             f"| RPC_URL: {rpc[:40]}..."
         )
@@ -1933,8 +2090,18 @@ async def telegram_polling_task():
             for update in updates:
                 offset = update.update_id + 1
                 if update.callback_query:
-                    await handle_callback_query(update.callback_query)
+                    cq = update.callback_query
+                    chat_id = cq.message.chat_id if cq.message else None
+                    user_id = cq.from_user.id if cq.from_user else None
+                    if not is_authorized(chat_id, user_id):
+                        logger.warning(f"Ignored callback from unauthorized chat/user: {chat_id}/{user_id}")
+                        continue
+                    await handle_callback_query(cq)
                 elif update.message and update.message.text:
+                    user_id = update.message.from_user.id if update.message.from_user else None
+                    if not is_authorized(update.message.chat.id, user_id):
+                        logger.warning(f"Ignored message from unauthorized chat/user: {update.message.chat.id}/{user_id}")
+                        continue
                     await handle_text_message(update.message)
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
@@ -1985,7 +2152,9 @@ async def send_alert(alert):
         f"  Top 50: {pct50:.1f}%\n"
         f"  Top 100: {pct100:.1f}%\n\n"
         f"<b>CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})\n\n"
-        f"📝 <b>Contract:</b> <code>{alert['token_address']}</code>"
+        f"<b>Signal Engine:</b> +{alert.get('signal_bonus', 0):.0f} / -{alert.get('signal_penalty', 0):.0f}\n"
+        + (f"<i>{', '.join(alert.get('signal_notes', []))}</i>\n" if alert.get('signal_notes') else "")
+        + f"📝 <b>Contract:</b> <code>{alert['token_address']}</code>"
     )
 
     keyboard = build_alert_keyboard(alert['chain'], alert['token_address'], alert['symbol'])
@@ -2010,7 +2179,7 @@ async def bot_task():
     start_time = time.time()
     last_heartbeat_time = start_time
     logger.info("Pump Bot v5.4 starting (Manual Trader + CA Paste)...")
-    log_trading_config()
+    await log_trading_config()
 
     async with aiohttp.ClientSession() as session:
         if COINGECKO_API_KEY:

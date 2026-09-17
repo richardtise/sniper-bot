@@ -1,8 +1,31 @@
+# --- secrets: never commit these ---
 .env
 *.env
+!.env.example
+
+# --- virtual environments ---
 venv/
 .venv/
 env/
+bot-env/
+
+# --- python ---
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# --- runtime state / logs (crime_pump.log leaked a live bot token) ---
+*.log
+logs/
+
+# --- sqlite databases and caches ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+coingecko_id_cache.json
+
+# --- os ---
 .DS_Store
+Thumbs.db
