@@ -1,7 +1,8 @@
 # Code review — my-sniper-bot
 
-Reviewed: `bot.py` (2,242 lines after these changes), `requirements.txt`, `start.sh`,
-`test_telegram.py`, `.env` (names only), `crime_pump.log`.
+Reviewed: `bot.py` (~3,000 lines after pass 2), `signals.py`, `discovery.py`,
+`label_outcomes.py`, `requirements.txt`, `start.sh`, `test_telegram.py`,
+`.env` (names only), `crime_pump.log`.
 
 **Verdict in one line:** the trading/execution half is solid and carefully written, but
 the *finding* half is the weak link — and the single biggest reason the bot surfaces
@@ -16,9 +17,10 @@ Items marked **✅ fixed** were changed in this pass; everything else is a recom
 
 | File | Purpose |
 | --- | --- |
-| `signals.py` | Pure runner/false-positive engine: hard rug filters + runner bonus/penalty, cross-scan acceleration history. 25 unit tests. |
+| `signals.py` | Pure runner/false-positive engine: hard rug filters + runner bonus/penalty, cross-scan acceleration history. 26 unit tests. |
 | `discovery.py` | Working candidate discovery via GeckoTerminal (free, no key), mapped to the pair shape `bot.evaluate_token` already consumes. 10 unit tests. |
-| `test_signals.py`, `test_discovery.py` | `python -m unittest` suites, 35 tests, no network. |
+| `test_signals.py`, `test_discovery.py`, `test_features.py` | `python -m unittest` suites, 43 tests, no network. |
+| `label_outcomes.py` | Pass 2: turns logged feature rows into forward-return labels for offline training. |
 | `.env.example` | Complete reference incl. the new flags. |
 | `.gitignore` | Now ignores `*.log`, `bot-env/`, `*.db`, caches. |
 | `README.md` | Full setup/usage/config/deploy docs. |
@@ -30,6 +32,46 @@ USE_SIGNALS=true          # enable signals.py filters + bonus/penalty
 USE_GECKOTERMINAL=true    # enable discovery.py instead of the 404'd endpoint
 ALLOWED_USER_IDS=123456   # optional extra Telegram allowlist
 ```
+
+---
+
+## 0b. Pass 2 — remaining review items fixed + feature logging
+
+Every open item from §2–§5 was addressed except the deliberate deferrals noted at
+the end of this section.
+
+| Item | Status |
+| --- | --- |
+| 4.4 `get_buy_amounts` keyed by native symbol | ✅ Keyed per chain (`buy_amounts_{chain}`) with a one-time migration of any customised legacy values; `/setamounts` validates the chain |
+| 4.5 `/risk` stored but unused | ✅ Now sizes trades: the buy keyboard gets a `💵 Risk $X` button that converts USD risk to native via a live native price |
+| 2.4 `/health` leaked the wallet | ✅ Wallet field removed from the JSON response |
+| 2.5 Infinite approvals | ✅ Approves exactly the sell amount (`APPROVAL_MULTIPLIER`, default 1.0); residual risk documented in code + `.env.example` |
+| 4.6 Security `None` cached 1800s | ✅ Failed lookups cached only 120s; added a honeypot.is v2 fallback when GoPlus is down |
+| 4.7 Nonce race | ✅ Per-chain `asyncio.Lock` held across nonce fetch → sign → send |
+| 4.8 Legacy-only gas | ✅ `build_gas_fields()` uses EIP-1559 when supported, with a `MAX_GAS_PRICE_GWEI` ceiling |
+| 4.9 Dead swap params | ✅ Removed; `get_token_decimals()` avoids the extra `balanceOf` |
+| 4.10 `fetch_json` retried only 429 | ✅ Retries 429/5xx/timeouts with jittered backoff and honours `Retry-After` |
+| 4.11 `tokens_evaluated` unused | ✅ Reported in `/health` and the heartbeat |
+| 4.12 `user_state` key mismatch | ✅ Single `state_key()` convention |
+| 4.13 Callback data near 64-byte cap | ✅ Buttons carry a short server-side ref instead of chain+address |
+| 4.14 Unbounded log file | ✅ `RotatingFileHandler` (5 MB × 3) |
+| 4.15 Bare `except:` | ✅ All replaced with `except Exception:` |
+| 4.16 Fiction paper fills | ✅ Paper buys fill at the observed native price minus fee/slippage; paper sells value the sold tokens at the live price. Paper mode also no longer requires web3 (it returned "No Web3 RPC" before) |
+| 5.2 No feedback loop | ✅ Phase 2 below: per-evaluation feature logging + `label_outcomes.py` |
+| 5.3 Blocking handler loop | ✅ Updates dispatched as tasks; polling keeps draining |
+| 5.4 No Telegram 429 handling | ✅ `tg_send()` catches `RetryAfter` and retries with backoff |
+| 5.5 Unescaped HTML | ✅ `esc()` applied to token names/symbols/tx hashes |
+| 5.6 `telebot` not in requirements | ✅ `test_telegram.py` rewritten on python-telegram-bot |
+| 5.7 Unused `.env` keys | ⚠️ Documented; `AUTO_BUY_*`/`SCANNER_API_KEY` are still dead config (remove or implement) |
+
+**Deliberately deferred**
+* §5.1 modularising the 2.9k-line `bot.py` — large, mechanical, and best done with
+  the trading paths under test first.
+* §4.0 router-agnostic execution (Aerodrome/V4/aggregators) — a feature, not a bug.
+* §3.3 liquidity ≥ 50× intended buy size — partially covered by the signal engine;
+  add as a hard live-trading gate only once position sizing is settled.
+* §2.3 mandatory `I_UNDERSTAND_LIVE_TRADING` second flag — would break existing
+  live deployments, so the paper-first default stands.
 
 ---
 
@@ -120,17 +162,19 @@ for when `CHAT_ID` is a group. Unauthorized updates are logged and dropped.
 * Recommend: rotate the key after any incident, and consider a KMS/secret manager
   instead of a plain env var.
 
-### 2.4 `/health` leaks your wallet address
+### 2.4 ✅ `/health` leaked your wallet address
 
-`health_check()` (bot.py:2234) returns `"wallet": WALLET_ADDRESS` on a server bound
-to `0.0.0.0`. If the port is ever public (Render gives it a URL), anyone can link
-your wallet to the bot. Drop the wallet field or require a header token.
+`health_check()` (bot.py:2234) returned `"wallet": WALLET_ADDRESS` on a server
+bound to `0.0.0.0`. If the port is ever public (Render gives it a URL), anyone
+could link your wallet to the bot. **Fixed:** the field is removed; the endpoint
+now also reports `tokens_evaluated` and feature-logging counters.
 
-### 2.5 Infinite approvals
+### 2.5 ✅ Infinite approvals
 
-`ensure_token_approval()` (bot.py:1110) approves `2**256 - 1`. That is standard for
-bots, but it means any future spender-router bug drains the token. Consider
-approving exactly `sell_amount` per trade, or at least document the risk.
+`ensure_token_approval()` (bot.py:1110) approved `2**256 - 1`. **Fixed:** it now
+approves exactly the current sell amount (`APPROVAL_MULTIPLIER`, default `1.0`).
+Residual risk is documented: raising the multiplier leaves a larger standing
+allowance that a router bug could drain.
 
 ---
 
@@ -250,6 +294,9 @@ liquidity is often on Aerodrome and Ethereum micro-caps are often on V4/other
 DEXes; those still need a router-agnostic quote (aggregator or per-`dexId`
 routing). This is the main "quote" improvement left.
 
+> **Pass 2:** every row in this table is now fixed — see §0b for the per-item
+> summary. The "Fix" column records what was done or recommended.
+
 | # | Where | Bug | Fix |
 | --- | --- | --- | --- |
 | 4.1 | ✅ `_HARD_QUOTERS` (bot.py:116) | BSC QuoterV2 was `0xB048Bbc1Ee6b0bD2fD19B4eEdb5f5b9F5b5f5b5f` — a fabricated address. Real PancakeSwap QuoterV2 is [`0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997`](https://docs.pancakeswap.finance/developers/smart-contracts/pancakeswap-exchange/v3-contracts). V3 quoting on BSC silently failed and always fell back to V2. | Corrected; `BSC_QUOTER_V2` still overrides. |
@@ -277,30 +324,23 @@ routing). This is the main "quote" improvement left.
    (`dexscreener.py`, `goplus.py`, `moralis.py`, `coingecko.py`, `geckoterminal.py`),
    `scoring.py`, `trading.py`, `telegram_bot.py`. `signals.py` and `discovery.py`
    are the first modules; the rest can follow without behaviour changes.
-2. **No backtest / no feedback loop.** You cannot tune false positives without
-   labels. Recommended minimum:
-   * log every *evaluated* candidate with its feature vector and the reject reason
-     (not just alerts),
-   * snapshot price and liquidity at +15m/+1h/+6h for each,
-   * add a `/stats` command over a new `trades` table with realized P&L per entry
-     score bucket,
-   * then measure precision/recall of each rule before changing a threshold.
-   Right now `positions.pnl_pct` is recorded inconsistently (see 4.3, 4.16), so
-   even the alert→outcome loop is unreliable.
-3. **Blocking handler loop.** `telegram_polling_task` awaits each update inline; a
-   buy that waits up to 120s for a receipt stalls all further commands. Dispatch
-   each update as a task (or move to a webhook).
-4. **No retry/backoff on Telegram 429.** A burst of alerts can be dropped. Catch
-   `RetryAfter` and sleep.
-5. **HTML injection / parse errors.** Symbols are interpolated into `ParseMode.HTML`
-   unescaped — a token named `<b>` or `A&B` breaks the message (the old
-   `crime_pump.log` literally shows a 400 parse error on the startup message).
-   Wrap dynamic values in `html.escape`.
-6. **`test_telegram.py` imports `telebot` (pyTelegramBotAPI)**, which is not in
-   `requirements.txt` and not used by `bot.py`. Either add it or delete the file.
-7. **`.env` contains unused keys**: `SCANNER_API_KEY`, `AUTO_BUY_ENABLED`,
+   *(Deferred — see §0b.)*
+2. ✅ **No feedback loop → Phase 2.** Every evaluation (including rejects) is now
+   logged to the `features` table with the full feature vector and reject reason,
+   and `label_outcomes.py` derives forward-multiple labels. `positions.pnl_pct`
+   is also real now that paper fills are priced (4.16) and `get_token_price_usd`
+   works without a session (4.3). See §8.
+3. ✅ **Blocking handler loop.** `telegram_polling_task` dispatches each update to
+   its own task (`_spawn_handler`), so a 120s buy receipt no longer stalls commands.
+4. ✅ **No retry/backoff on Telegram 429.** `tg_send()` catches `RetryAfter` and
+   retries with backoff; used by alerts, position exits and menus.
+5. ✅ **HTML injection / parse errors.** `esc()` wraps every dynamic value
+   (names, symbols, tx hashes, signal notes) before `ParseMode.HTML`.
+6. ✅ **`test_telegram.py` imports `telebot`.** Rewritten on python-telegram-bot,
+   which is already in `requirements.txt`.
+7. ⚠️ **`.env` contains unused keys**: `SCANNER_API_KEY`, `AUTO_BUY_ENABLED`,
    `AUTO_BUY_AMOUNT`, `AUTO_BUY_MIN_SCORE`. `AUTO_BUY_*` in particular implies an
-   auto-buy feature that does not exist — remove or implement.
+   auto-buy feature that does not exist. Still dead config — remove or implement.
 
 ---
 
@@ -309,25 +349,26 @@ routing). This is the main "quote" improvement left.
 **Do now**
 1. Revoke the leaked Telegram token (§2.1).
 2. Set `USE_GECKOTERMINAL=true` and `USE_SIGNALS=true`; leave `PAPER_TRADING=true`.
-3. Fix `get_buy_amounts` keying and decide what `/risk` means (§4.4, §4.5).
-4. Holder concentration already aligns: `score_holder` and the default
-   `SIG_HOLDER_STANCE=pump` both reward it (§3.1).
+**Done in pass 2**
+3. ✅ Fixed `get_buy_amounts` keying and gave `/risk` a real job (§4.4, §4.5).
+4. ✅ Holder concentration aligns: `score_holder` and `SIG_HOLDER_STANCE=pump`.
+5. ✅ honeypot.is fallback and short failure cache (§4.6).
+6. ✅ Nonce locking and EIP-1559 gas (§4.7, §4.8).
+7. ✅ Feature logging for offline training (§5.2, §8).
 
 **Next**
-5. Add GeckoTerminal token-info enrichment (`gt_score`, socials, holder
-   distribution, dev holding) for candidates that pass the phase-1 gate — it is
-   free and directly improves both legitimacy scoring and rug filtering.
-6. Add a `trades` table + `/stats`, and start logging outcomes for tuning (§5.2).
-7. Add the honeypot.is fallback and split "failed lookup" from "unsafe" (§4.6).
-8. Add nonce locking and EIP-1559 gas (§4.7, §4.8).
-9. Router-agnostic execution: add per-`dexId` routing or an aggregator quote so
-   Aerodrome (Base) and V4/other venues are tradeable (§4.0).
+8. GeckoTerminal token-info enrichment (`gt_score`, socials, holder distribution,
+   dev holding) for phase-1 survivors — free, improves legitimacy + rug filtering.
+9. A `trades` table + `/stats` with realized P&L per entry-score bucket, now that
+   paper fills and P&L are real.
+10. Router-agnostic execution: per-`dexId` routing or an aggregator quote so
+    Aerodrome (Base) and V4/other venues are tradeable (§4.0).
+11. Train the first model on `label_outcomes.py --export` output and compare its
+    precision/recall against the hand-tuned `MIN_SCORE`.
 
 **Then**
-9. On-chain new-pair listening via factory logs (§1).
-10. Router-agnostic execution via aggregator quotes (1inch/OpenOcean) to reduce
-    failed V3 fee-tier hunts.
-11. Modularise `bot.py` and add tests for the trading paths with a mocked web3.
+12. On-chain new-pair listening via factory logs (§1).
+13. Modularise `bot.py` and add tests for the trading paths with a mocked web3.
 
 ---
 
@@ -335,7 +376,7 @@ routing). This is the main "quote" improvement left.
 
 ```bash
 # 1. nothing to install — signals.py / discovery.py are stdlib-only
-python -m unittest test_signals test_discovery   # 36 tests
+python -m unittest test_signals test_discovery test_features   # 43 tests
 
 # 2. .env
 USE_SIGNALS=true
@@ -344,6 +385,7 @@ GT_SOURCES=new_pools,trending
 ALLOWED_USER_IDS=<your telegram user id>          # optional
 SIG_HOLDER_STANCE=pump                            # reward concentrated supply
 SIG_MIN_LIQUIDITY_USD=4000                        # all thresholds tunable
+LOG_FEATURES=true                                 # collect training data (Phase 2)
 
 # 3. keep paper mode on and watch the "Signal Engine" line in alerts
 PAPER_TRADING=true
@@ -357,3 +399,43 @@ line and the contributing reasons, and rejected tokens are logged as
 **Important:** `USE_SIGNALS` *adds* `bonus − penalty` to the existing 0–100 score.
 Until you backtest (see §5.2), keep `MIN_SCORE` where it is and treat the signal
 line as an explanation, not as a calibrated probability.
+
+---
+
+## 8. Phase 2 — feature logging for offline model training
+
+Enable with `LOG_FEATURES=true` (default **false** so a long-running bot cannot
+fill the disk). `evaluate_token` now builds a feature snapshot for **every**
+evaluation — including hard rejects — and calls `FEATURE_LOGGER.log_row()`, which
+only does a `queue.put_nowait`. A daemon thread (`FeatureLogger._run`) owns its own
+SQLite connection and drains the queue in batches, so the scanner never blocks on
+disk I/O. When the queue is full, rows are dropped and counted rather than stalled.
+
+`features` table columns (abridged):
+
+* ids/time: `ts_utc`, `ts_epoch`, `chain`, `token_address`, `pair_address`, `symbol`, `source`
+* market: `age_minutes`, `liquidity_usd`, `market_cap_usd`, `fdv_usd`, `price_usd`, `price_native`
+* volume: `vol_5m/15m/1h/6h/24h`, `vol_liq_ratio`, `vol_5m_1h`, `vol_1h_6h`, `vol_6h_24h`
+* activity: `buys_5m`, `sells_5m`, `buyers_5m`, `sellers_5m`, `buys_1h`, `sells_1h`, `buy_ratio_5m/1h`
+* price: `chg_5m/15m/1h/6h/24h`
+* holders: `top10`, `top50`, `top100`, `holder_count`, `creator_pct`
+* security: `buy_tax`, `sell_tax`, `is_honeypot`, `is_open_source`, `is_proxy`,
+  `is_mintable`, `owner_change_balance`, `transfer_pausable`, `slippage_modifiable`,
+  `hidden_owner`, `cannot_sell_all`, `selfdestruct`, `trading_cooldown`,
+  `is_blacklisted`, `is_whitelisted`, `lp_locked`, `security_source`, `security_known`
+* model targets/context: `signal_bonus`, `signal_penalty`, `signal_notes`,
+  `base_score`, `hand_score`, `phase1_pass`, `rejected`, `reject_reasons`,
+  `passed_threshold`, `alert_sent`, `paper_mode`
+
+Because the bot re-evaluates the same token every scan, the table is also the
+price time-series. `label_outcomes.py` walks later rows for the same
+`(chain, token_address)` and writes the forward maximum multiple per horizon
+(`max_mult_1h`, `max_mult_6h`, `max_mult_24h`) plus binary labels
+(`hit_2x_1h`, `hit_3x_24h`, `hit_5x_24h`, …). `--export training.csv` dumps a
+sklearn-ready CSV; `--fetch-current` labels the newest rows from live prices.
+
+Caveat for modelling: rows for the same token are **not** independent. Split by
+token, not by row, or you will leak the future into the training set.
+
+Tests: `python -m unittest -v test_signals test_discovery test_features` (43).
+

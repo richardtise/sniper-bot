@@ -56,6 +56,7 @@ The handful you are most likely to change:
 | `USE_SIGNALS` | `false` | Enable the signal engine (runner bonus / false-positive filters). |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
 | `ALLOWED_USER_IDS` | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
+| `LOG_FEATURES` | `false` | Log a feature row for every token evaluation (see [Training data](#training-data)). |
 
 Per-chain routing addresses (`ETH_QUOTER_V2`, `BSC_ROUTER_V3`, …) can be
 overridden in `.env`, but working defaults are compiled in for all four chains.
@@ -72,9 +73,10 @@ Send `/start` in the chat, then paste a contract address to buy.
 | `/sell <id>` | Market-sell a position. |
 | `/balance` | Native balances on all chains. |
 | `/settings` | Show slippage, trailing stop, TP ladder, risk. |
-| `/risk <usd>` | Set risk per trade (stored). |
-| `/setamounts <chain> <a,b,c>` | Set preset buy sizes. |
+| `/risk <usd>` | Set $ risk per trade (adds a one-tap 💵 Risk buy button). |
+| `/setamounts <chain> <a,b,c>` | Set preset buy sizes (independent per chain). |
 | `/debug` | Log per-chain config and contract status. |
+| `/features` | Feature-logging counters. |
 
 Alerts, token cards and positions all carry inline buttons: preset/custom buy,
 sell 25/50/100%, buy more, and set trailing stop.
@@ -90,8 +92,42 @@ redeploys.
 ## Tests
 
 ```bash
-python -m unittest -v test_signals test_discovery
+python -m unittest -v test_signals test_discovery test_features
 ```
+
+## Training data
+
+Set `LOG_FEATURES=true` and the bot writes one row per token evaluation — including
+rejections — into the `features` table: liquidity/mcap, volume windows and ratios,
+buy/sell counts and unique buyers, price changes, holder concentration, taxes and
+security flags, signal-engine bonus/penalty, the hand-tuned score, and whether an
+alert was sent. It is fire-and-forget (a background thread writes it), so the
+scanner never slows down.
+
+`label_outcomes.py` turns those rows into supervised labels using the forward
+maximum price each token reached (the repeated scans act as the price series):
+
+```bash
+python label_outcomes.py                      # writes max_mult_1h/6h/24h + hit_Nx_* labels
+python label_outcomes.py --fetch-current      # also label the newest rows from live prices
+python label_outcomes.py --export training.csv
+```
+
+Then train offline, e.g. logistic regression on "did it 2× within 24h":
+
+```python
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+df = pd.read_csv("training.csv")
+features = ["liquidity_usd", "vol_liq_ratio", "buy_ratio_5m", "buyers_5m",
+            "top10", "lp_locked", "signal_bonus", "hand_score"]
+X, y = df[features].fillna(0), df["hit_2x_24h"].fillna(0).astype(int)
+model = LogisticRegression(max_iter=1000).fit(X, y)
+```
+
+Rows sharing a `(chain, token_address)` are **not** independent (they are the same
+token at different times) — split by token, not by row, when validating.
 
 ## Security
 

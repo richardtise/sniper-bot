@@ -23,14 +23,21 @@ import time
 import os
 import json
 import logging
+import logging.handlers
+import random
+import queue
 import sqlite3
 import re
+import threading
 from contextlib import asynccontextmanager
 from collections import deque
+from datetime import datetime, timezone
+from html import escape as html_escape
 from typing import Dict, List, Optional, Tuple, Any
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TelegramError
 from fastapi import FastAPI
 import uvicorn
 
@@ -84,6 +91,21 @@ ALLOWED_USER_IDS = {
     int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
 }
 
+# Feature logging for offline model training (see FeatureLogger below).
+# Default OFF so a long-running bot cannot silently fill the disk.
+LOG_FEATURES = os.getenv("LOG_FEATURES", "false").lower() == "true"
+FEATURE_DB_PATH = os.getenv("FEATURE_DB_PATH", "").strip()  # empty -> DB_PATH
+
+# Trading safety / cost knobs.
+APPROVAL_MULTIPLIER = max(1.0, float(os.getenv("APPROVAL_MULTIPLIER", "1.0")))
+MAX_GAS_PRICE_GWEI = float(os.getenv("MAX_GAS_PRICE_GWEI", "500"))
+PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT", "1.0"))  # modelled fee per side
+
+# Security lookup cache lifetimes. A *failed* lookup is cached much more briefly
+# than a good one so a provider outage cannot hide every token for 30 minutes.
+SECURITY_TTL = 1800
+SECURITY_FAIL_TTL = 120
+
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
@@ -97,6 +119,8 @@ CHAIN_TO_COINGECKO_PLATFORM = {
     "robinhood": "robinhood",
 }
 CHAIN_TO_GOPLUS_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
+# honeypot.is uses numeric chain ids; used as a second opinion when GoPlus is down.
+HONEYPOT_IS_CHAIN_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
 BLOCKSCOUT_URLS = {"robinhood": "https://robinhoodchain.blockscout.com/api/v2"}
 
 RPCS = {
@@ -232,7 +256,58 @@ DEFAULT_TRAILING_STOP = 15.0
 DEFAULT_SLIPPAGE = 5.0
 DEFAULT_RISK_USD = 10.0
 
-user_state: Dict[int, dict] = {}
+user_state: Dict[str, dict] = {}
+
+
+def state_key(chat_id) -> str:
+    """Single key convention for user_state (issue 4.12)."""
+    return str(chat_id).strip()
+
+
+# Short callback references (issue 4.13): Telegram caps callback_data at 64
+# bytes and "buy:robinhood:0x<40 hex>:0.005" is already ~62. The long target is
+# registered server-side and the button carries only a short ref.
+_callback_refs: Dict[str, dict] = {}
+_callback_ref_seq = 0
+
+
+def register_callback_target(chain, token_address, symbol="", price_usd=0.0, price_native=0.0) -> str:
+    global _callback_ref_seq
+    _callback_ref_seq += 1
+    ref = format(_callback_ref_seq, "x")
+    _callback_refs[ref] = {
+        "chain": chain, "token": token_address, "symbol": symbol,
+        "price_usd": price_usd, "price_native": price_native,
+    }
+    if len(_callback_refs) > 5000:  # bound memory; very old buttons just expire
+        for old in list(_callback_refs)[:1000]:
+            _callback_refs.pop(old, None)
+    return ref
+
+
+def get_callback_target(ref: str) -> Optional[dict]:
+    return _callback_refs.get(ref)
+
+
+# Update handlers run as their own tasks so a slow buy (up to 120s receipt wait)
+# cannot stall polling and make the bot miss commands (issue 5.3).
+_handler_tasks: set = set()
+
+
+def _spawn_handler(coro):
+    task = asyncio.create_task(coro)
+    _handler_tasks.add(task)
+
+    def _done(t):
+        _handler_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error(f"Update handler failed: {exc}", exc_info=exc)
+
+    task.add_done_callback(_done)
+    return task
 
 # Signal engine state (only populated when USE_SIGNALS=true).
 SIGNAL_FILTERS = signals.Filters.from_env() if SIGNALS_AVAILABLE else None
@@ -284,7 +359,13 @@ V2_ROUTER_ABI = [
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("pump_bot_v5.log"), logging.StreamHandler()],
+    handlers=[
+        # Rotating so a long-running deployment cannot fill the disk (issue 4.14).
+        logging.handlers.RotatingFileHandler(
+            "pump_bot_v5.log", maxBytes=5 * 1024 * 1024, backupCount=3
+        ),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("pump_bot_v5")
 
@@ -292,10 +373,49 @@ bot = Bot(token=TELEGRAM_TOKEN)
 api_semaphore = asyncio.Semaphore(CONCURRENT_API_LIMIT)
 web3_semaphore = asyncio.Semaphore(3)  # Limit concurrent RPC calls to prevent 429s
 
+# Per-chain transaction lock (issue 4.7). A Telegram buy and a monitor sell can
+# otherwise fetch the same 'pending' nonce and one transaction replaces the other.
+_tx_locks: Dict[str, asyncio.Lock] = {}
+
+def tx_lock(chain: str) -> asyncio.Lock:
+    lock = _tx_locks.get(chain)
+    if lock is None:
+        lock = asyncio.Lock()
+        _tx_locks[chain] = lock
+    return lock
+
+
+async def tg_send(text: str, *, retries: int = 3, **kwargs):
+    """bot.send_message with Telegram RetryAfter / transient-error backoff (5.4)."""
+    kwargs.setdefault("chat_id", CHAT_ID)
+    for attempt in range(retries + 1):
+        try:
+            return await bot.send_message(text=text, **kwargs)
+        except RetryAfter as e:
+            ra = getattr(e, "retry_after", 5)
+            wait = int(ra.total_seconds()) if hasattr(ra, "total_seconds") else int(ra)
+            wait = max(1, wait) + 1
+            logger.warning(f"Telegram rate limited, sleeping {wait}s")
+            if attempt == retries:
+                raise
+            await asyncio.sleep(wait)
+        except TelegramError as e:
+            logger.error(f"Telegram send failed: {e}")
+            if attempt == retries:
+                raise
+            await asyncio.sleep(2 * (attempt + 1))
+    return None
+
+
+def esc(value) -> str:
+    """Escape untrusted text (token names/symbols) for ParseMode.HTML (issue 5.5)."""
+    return html_escape(str(value), quote=False)
+
 security_cache: Dict[str, Tuple[dict, float]] = {}
 holder_cache: Dict[str, Tuple[Tuple[float, float, float], float]] = {}
 coingecko_id_map: Dict[str, Dict[str, str]] = {}
 coingecko_ticker_cache: Dict[str, Tuple[dict, float]] = {}
+_native_price_cache: Dict[str, Tuple[float, float]] = {}
 
 db_conn: Optional[sqlite3.Connection] = None
 w3_instances: Dict[str, Any] = {}
@@ -344,11 +464,195 @@ shutdown_flag = False
 DB_PATH = "pump_bot_v5.db"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE LOGGING (Phase 2) — every evaluated token, not just alerts
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# One row per token evaluation (including rejects), with the raw features a
+# linear/logistic regression can learn from. Enable with LOG_FEATURES=true.
+# Rows for the same token accumulate over scans, which doubles as the price
+# time-series used by label_outcomes.py to build forward-return labels.
+
+FEATURE_FIELDS = [
+    "ts_utc", "ts_epoch", "chain", "token_address", "pair_address", "symbol", "source",
+    "age_minutes", "liquidity_usd", "market_cap_usd", "fdv_usd", "price_usd", "price_native",
+    "vol_5m", "vol_15m", "vol_1h", "vol_6h", "vol_24h",
+    "vol_liq_ratio", "vol_5m_1h", "vol_1h_6h", "vol_6h_24h",
+    "buys_5m", "sells_5m", "buyers_5m", "sellers_5m", "buys_1h", "sells_1h",
+    "buy_ratio_5m", "buy_ratio_1h",
+    "chg_5m", "chg_15m", "chg_1h", "chg_6h", "chg_24h",
+    "top10", "top50", "top100", "holder_count", "creator_pct",
+    "buy_tax", "sell_tax",
+    "is_honeypot", "is_open_source", "is_proxy", "is_mintable",
+    "owner_change_balance", "transfer_pausable", "slippage_modifiable",
+    "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
+    "is_blacklisted", "is_whitelisted", "lp_locked",
+    "security_source", "security_known",
+    "signal_bonus", "signal_penalty", "signal_notes",
+    "base_score", "hand_score", "phase1_pass",
+    "rejected", "reject_reasons", "passed_threshold", "alert_sent", "paper_mode",
+]
+
+# Columns stored as INTEGER (flags/counts). Everything else is REAL unless it is
+# one of the few TEXT columns, so the schema stays readable.
+_FEATURE_INT_FIELDS = {
+    "buys_5m", "sells_5m", "buyers_5m", "sellers_5m", "buys_1h", "sells_1h",
+    "holder_count", "is_honeypot", "is_open_source", "is_proxy", "is_mintable",
+    "owner_change_balance", "transfer_pausable", "slippage_modifiable",
+    "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
+    "is_blacklisted", "is_whitelisted", "lp_locked", "security_known",
+    "rejected", "passed_threshold", "alert_sent", "paper_mode",
+}
+_FEATURE_TEXT_FIELDS = {
+    "ts_utc", "chain", "token_address", "pair_address", "symbol", "source",
+    "security_source", "signal_notes", "reject_reasons",
+}
+
+
+def _feature_schema_sql() -> str:
+    cols = []
+    for field in FEATURE_FIELDS:
+        if field in _FEATURE_TEXT_FIELDS:
+            sql_type = "TEXT"
+        elif field in _FEATURE_INT_FIELDS:
+            sql_type = "INTEGER"
+        else:
+            sql_type = "REAL"
+        cols.append(f"    {field} {sql_type}")
+    return (
+        "CREATE TABLE IF NOT EXISTS features (\n"
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        + ",\n".join(cols)
+        + "\n);"
+    )
+
+
+def _empty_feature() -> dict:
+    return {field: None for field in FEATURE_FIELDS}
+
+
+class FeatureLogger:
+    """Non-blocking feature writer.
+
+    ``evaluate_token`` only ever calls :meth:`log_row`, which does a
+    ``queue.put_nowait`` — the scanner never blocks on disk I/O. A daemon thread
+    owns its own SQLite connection and drains the queue in small batches.
+    """
+
+    def __init__(self, db_path: str, enabled: bool, max_queue: int = 20000):
+        self.db_path = db_path
+        self.enabled = enabled
+        self._q: "queue.Queue" = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.logged = 0
+        self.dropped = 0
+        self.written = 0
+
+    def start(self):
+        if not self.enabled or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="feature-writer", daemon=True)
+        self._thread.start()
+        logger.info(f"Feature logging ENABLED -> {self.db_path}")
+
+    def log_row(self, row: dict):
+        if not self.enabled:
+            return
+        self.logged += 1
+        try:
+            self._q.put_nowait(("insert", row))
+        except queue.Full:
+            self.dropped += 1
+
+    def mark_alert_sent(self, chain: str, token_address: str):
+        if not self.enabled:
+            return
+        try:
+            self._q.put_nowait(("alert", {"chain": chain, "token": token_address}))
+        except queue.Full:
+            self.dropped += 1
+
+    def _apply(self, conn: sqlite3.Connection, kind: str, payload: dict):
+        if kind == "insert":
+            placeholders = ",".join("?" * len(FEATURE_FIELDS))
+            conn.execute(
+                f"INSERT INTO features ({','.join(FEATURE_FIELDS)}) VALUES ({placeholders})",
+                [payload.get(f) for f in FEATURE_FIELDS],
+            )
+        elif kind == "alert":
+            conn.execute(
+                "UPDATE features SET alert_sent=1 WHERE id=("
+                "SELECT MAX(id) FROM features WHERE chain=? AND token_address=?)",
+                (payload["chain"], payload["token"]),
+            )
+
+    def _run(self):
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            while True:
+                try:
+                    item = self._q.get(timeout=1.0)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break
+                    continue
+                if item[0] == "stop":
+                    break
+                self._apply(conn, *item)
+                # Opportunistically drain a batch before paying the commit cost.
+                for _ in range(199):
+                    try:
+                        nxt = self._q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt[0] == "stop":
+                        item = nxt
+                        break
+                    self._apply(conn, *nxt)
+                conn.commit()
+                self.written += 1
+        except Exception as e:
+            logger.error(f"Feature writer stopped: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+    def stop(self, timeout: float = 5.0):
+        if self._thread is None:
+            return
+        self._stop.set()
+        try:
+            self._q.put_nowait(("stop", {}))
+        except queue.Full:
+            pass
+        self._thread.join(timeout=timeout)
+
+    def stats(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "queued": self._q.qsize(),
+            "logged": self.logged,
+            "written_batches": self.written,
+            "dropped": self.dropped,
+        }
+
+
+FEATURE_LOGGER = FeatureLogger(FEATURE_DB_PATH or DB_PATH, LOG_FEATURES)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # WAL lets the feature-writer thread write while the bot thread reads.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,19 +679,46 @@ def init_db() -> sqlite3.Connection:
             amount_native REAL, amount_tokens REAL, price_usd REAL, timestamp REAL
         );
     """)
+    conn.executescript(_feature_schema_sql())
+    conn.executescript(
+        "CREATE INDEX IF NOT EXISTS idx_features_token ON features(chain, token_address);"
+        "CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_epoch);"
+    )
     defaults = {
         "slippage": str(DEFAULT_SLIPPAGE),
         "trailing_stop": str(DEFAULT_TRAILING_STOP),
         "take_profit_levels": json.dumps(DEFAULT_TP_LEVELS),
-        "buy_amounts_eth": json.dumps(DEFAULT_BUY_AMOUNTS.get("ethereum", [0.001, 0.003, 0.005, 0.01])),
-        "buy_amounts_bnb": json.dumps(DEFAULT_BUY_AMOUNTS.get("bsc", [0.01, 0.03, 0.05, 0.1])),
-        "buy_amounts_base": json.dumps(DEFAULT_BUY_AMOUNTS.get("base", [0.001, 0.003, 0.005, 0.01])),
         "risk_usd": str(DEFAULT_RISK_USD),
     }
+    # Per-chain presets (issue 4.4). Previously keyed by native symbol, so
+    # base/robinhood/ethereum all shared "buy_amounts_eth".
+    for chain, amounts in DEFAULT_BUY_AMOUNTS.items():
+        defaults[_buy_amounts_key(chain)] = json.dumps(amounts)
+    # One-time migration: keep any customised legacy (symbol-keyed) presets, but
+    # only when the new per-chain key does not exist yet.
+    legacy_keys = {
+        "ethereum": "buy_amounts_eth",
+        "bsc": "buy_amounts_bnb",
+        "base": "buy_amounts_base",
+        "robinhood": "buy_amounts_eth",
+    }
+    for chain, old_key in legacy_keys.items():
+        new_key = _buy_amounts_key(chain)
+        if conn.execute("SELECT 1 FROM settings WHERE key=?", (new_key,)).fetchone():
+            continue
+        old = conn.execute("SELECT value FROM settings WHERE key=?", (old_key,)).fetchone()
+        if old:
+            conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (new_key, old[0]))
+            logger.info(f"Migrated buy amounts {old_key} -> {new_key}")
     for k, v in defaults.items():
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
     conn.commit()
     return conn
+
+
+def _buy_amounts_key(chain: str) -> str:
+    """Settings key for a chain's preset buy amounts (issue 4.4)."""
+    return f"buy_amounts_{chain}"
 
 def db_get_setting(key: str, default=None):
     cur = db_conn.execute("SELECT value FROM settings WHERE key=?", (key,))
@@ -525,6 +856,11 @@ async def _coingecko_rate_limit():
         coingecko_minute_reset = time.time() + 60
 
 async def fetch_json(session, url, headers=None, use_coingecko_limiter=False):
+    """GET + JSON with retries on 429, 5xx and network errors (issue 4.10).
+
+    Retries use jittered backoff and honour Retry-After when present so a
+    provider hiccup does not silently drop a candidate.
+    """
     if use_coingecko_limiter:
         await _coingecko_rate_limit()
     async with api_semaphore:
@@ -532,16 +868,24 @@ async def fetch_json(session, url, headers=None, use_coingecko_limiter=False):
             try:
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        if VERBOSE_LOGGING:
-                            logger.debug(f"HTTP {resp.status} for {url[:80]}")
-                        return None
+                        try:
+                            return await resp.json(content_type=None)
+                        except Exception:
+                            return None
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after and retry_after.replace(".", "", 1).isdigit():
+                            delay = float(retry_after)
+                        else:
+                            delay = float(2 ** attempt)
+                        await asyncio.sleep(min(delay, 30.0) + random.uniform(0, 0.5))
+                        continue
+                    if VERBOSE_LOGGING:
+                        logger.debug(f"HTTP {resp.status} for {url[:80]}")
+                    return None
             except Exception as e:
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5 * attempt + random.uniform(0, 0.5))
                 elif VERBOSE_LOGGING:
                     logger.debug(f"Fetch failed for {url[:80]}: {e}")
         return None
@@ -627,6 +971,49 @@ async def get_all_pairs(session, network):
 # SECURITY CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _security_placeholder(source: str) -> dict:
+    """Neutral security record so all providers return the same keys."""
+    return {
+        "is_honeypot": False, "buy_tax": 0.0, "sell_tax": 0.0,
+        "is_whitelisted": False, "is_blacklisted": False,
+        "is_open_source": None, "is_proxy": False,
+        "can_take_back_ownership": False, "owner_change_balance": False,
+        "is_mintable": False, "slippage_modifiable": False,
+        "transfer_pausable": False, "lp_locked": None,
+        "hidden_owner": False, "cannot_sell_all": False,
+        "selfdestruct": False, "trading_cooldown": False,
+        "holder_count": 0, "creator_percent": 0.0,
+        "source": source,
+    }
+
+
+async def get_honeypot_is_security(session, chain, token):
+    """Second-opinion honeypot/tax check via honeypot.is v2 (issue 4.6).
+
+    Used as a fallback when GoPlus is unreachable or has no record, so a single
+    provider outage no longer hides every token for 30 minutes.
+    """
+    chain_id = HONEYPOT_IS_CHAIN_ID.get(chain)
+    if not chain_id:
+        return None
+    url = f"https://api.honeypot.is/v2/IsHoneypot?address={token}&chainID={chain_id}"
+    data = await fetch_json(session, url)
+    if not isinstance(data, dict):
+        return None
+    sim = data.get("simulationResult") or {}
+    hp = data.get("honeypotResult") or {}
+    code = data.get("contractCode") or {}
+    sec = _security_placeholder("honeypot.is")
+    sec.update({
+        "is_honeypot": bool(hp.get("isHoneypot")),
+        "buy_tax": float(sim.get("buyTax") or 0),
+        "sell_tax": float(sim.get("sellTax") or 0),
+        "is_open_source": bool(code.get("openSource")) if code else None,
+        "is_proxy": bool(code.get("isProxy")),
+    })
+    return sec
+
+
 async def get_token_security(session, chain, token):
     if chain == "robinhood":
         return await get_robinhood_security(session, token)
@@ -637,16 +1024,25 @@ async def get_token_security(session, chain, token):
     now = time.time()
     if cache_key in security_cache:
         cached, ts = security_cache[cache_key]
-        if now - ts < 1800:
+        # A failed lookup (cached None) is retried far sooner than a good one.
+        ttl = SECURITY_TTL if cached else SECURITY_FAIL_TTL
+        if now - ts < ttl:
             return cached
     url = f"https://api.gopluslabs.io/api/v1/token_security/{goplus_chain}?contract_addresses={token.lower()}"
     data = await fetch_json(session, url)
-    if not data or "result" not in data:
-        security_cache[cache_key] = (None, now)
-        return None
-    result = data["result"].get(token.lower())
+    result = None
+    if data and "result" in data:
+        result = data["result"].get(token.lower())
     if not result:
+        # GoPlus has no record or is down -> try honeypot.is before giving up.
+        fallback = await get_honeypot_is_security(session, chain, token)
+        if fallback:
+            security_cache[cache_key] = (fallback, now)
+            logger.info(f"GoPlus miss for {token[:10]}... — used honeypot.is fallback")
+            return fallback
         security_cache[cache_key] = (None, now)
+        if VERBOSE_LOGGING:
+            logger.info(f"Security lookup failed for {chain} {token[:10]}... (short-cached)")
         return None
     security = {
         "is_honeypot": result.get("is_honeypot") == "1",
@@ -952,6 +1348,27 @@ def score_price(chg_5m, chg_1h, chg_6h, age_minutes):
 # TOKEN EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _apply_security_to_feature(feat: dict, security: Optional[dict]):
+    """Copy security flags into the feature row (Phase 2 logging)."""
+    if not security:
+        return
+    feat["security_source"] = security.get("source")
+    feat["security_known"] = 1
+    for key in (
+        "is_honeypot", "is_open_source", "is_proxy", "is_mintable",
+        "owner_change_balance", "transfer_pausable", "slippage_modifiable",
+        "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
+        "is_blacklisted", "is_whitelisted", "lp_locked",
+    ):
+        value = security.get(key)
+        feat[key] = None if value is None else int(bool(value))
+    feat["buy_tax"] = float(security.get("buy_tax") or 0)
+    feat["sell_tax"] = float(security.get("sell_tax") or 0)
+    feat["holder_count"] = int(security.get("holder_count") or 0)
+    # GoPlus reports creator_percent as a fraction; store it as a percentage.
+    feat["creator_pct"] = float(security.get("creator_percent") or 0) * 100
+
+
 async def evaluate_token(session, pair):
     global tokens_evaluated
     chain = pair.get("chainId")
@@ -964,32 +1381,83 @@ async def evaluate_token(session, pair):
         return None
     tokens_evaluated += 1
 
+    # ── Phase 2: feature snapshot, persisted for every evaluation (incl. rejects) ──
+    feat = _empty_feature()
+    feat.update({
+        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ts_epoch": time.time(),
+        "chain": chain, "token_address": token, "pair_address": pair_id,
+        "symbol": symbol, "source": str(pair.get("source") or ""),
+        "price_usd": float(pair.get("priceUsd") or 0),
+        "price_native": float(pair.get("priceNative") or 0),
+        "fdv_usd": float(pair.get("fdv") or 0),
+        "paper_mode": 1 if PAPER_TRADING else 0,
+    })
+
+    def finish(reason: Optional[str] = None, result: Optional[dict] = None):
+        """Persist the feature row (non-blocking) and return the eval result."""
+        feat["phase1_pass"] = feat.get("phase1_pass") or 0
+        feat["rejected"] = 1 if reason else 0
+        feat["reject_reasons"] = reason or ""
+        feat["passed_threshold"] = 1 if result is not None else 0
+        feat["alert_sent"] = 0  # the main loop marks this after a real send
+        FEATURE_LOGGER.log_row(feat)
+        return result
+
+    def reject(reason: str):
+        return finish(reason)
+
     min_liq = ROBINHOOD_MIN_LIQUIDITY_USD if chain == "robinhood" else MIN_LIQUIDITY_USD
     liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
-    if liquidity < min_liq: return None
+    feat["liquidity_usd"] = liquidity
+    if liquidity < min_liq: return reject("liquidity")
     price = float(pair.get("priceUsd") or 0)
-    if price < MIN_PRICE: return None
+    if price < MIN_PRICE: return reject("price_too_low")
     market_cap = float(pair.get("marketCap") or 0)
-    if market_cap < MIN_MARKET_CAP_USD: return None
+    feat["market_cap_usd"] = market_cap
+    if market_cap < MIN_MARKET_CAP_USD: return reject("market_cap")
     vol_5m = float(pair.get("volume", {}).get("m5") or 0)
-    if vol_5m < MIN_VOL_5M_USD: return None
+    if vol_5m < MIN_VOL_5M_USD: return reject("vol_5m")
 
+    vol_15m = float(pair.get("volume", {}).get("m15") or 0)
     vol_1h = float(pair.get("volume", {}).get("h1") or 0)
     vol_24h = float(pair.get("volume", {}).get("h24") or 0)
     vol_6h = float(pair.get("volume", {}).get("h6") or 0)
     txns_5m = pair.get("txns", {}).get("m5", {}) or {}
     buys_5m = int(txns_5m.get("buys", 0))
     sells_5m = int(txns_5m.get("sells", 0))
+    buyers_5m = int(txns_5m.get("buyers", 0))
+    sellers_5m = int(txns_5m.get("sellers", 0))
     txns_1h = pair.get("txns", {}).get("h1", {}) or {}
     buys_1h = int(txns_1h.get("buys", 0))
     sells_1h = int(txns_1h.get("sells", 0))
     chg_5m = float(pair.get("priceChange", {}).get("m5") or 0)
+    chg_15m = float(pair.get("priceChange", {}).get("m15") or 0)
     chg_1h = float(pair.get("priceChange", {}).get("h1") or 0)
     chg_6h = float(pair.get("priceChange", {}).get("h6") or 0)
+    chg_24h = float(pair.get("priceChange", {}).get("h24") or 0)
     pair_created = pair.get("pairCreatedAt")
     age_minutes = (time.time() - pair_created / 1000) / 60 if pair_created else None
+
+    feat.update({
+        "age_minutes": age_minutes,
+        "vol_5m": vol_5m, "vol_15m": vol_15m, "vol_1h": vol_1h,
+        "vol_6h": vol_6h, "vol_24h": vol_24h,
+        "vol_liq_ratio": (vol_5m / liquidity) if liquidity else 0.0,
+        "vol_5m_1h": (vol_5m / vol_1h) if vol_1h else 0.0,
+        "vol_1h_6h": (vol_1h / vol_6h) if vol_6h else 0.0,
+        "vol_6h_24h": (vol_6h / vol_24h) if vol_24h else 0.0,
+        "buys_5m": buys_5m, "sells_5m": sells_5m,
+        "buyers_5m": buyers_5m, "sellers_5m": sellers_5m,
+        "buys_1h": buys_1h, "sells_1h": sells_1h,
+        "buy_ratio_5m": (buys_5m / (buys_5m + sells_5m)) if (buys_5m + sells_5m) else 0.0,
+        "buy_ratio_1h": (buys_1h / (buys_1h + sells_1h)) if (buys_1h + sells_1h) else 0.0,
+        "chg_5m": chg_5m, "chg_15m": chg_15m, "chg_1h": chg_1h,
+        "chg_6h": chg_6h, "chg_24h": chg_24h,
+    })
+
     if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
-        return None
+        return reject("robinhood_too_new")
 
     score = 0; penalties = 0
     score += score_volume_liquidity(vol_5m, liquidity)
@@ -1021,41 +1489,48 @@ async def evaluate_token(session, pair):
     score += score_price(chg_5m, chg_1h, chg_6h, age_minutes)
 
     security = await get_token_security(session, chain, token)
+    _apply_security_to_feature(feat, security)
     if security:
-        if security.get("is_honeypot"): return None
-        if security.get("buy_tax", 0) > MAX_ALLOWED_TAX or security.get("sell_tax", 0) > MAX_ALLOWED_TAX: return None
+        if security.get("is_honeypot"): return reject("honeypot")
+        if security.get("buy_tax", 0) > MAX_ALLOWED_TAX or security.get("sell_tax", 0) > MAX_ALLOWED_TAX: return reject("tax")
         if chain != "robinhood":
             if any([
                 security.get("is_whitelisted"), security.get("is_blacklisted"),
                 security.get("is_proxy"), security.get("can_take_back_ownership"),
                 security.get("owner_change_balance"), security.get("is_mintable"),
                 security.get("slippage_modifiable"), security.get("transfer_pausable"),
-            ]): return None
+            ]): return reject("risky_contract_flag")
         else:
             if not security.get("is_verified", False): penalties += PENALTY_UNVERIFIED_CONTRACT
         score += SECURITY_PTS
     else:
-        return None
+        return reject("security_unknown")
 
     # ── Optional signal engine (signals.py): reject rugs before enrichment ──
     verdict = None
     if USE_SIGNALS:
         verdict = signals.evaluate(pair, security=security, filters=SIGNAL_FILTERS)
         PAIR_HISTORY.observe(pair, security=security, score=score - penalties)
+        feat["signal_bonus"] = verdict.bonus
+        feat["signal_penalty"] = verdict.penalty
+        feat["signal_notes"] = ", ".join(verdict.notes)[:500]
         if verdict.rejected:
             if VERBOSE_LOGGING:
                 logger.info(f"Signal reject {symbol}@{chain}: {','.join(verdict.reject_reasons)}")
-            return None
+            return reject("signal:" + ",".join(verdict.reject_reasons))
 
     base_score = score - penalties
+    feat["base_score"] = base_score
     if base_score < PHASE1_MIN_SCORE:
         if VERBOSE_LOGGING:
             logger.info(f"Phase gate skip {symbol}@{chain}: base_score={base_score:.1f}")
-        return None
+        return reject("phase1_gate")
+    feat["phase1_pass"] = 1
 
     top10, top50, top100 = await get_holder_concentration(session, chain, token)
     holder_pts = score_holder(top10, top50, top100, age_minutes)
     score += holder_pts
+    feat["top10"], feat["top50"], feat["top100"] = top10, top50, top100
 
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
@@ -1064,6 +1539,7 @@ async def evaluate_token(session, pair):
     total_score = max(0, score - penalties)
     if verdict is not None:
         total_score = max(0.0, total_score + verdict.bonus - verdict.penalty)
+    feat["hand_score"] = total_score
 
     if VERBOSE_LOGGING:
         logger.info(
@@ -1076,9 +1552,9 @@ async def evaluate_token(session, pair):
         )
 
     if total_score < ALERT_THRESHOLD:
-        return None
+        return reject("below_threshold")
 
-    return {
+    return finish(None, {
         "chain": chain, "token_address": token, "symbol": symbol, "name": name,
         "pair_address": pair_id, "total_score": total_score,
         "vol_5m": vol_5m, "liquidity": liquidity, "market_cap": market_cap,
@@ -1094,7 +1570,7 @@ async def evaluate_token(session, pair):
         "signal_bonus": verdict.bonus if verdict else 0.0,
         "signal_penalty": verdict.penalty if verdict else 0.0,
         "signal_notes": verdict.notes if verdict else [],
-    }
+    })
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # V3 TRADING — exactInputSingle + QuoterV2 slippage protection
@@ -1110,17 +1586,46 @@ async def get_wallet_balance(chain: str) -> float:
         logger.warning(f"Balance check failed for {chain}: {e}")
         return 0.0
 
-async def get_token_balance(chain: str, token_address: str) -> Tuple[float, int]:
+async def get_token_decimals(chain: str, token_address: str) -> int:
+    """Only fetch decimals (issue 4.9: execute_buy did a needless balanceOf too)."""
     w3 = w3_instances.get(chain)
-    if not w3 or not WALLET_ADDRESS: return 0.0, 18
+    if not w3:
+        return 18
     try:
         token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-        bal = await asyncio.to_thread(token.functions.balanceOf(WALLET_ADDRESS).call)
-        decimals = await asyncio.to_thread(token.functions.decimals().call)
-        return bal / (10 ** decimals), decimals
+        return int(await asyncio.to_thread(token.functions.decimals().call))
     except Exception as e:
-        logger.warning(f"Token balance check failed: {e}")
-        return 0.0, 18
+        logger.warning(f"Token decimals check failed: {e}")
+        return 18
+
+
+async def build_gas_fields(w3, chain: str, multiplier: float = 1.2) -> dict:
+    """EIP-1559 fee fields when the chain supports them, legacy otherwise (4.8).
+
+    Also enforces ``MAX_GAS_PRICE_GWEI`` so a base-fee spike cannot make the bot
+    overpay enormously; set it to 0 to disable the ceiling.
+    """
+    ceiling = w3.to_wei(MAX_GAS_PRICE_GWEI, 'gwei') if MAX_GAS_PRICE_GWEI > 0 else 0
+    base_fee = None
+    try:
+        latest = await asyncio.to_thread(w3.eth.get_block, 'latest')
+        base_fee = latest.get('baseFeePerGas') if hasattr(latest, 'get') else None
+    except Exception:
+        base_fee = None
+    if base_fee:
+        try:
+            priority = int(await asyncio.to_thread(lambda: w3.eth.max_priority_fee))
+        except Exception:
+            priority = w3.to_wei(1.5, 'gwei')
+        max_fee = int(base_fee * multiplier) + priority
+        if ceiling and max_fee > ceiling:
+            max_fee = ceiling
+        return {'maxFeePerGas': int(max_fee), 'maxPriorityFeePerGas': int(min(priority, max_fee))}
+    gas_price = int(await asyncio.to_thread(lambda: w3.eth.gas_price))
+    gas_price = int(gas_price * multiplier)
+    if ceiling and gas_price > ceiling:
+        gas_price = ceiling
+    return {'gasPrice': gas_price}
 
 async def ensure_token_approval(chain: str, token_address: str, spender: str, amount: int):
     w3 = w3_instances.get(chain)
@@ -1132,14 +1637,18 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
                 token.functions.allowance(WALLET_ADDRESS, Web3.to_checksum_address(spender)).call
             )
         if allowance >= amount: return None
-        async with web3_semaphore:
+        # Approve only what this sell needs (issue 2.5) instead of 2**256-1.
+        # APPROVAL_MULTIPLIER > 1 reduces approval transactions but leaves a
+        # larger standing allowance that a router bug could drain — keep it at
+        # 1.0 unless you accept that trade-off.
+        approve_amount = int(amount * APPROVAL_MULTIPLIER)
+        gas_fields = await build_gas_fields(w3, chain, multiplier=1.1)
+        async with tx_lock(chain):
             nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
             approve_tx = token.functions.approve(
-                Web3.to_checksum_address(spender), 2**256 - 1
+                Web3.to_checksum_address(spender), approve_amount
             ).build_transaction({
-                'from': WALLET_ADDRESS, 'gas': 100000,
-                'gasPrice': int(gas_price * 1.1), 'nonce': nonce,
+                'from': WALLET_ADDRESS, 'gas': 100000, 'nonce': nonce, **gas_fields,
             })
             signed = w3.eth.account.sign_transaction(approve_tx, PRIVATE_KEY)
             raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
@@ -1147,9 +1656,9 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
                 logger.error("Approval failed: could not get raw transaction bytes")
                 return None
             tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
-            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
         if receipt.status == 1:
-            logger.info(f"Approval confirmed: {tx_hash.hex()}")
+            logger.info(f"Approval confirmed: {tx_hash.hex()} (allowance {approve_amount})")
             return tx_hash.hex()
         else:
             logger.error(f"Approval failed: {tx_hash.hex()}")
@@ -1177,10 +1686,11 @@ async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_t
         return None
 
 async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
-                      is_eth_input, slippage, price_native=None, token_decimals=None):
+                      is_eth_input, slippage):
     """
     Quote ALL fee tiers first via QuoterV2, pick the best, submit ONE transaction.
     No fallback estimates — if the quoter can't find a pool, we don't swap.
+    (issue 4.9: the unused price_native/token_decimals params were removed.)
     """
     router_addr = get_router_v3(chain)
     if not router_addr or not Web3.is_address(router_addr):
@@ -1226,35 +1736,38 @@ async def try_v3_swap(w3, chain, token_in, token_out, amount_in,
     )
 
     try:
-        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-        gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+        gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
+        # Serialize nonce allocation per chain (issue 4.7): fetch nonce, build,
+        # sign and send while holding the lock, so a concurrent buy/sell cannot
+        # grab the same nonce. The receipt wait happens outside the lock.
+        async with tx_lock(chain):
+            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            tx_dict = {
+                'from': WALLET_ADDRESS,
+                'nonce': nonce,
+                **gas_fields,
+            }
+            if is_eth_input:
+                tx_dict['value'] = amount_in
 
-        tx_dict = {
-            'from': WALLET_ADDRESS,
-            'gasPrice': int(gas_price * 1.2),
-            'nonce': nonce,
-        }
-        if is_eth_input:
-            tx_dict['value'] = amount_in
+            # Try to estimate gas; fallback to hardcoded if it fails
+            try:
+                estimated_gas = await asyncio.to_thread(
+                    router.functions.exactInputSingle(params).estimate_gas, tx_dict
+                )
+                tx_dict['gas'] = int(estimated_gas * 1.3)
+                logger.info(f"Gas estimated: {estimated_gas} | using {tx_dict['gas']} for {chain}")
+            except Exception as gas_err:
+                tx_dict['gas'] = 350000
+                logger.warning(f"Gas estimation failed for {chain}, using fallback 350k: {gas_err}")
 
-        # Try to estimate gas; fallback to hardcoded if it fails
-        try:
-            estimated_gas = await asyncio.to_thread(
-                router.functions.exactInputSingle(params).estimate_gas, tx_dict
-            )
-            tx_dict['gas'] = int(estimated_gas * 1.3)
-            logger.info(f"Gas estimated: {estimated_gas} | using {tx_dict['gas']} for {chain}")
-        except Exception as gas_err:
-            tx_dict['gas'] = 350000
-            logger.warning(f"Gas estimation failed for {chain}, using fallback 350k: {gas_err}")
+            tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
+            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+            if raw_tx is None:
+                return False, "Failed to get raw transaction bytes from signed tx", 0
 
-        tx = router.functions.exactInputSingle(params).build_transaction(tx_dict)
-        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        if raw_tx is None:
-            return False, "Failed to get raw transaction bytes from signed tx", 0
-
-        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
         logger.info(f"V3 swap tx sent: {tx_hash.hex()} | fee={best_fee} | minOut={amount_out_min} | gas={tx_dict['gas']}")
         receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
 
@@ -1322,28 +1835,28 @@ async def try_v2_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, s
             if amount_out_min <= 0:
                 amount_out_min = 1
 
-            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-            gas_price = await asyncio.to_thread(lambda: w3.eth.gas_price)
+            gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
+            async with tx_lock(chain):
+                nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+                tx_dict = {
+                    'from': WALLET_ADDRESS,
+                    'nonce': nonce,
+                    'gas': 250000,
+                    **gas_fields,
+                }
 
-            tx_dict = {
-                'from': WALLET_ADDRESS,
-                'gasPrice': int(gas_price * 1.2),
-                'nonce': nonce,
-                'gas': 250000,
-            }
+                if is_eth_input:
+                    tx_dict['value'] = amount_in
+                    tx = router.functions.swapExactETHForTokens(amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
+                else:
+                    tx = router.functions.swapExactTokensForETH(amount_in, amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
 
-            if is_eth_input:
-                tx_dict['value'] = amount_in
-                tx = router.functions.swapExactETHForTokens(amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
-            else:
-                tx = router.functions.swapExactTokensForETH(amount_in, amount_out_min, path, WALLET_ADDRESS, deadline).build_transaction(tx_dict)
+                signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+                raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+                if raw_tx is None:
+                    return False, "Failed to get raw transaction bytes from signed tx", 0
 
-            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-            if raw_tx is None:
-                return False, "Failed to get raw transaction bytes from signed tx", 0
-
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
+                tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
             logger.info(f"V2 swap tx sent: {tx_hash.hex()} | minOut={amount_out_min} | gas={tx_dict['gas']}")
             receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
 
@@ -1356,28 +1869,45 @@ async def try_v2_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, s
         logger.error(f"V2 swap exception: {e}")
         return False, str(e), 0
 
+def paper_fill_tokens(amount_native: float, price_native: float, slippage_pct: float) -> Optional[float]:
+    """Model a paper fill at the observed native price minus fee/slippage (4.16).
+
+    Returns None when there is no usable price so the caller can fall back.
+    """
+    if price_native is None or price_native <= 0:
+        return None
+    effective_price = price_native * (1 + slippage_pct / 100.0)
+    if effective_price <= 0:
+        return None
+    return (amount_native * (1 - PAPER_FEE_PCT / 100.0)) / effective_price
+
+
 async def execute_buy(chain: str, token_address: str, amount_native: float, slippage: float = None, price_native: float = None):
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
+    # Paper mode is handled first: it must work with no web3/wallet at all.
+    if PAPER_TRADING:
+        tokens = paper_fill_tokens(amount_native, price_native or 0.0, slippage)
+        if tokens is None:
+            logger.warning("Paper buy without price_native; using nominal 1000 tokens/native")
+            tokens = amount_native * 1000
+        db_log_paper_trade(chain, token_address, "???", "BUY", amount_native, tokens, 0.0)
+        logger.info(f"PAPER BUY: {amount_native} {NATIVE_SYMBOL[chain]} -> {tokens:.4f} tokens on {chain}")
+        return True, "PAPER_TRADE", tokens
     w3 = w3_instances.get(chain)
     weth_address = get_weth_address(chain)
     if not w3:
         return False, f"No Web3 RPC connection for {chain}. Check RPCS config or redeploy.", 0.0
     if not weth_address:
         return False, f"No WETH/Wrapped Native address for {chain}. Set {chain.upper()}_WNATIVE or ROBINHOOD_WNATIVE in .env.", 0.0
-    if PAPER_TRADING:
-        simulated_tokens = amount_native * 1000
-        db_log_paper_trade(chain, token_address, "???", "BUY", amount_native, simulated_tokens, 0.0)
-        logger.info(f"PAPER BUY: {amount_native} {NATIVE_SYMBOL[chain]} -> {simulated_tokens} tokens on {chain}")
-        return True, "PAPER_TRADE", simulated_tokens
     amount_in_wei = w3.to_wei(amount_native, 'ether')
     balance = await asyncio.to_thread(w3.eth.get_balance, WALLET_ADDRESS)
     if balance < amount_in_wei:
         return False, f"Insufficient {NATIVE_SYMBOL[chain]}: {w3.from_wei(balance, 'ether')}", 0.0
-    _, decimals = await get_token_balance(chain, token_address)
+    decimals = await get_token_decimals(chain, token_address)
     success, tx_hash, tokens_received = await try_v3_swap(
         w3, chain, weth_address, token_address, amount_in_wei,
-        is_eth_input=True, slippage=slippage, price_native=price_native, token_decimals=decimals
+        is_eth_input=True, slippage=slippage
     )
     if success:
         human_tokens = tokens_received / (10 ** decimals) if tokens_received > 0 else 0
@@ -1399,6 +1929,24 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
 async def execute_sell(chain: str, token_address: str, percentage: float = 100.0, slippage: float = None):
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
+    # Paper mode first so it works with no web3/wallet.
+    if PAPER_TRADING:
+        # Value the sold tokens at the live native price so paper P&L is no
+        # longer fiction (issue 4.16).
+        pos_row = db_conn.execute(
+            "SELECT amount_tokens FROM positions WHERE chain=? AND token_address=? "
+            "AND status='open' ORDER BY entry_time DESC LIMIT 1",
+            (chain, token_address),
+        ).fetchone()
+        native_received = 0.0
+        if pos_row and pos_row[0]:
+            tokens_sold = float(pos_row[0]) * (percentage / 100.0)
+            price_native = await get_token_price_native(None, chain, token_address)
+            if price_native > 0:
+                native_received = tokens_sold * price_native * (1 - PAPER_FEE_PCT / 100.0)
+        db_log_paper_trade(chain, token_address, "???", "SELL", native_received, 0.0, 0.0)
+        logger.info(f"PAPER SELL: {percentage}% on {chain} -> ~{native_received:.6f} {NATIVE_SYMBOL[chain]}")
+        return True, "PAPER_TRADE", float(native_received)
     w3 = w3_instances.get(chain)
     router_addr = get_router_v3(chain)
     weth_address = get_weth_address(chain)
@@ -1408,10 +1956,6 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
         return False, f"No V3 router for {chain}. Set {chain.upper()}_ROUTER_V3 in .env.", 0.0
     if not weth_address:
         return False, f"No WETH address for {chain}. Set {chain.upper()}_WNATIVE in .env.", 0.0
-    if PAPER_TRADING:
-        db_log_paper_trade(chain, token_address, "???", "SELL", 0.0, 0.0, 0.0)
-        logger.info(f"PAPER SELL: {percentage}% on {chain}")
-        return True, "PAPER_TRADE", 0.0
     token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
     try:
         bal = await asyncio.to_thread(token.functions.balanceOf(WALLET_ADDRESS).call)
@@ -1449,7 +1993,7 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd, 
     tp_levels = json.loads(tp_levels_raw)
     success, tx_hash, tokens_received = await execute_buy(chain, token_address, amount_native, price_native=price_native)
     if not success:
-        await bot.send_message(chat_id=CHAT_ID, text=f"❌ <b>Buy failed for {symbol}</b>\n{tx_hash}", parse_mode=ParseMode.HTML)
+        await tg_send(f"❌ <b>Buy failed for {esc(symbol)}</b>\n{esc(tx_hash)}", parse_mode=ParseMode.HTML)
         return None
     pos_id = db_add_position(
         chain, token_address, symbol, price_usd, tokens_received,
@@ -1457,18 +2001,15 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd, 
         paper=1 if PAPER_TRADING else 0
     )
     mode = "📄 PAPER" if PAPER_TRADING else "💰 LIVE"
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            f"{mode} <b>Position Opened</b>\n"
-            f"{symbol} on {chain.upper()}\n"
-            f"Spent: {amount_native} {NATIVE_SYMBOL[chain]}\n"
-            f"Received: {tokens_received:.4f} {symbol}\n"
-            f"Entry: ${price_usd:.6f}\n"
-            f"Trailing stop: {trailing_stop}%\n"
-            f"Tx: <code>{tx_hash}</code>"
-        ),
-        parse_mode=ParseMode.HTML
+    await tg_send(
+        f"{mode} <b>Position Opened</b>\n"
+        f"{esc(symbol)} on {chain.upper()}\n"
+        f"Spent: {amount_native} {NATIVE_SYMBOL[chain]}\n"
+        f"Received: {tokens_received:.4f} {esc(symbol)}\n"
+        f"Entry: ${price_usd:.6f}\n"
+        f"Trailing stop: {trailing_stop}%\n"
+        f"Tx: <code>{esc(tx_hash)}</code>",
+        parse_mode=ParseMode.HTML,
     )
     return pos_id
 
@@ -1485,16 +2026,13 @@ async def close_position_manual(pos_id: int):
     if not success: return False, f"Sell failed: {tx_hash}"
     db_close_position(pos_id, 0.0, tx_hash)
     mode = "📄 PAPER" if PAPER_TRADING else "💰 LIVE"
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            f"{mode} <b>Position Closed</b>\n"
-            f"{symbol} on {chain.upper()}\n"
-            f"Sold: {remaining_pct:.1f}%\n"
-            f"Received: {native_received:.4f} W{NATIVE_SYMBOL[chain]}\n"
-            f"Tx: <code>{tx_hash}</code>"
-        ),
-        parse_mode=ParseMode.HTML
+    await tg_send(
+        f"{mode} <b>Position Closed</b>\n"
+        f"{esc(symbol)} on {chain.upper()}\n"
+        f"Sold: {remaining_pct:.1f}%\n"
+        f"Received: {native_received:.4f} W{NATIVE_SYMBOL[chain]}\n"
+        f"Tx: <code>{esc(tx_hash)}</code>",
+        parse_mode=ParseMode.HTML,
     )
     return True, "Closed"
 
@@ -1510,15 +2048,12 @@ async def sell_position_pct(pos_id: int, pct: float):
     pnl = ((current_price - entry) / entry * 100) if entry > 0 and current_price > 0 else 0
     db_reduce_position(pos_id, actual_pct, pnl, tx_hash)
     mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            f"{mode} <b>Sold {actual_pct:.0f}% of {pos['symbol']}</b>\n"
-            f"Remaining: {pos['remaining_pct'] - actual_pct:.1f}%\n"
-            f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
-            f"Tx: <code>{tx_hash}</code>"
-        ),
-        parse_mode=ParseMode.HTML
+    await tg_send(
+        f"{mode} <b>Sold {actual_pct:.0f}% of {esc(pos['symbol'])}</b>\n"
+        f"Remaining: {pos['remaining_pct'] - actual_pct:.1f}%\n"
+        f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
+        f"Tx: <code>{esc(tx_hash)}</code>",
+        parse_mode=ParseMode.HTML,
     )
     return True, "Sold"
 
@@ -1526,21 +2061,63 @@ async def sell_position_pct(pos_id: int, pct: float):
 # POSITION MONITOR (Trailing Stop + Take Profits)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def get_token_price_usd(session, chain, token_address):
+def _deepest_pair(pairs):
+    """Pick the pair with the most liquidity (issue 4.16: was blindly pairs[0])."""
+    if not pairs or not isinstance(pairs, list):
+        return None
+    return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+
+
+async def _fetch_token_pairs(session, chain, token_address):
+    url = f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}"
+    if session is None:
+        # sell_position_pct calls this without a session; without the temporary
+        # one the fetch always failed and P&L was recorded as 0 (issue 4.3).
+        async with aiohttp.ClientSession() as temp_session:
+            return await fetch_json(temp_session, url)
+    return await fetch_json(session, url)
+
+
+async def get_token_quote(session, chain, token_address) -> Tuple[float, float]:
+    """Return (price_usd, price_native) from the token's deepest pair."""
     try:
-        url = f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}"
-        if session is None:
-            # sell_position_pct calls this without a session; without the
-            # temporary one the fetch always failed and P&L was recorded as 0.
-            async with aiohttp.ClientSession() as temp_session:
-                data = await fetch_json(temp_session, url)
-        else:
-            data = await fetch_json(session, url)
-        if data and isinstance(data, list) and len(data) > 0:
-            return float(data[0].get("priceUsd") or 0)
+        data = await _fetch_token_pairs(session, chain, token_address)
+        pair = _deepest_pair(data)
+        if pair:
+            return float(pair.get("priceUsd") or 0), float(pair.get("priceNative") or 0)
     except Exception as e:
         logger.debug(f"Price fetch failed: {e}")
-    return 0.0
+    return 0.0, 0.0
+
+
+async def get_token_price_usd(session, chain, token_address):
+    return (await get_token_quote(session, chain, token_address))[0]
+
+
+async def get_token_price_native(session, chain, token_address):
+    return (await get_token_quote(session, chain, token_address))[1]
+
+
+async def get_native_usd_price(session, chain: str) -> float:
+    """USD price of the chain's wrapped native token, for USD-risk sizing (4.5)."""
+    now = time.time()
+    cached = _native_price_cache.get(chain)
+    if cached and now - cached[1] < 300:
+        return cached[0]
+    weth = get_weth_address(chain)
+    if not weth:
+        return cached[0] if cached else 0.0
+    try:
+        data = await _fetch_token_pairs(session, chain, weth)
+        pair = _deepest_pair(data)
+        if pair:
+            price = float(pair.get("priceUsd") or 0)
+            if price > 0:
+                _native_price_cache[chain] = (price, now)
+                return price
+    except Exception as e:
+        logger.debug(f"Native price fetch failed for {chain}: {e}")
+    return cached[0] if cached else 0.0
 
 async def monitor_positions(session):
     while not shutdown_flag:
@@ -1573,17 +2150,14 @@ async def monitor_positions(session):
                                 db_conn.execute("UPDATE positions SET take_profit_levels=? WHERE id=?", (json.dumps(tp_levels), pos['id']))
                                 db_conn.commit()
                                 mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
-                                await bot.send_message(
-                                    chat_id=CHAT_ID,
-                                    text=(
-                                        f"🎯 {mode} <b>Take Profit Hit!</b>\n"
-                                        f"{pos['symbol']} on {pos['chain'].upper()}\n"
-                                        f"P&L: +{pnl_pct:.1f}%\n"
-                                        f"Sold: {actual_sell:.1f}%\n"
-                                        f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
-                                        f"Tx: <code>{tx_hash}</code>"
-                                    ),
-                                    parse_mode=ParseMode.HTML
+                                await tg_send(
+                                    f"🎯 {mode} <b>Take Profit Hit!</b>\n"
+                                    f"{esc(pos['symbol'])} on {pos['chain'].upper()}\n"
+                                    f"P&L: +{pnl_pct:.1f}%\n"
+                                    f"Sold: {actual_sell:.1f}%\n"
+                                    f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
+                                    f"Tx: <code>{esc(tx_hash)}</code>",
+                                    parse_mode=ParseMode.HTML,
                                 )
                                 tp_triggered = True
                                 break
@@ -1594,18 +2168,15 @@ async def monitor_positions(session):
                         db_close_position(pos['id'], pnl_pct, tx_hash)
                         mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
                         emoji = "🛑" if pnl_pct >= 0 else "🔴"
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=(
-                                f"{emoji} {mode} <b>Trailing Stop Hit!</b>\n"
-                                f"{pos['symbol']} on {pos['chain'].upper()}\n"
-                                f"Peak: ${highest_price:.6f}\n"
-                                f"Current: ${current_price:.6f}\n"
-                                f"Drop: {drop_from_peak:.1f}%\n"
-                                f"Final P&L: {pnl_pct:+.1f}%\n"
-                                f"Tx: <code>{tx_hash}</code>"
-                            ),
-                            parse_mode=ParseMode.HTML
+                        await tg_send(
+                            f"{emoji} {mode} <b>Trailing Stop Hit!</b>\n"
+                            f"{esc(pos['symbol'])} on {pos['chain'].upper()}\n"
+                            f"Peak: ${highest_price:.6f}\n"
+                            f"Current: ${current_price:.6f}\n"
+                            f"Drop: {drop_from_peak:.1f}%\n"
+                            f"Final P&L: {pnl_pct:+.1f}%\n"
+                            f"Tx: <code>{esc(tx_hash)}</code>",
+                            parse_mode=ParseMode.HTML,
                         )
             await asyncio.sleep(POSITION_CHECK_INTERVAL)
         except Exception as e:
@@ -1647,12 +2218,15 @@ async def detect_chain_for_ca(session, ca: str):
 
 async def handle_ca_paste(ca: str, message):
     """When user pastes a CA, fetch token and show buy UI."""
-    await bot.send_message(chat_id=CHAT_ID, text=f"🔍 Looking up <code>{ca}</code>...", parse_mode=ParseMode.HTML)
+    await tg_send(f"🔍 Looking up <code>{esc(ca)}</code>...", parse_mode=ParseMode.HTML)
 
     async with aiohttp.ClientSession() as temp_session:
         chain, pair = await detect_chain_for_ca(temp_session, ca)
         if not chain or not pair:
-            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Token not found on any supported chain.\nTried: {', '.join(NETWORKS)}", parse_mode=ParseMode.HTML)
+            await tg_send(
+                f"❌ Token not found on any supported chain.\nTried: {', '.join(NETWORKS)}",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         symbol = pair.get("baseToken", {}).get("symbol", "???")
@@ -1665,7 +2239,7 @@ async def handle_ca_paste(ca: str, message):
         chg_5m = float(pair.get("priceChange", {}).get("m5") or 0)
 
         text = (
-            f"🪙 <b>{name}</b> ({symbol})\n"
+            f"🪙 <b>{esc(name)}</b> ({esc(symbol)})\n"
             f"🔗 Chain: <b>{chain.upper()}</b>\n"
             f"💰 Price: ${price_usd:.6f}\n"
             f"💧 Liquidity: ${liquidity:,.0f}\n"
@@ -1675,10 +2249,10 @@ async def handle_ca_paste(ca: str, message):
             f"📝 <b>CA:</b> <code>{ca}</code>"
         )
 
-        keyboard = build_buy_keyboard(chain, ca, symbol, price_native)
-        await bot.send_message(
-            chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True, reply_markup=keyboard
+        keyboard = build_buy_keyboard(chain, ca, symbol, price_native, price_usd)
+        await tg_send(
+            text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=keyboard,
         )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1686,36 +2260,57 @@ async def handle_ca_paste(ca: str, message):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_buy_amounts(chain: str):
-    """Get preset buy amounts for a chain, with USD risk conversion."""
-    amounts_key = f"buy_amounts_{NATIVE_SYMBOL[chain].lower()}"
-    amounts_raw = db_get_setting(amounts_key, json.dumps(DEFAULT_BUY_AMOUNTS.get(chain, [0.001, 0.003, 0.005, 0.01])))
-    return json.loads(amounts_raw)
+    """Preset buy amounts for a chain.
 
-def build_buy_keyboard(chain, token_address, symbol, price_native=None):
-    """Build inline keyboard with buy buttons."""
+    Keyed per chain (issue 4.4) so /setamounts base no longer overwrites the
+    Ethereum presets the way the old native-symbol key did.
+    """
+    fallback = DEFAULT_BUY_AMOUNTS.get(chain, [0.001, 0.003, 0.005, 0.01])
+    amounts_raw = db_get_setting(_buy_amounts_key(chain), json.dumps(fallback))
+    try:
+        amounts = json.loads(amounts_raw)
+    except (TypeError, ValueError):
+        return fallback
+    return amounts if isinstance(amounts, list) and amounts else fallback
+
+def build_buy_keyboard(chain, token_address, symbol, price_native=None, price_usd=None):
+    """Build inline keyboard with buy buttons.
+
+    The chain/token pair is stored server-side and referenced by a short id, so
+    callback_data stays well under Telegram's 64-byte cap (issue 4.13).
+    When a USD risk is configured, a one-tap "Risk $X" button is added (4.5).
+    """
     amounts = get_buy_amounts(chain)
+    ref = register_callback_target(
+        chain, token_address, symbol, price_usd or 0.0, price_native or 0.0
+    )
     keyboard = []
     row = []
     for amt in amounts:
         label = f"💰 {amt} {NATIVE_SYMBOL[chain]}"
-        callback = f"buy:{chain}:{token_address}:{amt}"
-        row.append(InlineKeyboardButton(label, callback_data=callback))
+        row.append(InlineKeyboardButton(label, callback_data=f"buy:{ref}:{amt}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
 
-    keyboard.append([InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom:{chain}:{token_address}")])
+    risk_usd = float(db_get_setting("risk_usd", DEFAULT_RISK_USD) or 0)
+    if risk_usd > 0:
+        keyboard.append([
+            InlineKeyboardButton(f"💵 Risk ${risk_usd:g}", callback_data=f"riskbuy:{ref}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom:{ref}")])
     keyboard.append([
         InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/{chain}/{token_address}"),
         InlineKeyboardButton("🚫 Skip", callback_data="noop"),
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def build_alert_keyboard(chain, token_address, symbol):
+def build_alert_keyboard(chain, token_address, symbol, price_usd=None, price_native=None):
     """Build inline keyboard for scan alerts."""
-    return build_buy_keyboard(chain, token_address, symbol)
+    return build_buy_keyboard(chain, token_address, symbol, price_usd, price_native)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # POSITIONS KEYBOARD
@@ -1747,60 +2342,104 @@ def build_position_actions_keyboard(pos_id):
 # TELEGRAM HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def fetch_pair_info(chain: str, token_address: str) -> dict:
+    """Symbol + price info for a token, shared by every buy path."""
+    info = {"symbol": "???", "price_usd": 0.0, "price_native": 0.0}
+    try:
+        async with aiohttp.ClientSession() as temp_session:
+            data = await fetch_json(
+                temp_session, f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}"
+            )
+        pair = _deepest_pair(data)
+        if pair:
+            info["symbol"] = (pair.get("baseToken") or {}).get("symbol") or "???"
+            info["price_usd"] = float(pair.get("priceUsd") or 0)
+            info["price_native"] = float(pair.get("priceNative") or 0)
+    except Exception as e:
+        logger.debug(f"Pair info fetch failed for {chain} {token_address[:10]}...: {e}")
+    return info
+
+
+async def _buy_via_callback(chain, token_address, amount, target=None):
+    info = await fetch_pair_info(chain, token_address)
+    symbol = info["symbol"]
+    if symbol == "???" and target:
+        symbol = target.get("symbol") or "???"
+    await tg_send(
+        f"⏳ Buying {amount:g} {NATIVE_SYMBOL[chain]} of {esc(symbol)}...",
+        parse_mode=ParseMode.HTML,
+    )
+    pos_id = await open_position(
+        chain, token_address, symbol, amount, info["price_usd"], info["price_native"]
+    )
+    if pos_id:
+        logger.info(f"Position opened via callback: {symbol} id={pos_id}")
+
+
 async def handle_callback_query(query):
     """Process inline button clicks."""
     data = query.data
     if not data: return
     try:
         await bot.answer_callback_query(query.id)
-    except:
+    except Exception:
         pass
 
     parts = data.split(":")
     action = parts[0]
 
-    if action == "buy" and len(parts) >= 4:
-        chain = parts[1]
-        token_address = parts[2]
-        amount = float(parts[3])
-        symbol = "???"; price_usd = 0.0; price_native = 0.0
+    if action == "buy" and len(parts) >= 3:
+        target = get_callback_target(parts[1])
+        if not target:
+            await tg_send("⌛ This button expired. Paste the CA again to buy.")
+            return
         try:
-            url = f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}"
-            async with aiohttp.ClientSession() as temp_session:
-                async with temp_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        d = await resp.json()
-                        if d and isinstance(d, list) and len(d) > 0:
-                            symbol = d[0].get("baseToken", {}).get("symbol", "???")
-                            price_usd = float(d[0].get("priceUsd") or 0)
-                            price_native = float(d[0].get("priceNative") or 0)
-        except:
-            pass
-        await bot.send_message(chat_id=CHAT_ID, text=f"⏳ Buying {amount} {NATIVE_SYMBOL[chain]} of {symbol}...", parse_mode=ParseMode.HTML)
-        pos_id = await open_position(chain, token_address, symbol, amount, price_usd, price_native)
-        if pos_id:
-            logger.info(f"Position opened via callback: {symbol} id={pos_id}")
+            amount = float(parts[2])
+        except ValueError:
+            await tg_send("❌ Invalid amount in button.")
+            return
+        await _buy_via_callback(target["chain"], target["token"], amount, target)
 
-    elif action == "custom" and len(parts) >= 3:
-        chain = parts[1]
-        token_address = parts[2]
-        user_state[CHAT_ID] = {"action": "custom_buy", "chain": chain, "token": token_address}
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"✏️ <b>Custom Buy</b>\nReply with the amount of {NATIVE_SYMBOL[chain]} you want to spend:",
-            parse_mode=ParseMode.HTML
+    elif action == "riskbuy" and len(parts) >= 2:
+        # USD-risk position sizing (issue 4.5): /risk now actually sizes trades.
+        target = get_callback_target(parts[1])
+        if not target:
+            await tg_send("⌛ This button expired. Paste the CA again to buy.")
+            return
+        chain = target["chain"]
+        risk_usd = float(db_get_setting("risk_usd", DEFAULT_RISK_USD) or 0)
+        if risk_usd <= 0:
+            await tg_send("Set a USD risk first with /risk <usd>.")
+            return
+        native_usd = await get_native_usd_price(None, chain)
+        if native_usd <= 0:
+            await tg_send("Could not price the native token for risk sizing; use a preset amount.")
+            return
+        await _buy_via_callback(chain, target["token"], risk_usd / native_usd, target)
+
+    elif action == "custom" and len(parts) >= 2:
+        target = get_callback_target(parts[1])
+        if not target:
+            await tg_send("⌛ This button expired. Paste the CA again to buy.")
+            return
+        user_state[state_key(CHAT_ID)] = {
+            "action": "custom_buy", "chain": target["chain"], "token": target["token"],
+        }
+        await tg_send(
+            f"✏️ <b>Custom Buy</b>\nReply with the amount of {NATIVE_SYMBOL[target['chain']]} you want to spend:",
+            parse_mode=ParseMode.HTML,
         )
 
     elif action == "pos" and len(parts) >= 2:
         pos_id = int(parts[1])
         pos = db_get_position(pos_id)
         if not pos:
-            await bot.send_message(chat_id=CHAT_ID, text="Position not found.", parse_mode=ParseMode.HTML)
+            await tg_send("Position not found.")
             return
         mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
         text = (
             f"{mode} <b>Position #{pos['id']}</b>\n"
-            f"{pos['symbol']} on {pos['chain'].upper()}\n"
+            f"{esc(pos['symbol'])} on {pos['chain'].upper()}\n"
             f"Entry: ${pos['entry_price']:.6f}\n"
             f"Highest: ${pos['highest_price']:.6f}\n"
             f"Amount: {pos['amount_tokens']:.4f} tokens\n"
@@ -1808,7 +2447,7 @@ async def handle_callback_query(query):
             f"Trailing SL: {pos['trailing_stop_pct']}%"
         )
         keyboard = build_position_actions_keyboard(pos_id)
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await tg_send(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     elif action == "sellpct" and len(parts) >= 3:
         pos_id = int(parts[1])
@@ -1819,22 +2458,20 @@ async def handle_callback_query(query):
         pos_id = int(parts[1])
         pos = db_get_position(pos_id)
         if not pos:
-            await bot.send_message(chat_id=CHAT_ID, text="Position not found.", parse_mode=ParseMode.HTML)
+            await tg_send("Position not found.")
             return
         keyboard = build_buy_keyboard(pos['chain'], pos['token_address'], pos['symbol'])
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"💰 <b>Buy More {pos['symbol']}</b>\nSelect amount:",
-            parse_mode=ParseMode.HTML, reply_markup=keyboard
+        await tg_send(
+            f"💰 <b>Buy More {esc(pos['symbol'])}</b>\nSelect amount:",
+            parse_mode=ParseMode.HTML, reply_markup=keyboard,
         )
 
     elif action == "setsl" and len(parts) >= 2:
         pos_id = int(parts[1])
-        user_state[CHAT_ID] = {"action": "set_sl", "pos_id": pos_id}
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="🛡 <b>Set Trailing Stop Loss</b>\nReply with the new trailing stop % (e.g., 10, 15, 20):",
-            parse_mode=ParseMode.HTML
+        user_state[state_key(CHAT_ID)] = {"action": "set_sl", "pos_id": pos_id}
+        await tg_send(
+            "🛡 <b>Set Trailing Stop Loss</b>\nReply with the new trailing stop % (e.g., 10, 15, 20):",
+            parse_mode=ParseMode.HTML,
         )
 
     elif action == "cmd":
@@ -1850,8 +2487,9 @@ async def handle_text_message(message):
     """Handle regular text messages — CA detection + state replies."""
     text = message.text or ""
     chat_id = message.chat.id
+    key = state_key(chat_id)
 
-    state = user_state.get(str(chat_id))
+    state = user_state.get(key)
     if state:
         action = state.get("action")
 
@@ -1863,22 +2501,15 @@ async def handle_text_message(message):
                     return
                 chain = state["chain"]
                 token = state["token"]
-                symbol = "???"; price_usd = 0.0; price_native = 0.0
-                try:
-                    url = f"https://api.dexscreener.com/tokens/v1/{chain}/{token}"
-                    async with aiohttp.ClientSession() as temp_session:
-                        async with temp_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                            if resp.status == 200:
-                                d = await resp.json()
-                                if d and isinstance(d, list) and len(d) > 0:
-                                    symbol = d[0].get("baseToken", {}).get("symbol", "???")
-                                    price_usd = float(d[0].get("priceUsd") or 0)
-                                    price_native = float(d[0].get("priceNative") or 0)
-                except:
-                    pass
-                del user_state[str(chat_id)]
-                await bot.send_message(chat_id=chat_id, text=f"⏳ Buying {amount} {NATIVE_SYMBOL[chain]} of {symbol}...", parse_mode=ParseMode.HTML)
-                await open_position(chain, token, symbol, amount, price_usd, price_native)
+                del user_state[key]
+                info = await fetch_pair_info(chain, token)
+                symbol = info["symbol"]
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Buying {amount:g} {NATIVE_SYMBOL[chain]} of {esc(symbol)}...",
+                    parse_mode=ParseMode.HTML,
+                )
+                await open_position(chain, token, symbol, amount, info["price_usd"], info["price_native"])
             except ValueError:
                 await bot.send_message(chat_id=chat_id, text="❌ Invalid amount. Please send a number.")
             return
@@ -1891,7 +2522,7 @@ async def handle_text_message(message):
                     return
                 pos_id = state["pos_id"]
                 db_update_trailing_stop(pos_id, new_sl)
-                del user_state[str(chat_id)]
+                del user_state[key]
                 await bot.send_message(chat_id=chat_id, text=f"✅ Trailing stop updated to {new_sl}%", parse_mode=ParseMode.HTML)
             except ValueError:
                 await bot.send_message(chat_id=chat_id, text="❌ Invalid number.")
@@ -1949,6 +2580,21 @@ async def handle_command(message):
             parse_mode=ParseMode.HTML
         )
 
+    elif cmd == "/features":
+        stats = FEATURE_LOGGER.stats()
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                "<b>Feature logging</b>\n"
+                f"Enabled: {stats['enabled']}\n"
+                f"Rows logged: {stats['logged']}\n"
+                f"Batches written: {stats['written_batches']}\n"
+                f"Queued: {stats['queued']}\n"
+                f"Dropped: {stats['dropped']}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
     elif cmd == "/risk" and args:
         try:
             usd = float(args[0])
@@ -1959,11 +2605,19 @@ async def handle_command(message):
 
     elif cmd == "/setamounts" and len(args) >= 2:
         chain = args[0].lower()
+        if chain not in DEFAULT_BUY_AMOUNTS:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"Unknown chain. Use one of: {', '.join(NETWORKS)}",
+                parse_mode=ParseMode.HTML
+            )
+            return
         amounts_str = " ".join(args[1:])
         try:
-            amounts = [float(x.strip()) for x in amounts_str.split(",")]
-            key = f"buy_amounts_{NATIVE_SYMBOL.get(chain, chain).lower()}"
-            db_set_setting(key, json.dumps(amounts))
+            amounts = [float(x.strip()) for x in amounts_str.split(",") if x.strip()]
+            if not amounts or any(a <= 0 for a in amounts):
+                raise ValueError("amounts must be positive")
+            db_set_setting(_buy_amounts_key(chain), json.dumps(amounts))
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"✅ Buy amounts for {chain.upper()} updated: {amounts}",
@@ -2043,20 +2697,21 @@ async def send_start_menu():
         f"/balance — Check balances\n"
         f"/settings — View config\n"
         f"/debug — Log config to console\n"
-        f"/risk <usd> — Set $ risk per trade\n"
-        f"/setamounts <chain> <a,b,c> — Custom buy sizes"
+        f"/risk <usd> — Set $ risk per trade (adds a Risk buy button)\n"
+        f"/setamounts <chain> <a,b,c> — Custom buy sizes (per chain)\n"
+        f"/features — Feature-logging stats"
     )
-    await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    await tg_send(text, parse_mode=ParseMode.HTML)
 
 
 async def send_positions_menu():
     positions = db_get_open_positions()
     if not positions:
-        await bot.send_message(chat_id=CHAT_ID, text="No open positions.", parse_mode=ParseMode.HTML)
+        await tg_send("No open positions.", parse_mode=ParseMode.HTML)
         return
     text = "📊 <b>Your Positions</b>\nTap one to manage:"
     keyboard = build_positions_keyboard(positions)
-    await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await tg_send(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def send_settings_menu():
@@ -2071,11 +2726,13 @@ async def send_settings_menu():
         f"Slippage: {slippage}%\n"
         f"Trailing Stop: {trailing}%\n"
         f"Take Profit Levels:\n{tp_pretty}\n\n"
-        f"Risk per Trade: ${risk}\n"
+        f"Risk per Trade: ${risk} (used by the 💵 Risk buy button)\n"
         f"Paper Trading: {'✅ ON' if PAPER_TRADING else '❌ OFF'}\n"
+        f"Paper fee model: {PAPER_FEE_PCT}%/side\n"
+        f"Feature logging: {'✅ ON' if LOG_FEATURES else 'off'}\n"
         f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>"
     )
-    await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    await tg_send(text, parse_mode=ParseMode.HTML)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2096,13 +2753,13 @@ async def telegram_polling_task():
                     if not is_authorized(chat_id, user_id):
                         logger.warning(f"Ignored callback from unauthorized chat/user: {chat_id}/{user_id}")
                         continue
-                    await handle_callback_query(cq)
+                    _spawn_handler(handle_callback_query(cq))
                 elif update.message and update.message.text:
                     user_id = update.message.from_user.id if update.message.from_user else None
                     if not is_authorized(update.message.chat.id, user_id):
                         logger.warning(f"Ignored message from unauthorized chat/user: {update.message.chat.id}/{user_id}")
                         continue
-                    await handle_text_message(update.message)
+                    _spawn_handler(handle_text_message(update.message))
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
             await asyncio.sleep(5)
@@ -2133,11 +2790,12 @@ async def send_alert(alert):
             f"  Sell Tax: {sec.get('sell_tax', 0):.1f}%\n"
         )
 
+    age_display = f"{alert['age_minutes']:.0f}" if alert.get("age_minutes") is not None else "?"
     text = (
-        f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']}/100</b>\n\n"
-        f"<b>{alert['name']}</b> ({alert['symbol']})\n"
+        f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']:.0f}/100</b>\n\n"
+        f"<b>{esc(alert['name'])}</b> ({esc(alert['symbol'])})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
-        f"🕒 Age: <b>{alert['age_minutes']:.0f} min</b>\n\n"
+        f"🕒 Age: <b>{age_display} min</b>\n\n"
         f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}\n"
         f"<b>Market Cap:</b> ${alert['market_cap']:,.0f}\n"
         f"<b>Volume (5m):</b> ${alert['vol_5m']:,.0f}\n"
@@ -2153,17 +2811,22 @@ async def send_alert(alert):
         f"  Top 100: {pct100:.1f}%\n\n"
         f"<b>CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})\n\n"
         f"<b>Signal Engine:</b> +{alert.get('signal_bonus', 0):.0f} / -{alert.get('signal_penalty', 0):.0f}\n"
-        + (f"<i>{', '.join(alert.get('signal_notes', []))}</i>\n" if alert.get('signal_notes') else "")
-        + f"📝 <b>Contract:</b> <code>{alert['token_address']}</code>"
+        + (f"<i>{esc(', '.join(alert.get('signal_notes', [])))}</i>\n" if alert.get('signal_notes') else "")
+        + f"📝 <b>Contract:</b> <code>{esc(alert['token_address'])}</code>"
     )
 
-    keyboard = build_alert_keyboard(alert['chain'], alert['token_address'], alert['symbol'])
+    keyboard = build_alert_keyboard(
+        alert['chain'], alert['token_address'], alert['symbol'],
+        price_usd=alert.get("price_usd"), price_native=alert.get("price_native"),
+    )
     try:
-        await bot.send_message(
-            chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True, reply_markup=keyboard
+        await tg_send(
+            text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=keyboard,
         )
         alerts_sent += 1
+        # Mark the feature row as actually alerted (Phase 2 labelling).
+        FEATURE_LOGGER.mark_alert_sent(alert['chain'], alert['token_address'])
         logger.info(f"ALERT #{alerts_sent} sent → {alert['symbol']}@{alert['chain']} score={alert['total_score']}")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
@@ -2176,6 +2839,7 @@ async def send_alert(alert):
 async def bot_task():
     global start_time, last_heartbeat_time, total_pairs_scanned, db_conn
     db_conn = init_db()
+    FEATURE_LOGGER.start()
     start_time = time.time()
     last_heartbeat_time = start_time
     logger.info("Pump Bot v5.4 starting (Manual Trader + CA Paste)...")
@@ -2188,16 +2852,14 @@ async def bot_task():
         polling_task = asyncio.create_task(telegram_polling_task())
 
         try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=(
-                    f"✅ <b>Pump Bot v5.4</b> started\n"
-                    f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}\n"
-                    f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>\n"
-                    f"Scan interval: {SCAN_INTERVAL}s\n"
-                    f"Alert threshold: {ALERT_THRESHOLD}/100\n\n"
-                    f"<b>Paste any CA to buy instantly!</b>"
-                ),
+            await tg_send(
+                f"✅ <b>Pump Bot v5.4</b> started\n"
+                f"Mode: {'📄 PAPER' if PAPER_TRADING else '💰 LIVE'}\n"
+                f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>\n"
+                f"Scan interval: {SCAN_INTERVAL}s\n"
+                f"Alert threshold: {ALERT_THRESHOLD}/100\n"
+                f"Feature logging: {'ON' if LOG_FEATURES else 'off'}\n\n"
+                f"<b>Paste any CA to buy instantly!</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -2212,16 +2874,15 @@ async def bot_task():
                 if time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                     uptime = (time.time() - start_time) / 3600
                     positions = db_get_open_positions()
-                    await bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=(
-                            f"🫀 <b>Bot v5.4 Heartbeat</b>\n"
-                            f"Uptime: {uptime:.1f}h\n"
-                            f"Pairs scanned: {total_pairs_scanned}\n"
-                            f"Alerts sent: {alerts_sent}\n"
-                            f"Open positions: {len(positions)}"
-                        ),
-                        parse_mode=ParseMode.HTML
+                    await tg_send(
+                        f"🫀 <b>Bot v5.4 Heartbeat</b>\n"
+                        f"Uptime: {uptime:.1f}h\n"
+                        f"Pairs scanned: {total_pairs_scanned}\n"
+                        f"Tokens evaluated: {tokens_evaluated}\n"
+                        f"Alerts sent: {alerts_sent}\n"
+                        f"Open positions: {len(positions)}"
+                        + (f"\nFeatures queued: {FEATURE_LOGGER.stats()['queued']}" if LOG_FEATURES else ""),
+                        parse_mode=ParseMode.HTML,
                     )
                     last_heartbeat_time = time.time()
 
@@ -2253,12 +2914,11 @@ async def bot_task():
             except Exception as e:
                 logger.error(f"CRITICAL CYCLE ERROR: {e}", exc_info=True)
                 try:
-                    await bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=f"⚠️ <b>Bot cycle crashed</b>\n<code>{str(e)[:300]}</code>\nRetrying in 60s...",
-                        parse_mode=ParseMode.HTML
+                    await tg_send(
+                        f"⚠️ <b>Bot cycle crashed</b>\n<code>{esc(str(e)[:300])}</code>\nRetrying in 60s...",
+                        parse_mode=ParseMode.HTML,
                     )
-                except:
+                except Exception:
                     pass
                 await asyncio.sleep(60)
 
@@ -2269,6 +2929,7 @@ async def bot_task():
             await polling_task
         except asyncio.CancelledError:
             pass
+    FEATURE_LOGGER.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2287,6 +2948,7 @@ async def lifespan(app):
         await task
     except asyncio.CancelledError:
         logger.info("Bot task cancelled cleanly")
+    FEATURE_LOGGER.stop()
     if db_conn:
         db_conn.close()
 
@@ -2295,14 +2957,17 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health_check():
     positions = db_get_open_positions() if db_conn else []
+    # The wallet address is deliberately NOT exposed here (issue 2.4): this
+    # endpoint is bound to 0.0.0.0 and may be publicly reachable.
     return {
         "status": "alive",
         "alerts_sent": alerts_sent,
         "pairs_scanned": total_pairs_scanned,
+        "tokens_evaluated": tokens_evaluated,
         "open_positions": len(positions),
         "threshold": ALERT_THRESHOLD,
         "paper_trading": PAPER_TRADING,
-        "wallet": WALLET_ADDRESS,
+        "features": FEATURE_LOGGER.stats(),
     }
 
 if __name__ == "__main__":
