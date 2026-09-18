@@ -52,9 +52,11 @@ The handful you are most likely to change:
 | `MAX_ALLOWED_TAX` | `10` | Reject tokens above this buy/sell tax %. |
 | `MORALIS_API_KEY` | — | Enables holder-concentration scoring. |
 | `COINGECKO_API_KEY` | — | Enables CEX-listing scoring. |
-| `USE_GECKOTERMINAL` | `false` | Keep `false` for the original DexScreener discovery. `true` widens the net to GeckoTerminal and **will add a lot of Base noise** if you use `new_pools`. |
-| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties). |
+| `USE_GECKOTERMINAL` | `false` | Keep `false` for the original DexScreener discovery. `true` finds pools earlier but adds noise; pair it with `USE_SIGNALS=true` and the AND-gates below. |
+| `GT_SOURCES` | `trending` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. |
+| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. |
 | `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned `MIN_SCORE` stays the gate; a bonus can never create an alert. |
+| `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach `MIN_SCORE`). Every AND-condition in `SIG_EARLY_*` must hold. |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
 | `BASE_MIN_LIQUIDITY_USD` etc. | — | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
@@ -142,15 +144,22 @@ token at different times) — split by token, not by row, when validating.
 
 ## Notes
 
-- **Filtering / Base noise.** The hand-tuned score (`MIN_SCORE`) is the only gate,
-  as in the original bot. Signals can veto and penalise, but their bonus is
-  weighted by `SIGNAL_BONUS_WEIGHT` (default `0.0`) so they cannot promote noise.
-  If a chain is still too noisy, tighten it directly:
-  `BASE_MIN_LIQUIDITY_USD`, `BASE_MIN_VOL_5M_USD`, `BASE_MIN_MARKET_CAP_USD`.
+- **Finding runners early vs. filtering noise is a real trade-off.** Discovery
+  breadth (`new_pools`) is what finds pools early; filtering is what keeps junk
+  out. They pull in opposite directions, so the bot keeps them separate:
+  discovery decides *what gets looked at*, and AND-gated filters decide *what
+  alerts*. GeckoTerminal supplies unique `buyers`/`sellers`, which DexScreener
+  does not — those gates (`SIG_MIN_UNIQUE_BUYER_RATIO`, `SIG_MIN_VOL_LIQ`) are
+  what stop a rug from scoring high on volume alone.
+- **Filtering.** The hand-tuned score (`MIN_SCORE`) is the gate, as in the
+  original bot. Signals only veto and penalise (`SIGNAL_BONUS_WEIGHT=0.0` by
+  default). Tighten a noisy chain directly with `BASE_MIN_LIQUIDITY_USD`,
+  `BASE_MIN_VOL_5M_USD`, `BASE_MIN_MARKET_CAP_USD`.
+- **Early runners.** `EARLY_RUNNER_MODE=true` + `USE_GECKOTERMINAL=true` gives a
+  young pool a chance to alert even though it can't reach `MIN_SCORE`. It is
+  AND-gated, so it will not fire on a dead, illiquid or wash-traded pool.
 - Default discovery uses DexScreener's boost/profile lists because the DexScreener
-  "all pairs" endpoint is dead (404). `USE_GECKOTERMINAL=true` widens discovery
-  (and noise) considerably — if you use it, prefer `GT_SOURCES=trending` over
-  `new_pools`.
+  "all pairs" endpoint is dead (404).
 - Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Liquidity on
   Aerodrome (Base) or V4 venues may not be tradeable.
 - See [`REVIEW.md`](REVIEW.md) for the detailed code review, known issues and

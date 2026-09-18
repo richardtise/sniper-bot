@@ -85,6 +85,12 @@ ALERT_THRESHOLD = int(os.getenv("MIN_SCORE", os.getenv("ALERT_THRESHOLD", "65"))
 USE_SIGNALS = os.getenv("USE_SIGNALS", "false").lower() == "true" and SIGNALS_AVAILABLE
 USE_GECKOTERMINAL = os.getenv("USE_GECKOTERMINAL", "false").lower() == "true" and DISCOVERY_AVAILABLE
 
+# Early-runner fast lane: lets a genuinely strong *young* pool alert even though
+# its 1h/6h/24h windows are empty (and so its hand-tuned score can never reach
+# MIN_SCORE). Requires USE_SIGNALS and every AND-condition in
+# signals.early_runner_reasons() to hold. Default OFF.
+EARLY_RUNNER_MODE = os.getenv("EARLY_RUNNER_MODE", "false").lower() == "true" and SIGNALS_AVAILABLE
+
 # Optional Telegram allowlist. Empty -> only CHAT_ID is accepted. Set this when
 # CHAT_ID is a group so other members cannot run /sell, /risk, /setamounts.
 ALLOWED_USER_IDS = {
@@ -515,6 +521,7 @@ FEATURE_FIELDS = [
     "signal_bonus", "signal_penalty", "signal_notes",
     "base_score", "hand_score", "phase1_pass",
     "rejected", "reject_reasons", "passed_threshold", "alert_sent", "paper_mode",
+    "early_runner",
 ]
 
 # Columns stored as INTEGER (flags/counts). Everything else is REAL unless it is
@@ -525,7 +532,7 @@ _FEATURE_INT_FIELDS = {
     "owner_change_balance", "transfer_pausable", "slippage_modifiable",
     "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
     "is_blacklisted", "is_whitelisted", "lp_locked", "security_known",
-    "rejected", "passed_threshold", "alert_sent", "paper_mode",
+    "rejected", "passed_threshold", "alert_sent", "paper_mode", "early_runner",
 }
 _FEATURE_TEXT_FIELDS = {
     "ts_utc", "chain", "token_address", "pair_address", "symbol", "source",
@@ -533,22 +540,35 @@ _FEATURE_TEXT_FIELDS = {
 }
 
 
+def _feature_col_type(field: str) -> str:
+    if field in _FEATURE_TEXT_FIELDS:
+        return "TEXT"
+    if field in _FEATURE_INT_FIELDS:
+        return "INTEGER"
+    return "REAL"
+
+
 def _feature_schema_sql() -> str:
-    cols = []
-    for field in FEATURE_FIELDS:
-        if field in _FEATURE_TEXT_FIELDS:
-            sql_type = "TEXT"
-        elif field in _FEATURE_INT_FIELDS:
-            sql_type = "INTEGER"
-        else:
-            sql_type = "REAL"
-        cols.append(f"    {field} {sql_type}")
+    cols = [f"    {field} {_feature_col_type(field)}" for field in FEATURE_FIELDS]
     return (
         "CREATE TABLE IF NOT EXISTS features (\n"
         "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
         + ",\n".join(cols)
         + "\n);"
     )
+
+
+def ensure_feature_columns(conn: sqlite3.Connection):
+    """Add any newly introduced feature columns to an existing DB.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not add columns, so a deployment that
+    already has a ``features`` table needs this migration.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(features)")}
+    for field in FEATURE_FIELDS:
+        if field not in existing:
+            conn.execute(f"ALTER TABLE features ADD COLUMN {field} {_feature_col_type(field)}")
+    conn.commit()
 
 
 def _empty_feature() -> dict:
@@ -705,6 +725,7 @@ def init_db() -> sqlite3.Connection:
         );
     """)
     conn.executescript(_feature_schema_sql())
+    ensure_feature_columns(conn)  # migrate older feature tables
     conn.executescript(
         "CREATE INDEX IF NOT EXISTS idx_features_token ON features(chain, token_address);"
         "CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_epoch);"
@@ -1585,6 +1606,18 @@ async def evaluate_token(session, pair):
     total_score = max(0.0, legacy_total - signal_penalty + signal_bonus * SIGNAL_BONUS_WEIGHT)
     feat["hand_score"] = legacy_total
 
+    # Early-runner fast lane: a pool younger than its long volume windows can
+    # never reach MIN_SCORE, so allow an AND-gated exception. This is what makes
+    # USE_GECKOTERMINAL=new_pools useful rather than just noisy.
+    early_ok = False
+    if EARLY_RUNNER_MODE and total_score < ALERT_THRESHOLD:
+        early_reasons = signals.early_runner_reasons(pair, security=security, filters=SIGNAL_FILTERS)
+        if not early_reasons:
+            early_ok = True
+            if VERBOSE_LOGGING:
+                logger.info(f"Early-runner lane {symbol}@{chain} age={age_minutes:.0f}m score={total_score:.0f}")
+    feat["early_runner"] = 1 if early_ok else 0
+
     if VERBOSE_LOGGING:
         logger.info(
             f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}) | "
@@ -1594,13 +1627,15 @@ async def evaluate_token(session, pair):
             f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={top100:.1f}% | "
             f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties} "
             f"signal=+{signal_bonus:.0f}/-{signal_penalty:.0f}"
+            + ("  [EARLY]" if early_ok else "")
         )
 
-    # Original gate: the token must clear the threshold on the hand-tuned score.
-    if legacy_total < ALERT_THRESHOLD:
+    # Original gate: the token must clear the threshold on the hand-tuned score,
+    # unless the strict early-runner lane vouched for it.
+    if legacy_total < ALERT_THRESHOLD and not early_ok:
         return reject("below_threshold")
     # Signals may still veto a token the hand-tuned score would have alerted on.
-    if total_score < ALERT_THRESHOLD:
+    if total_score < ALERT_THRESHOLD and not early_ok:
         return reject("signal_penalised")
 
     return finish(None, {

@@ -52,6 +52,8 @@ __all__ = [
     "PairHistory",
     "evaluate",
     "hard_reject_reasons",
+    "early_runner_reasons",
+    "qualifies_as_early_runner",
     "runner_signals",
     "normalize_security",
     "is_major_asset",
@@ -169,6 +171,24 @@ class Filters:
     min_buy_ratio_5m: float = 0.35
     max_avg_trade_liq_ratio: float = 0.10    # one wallet moving the pool
     max_vol_liq_ratio: float = 25.0          # absurd turnover = wash
+    # AND-gates that only activate when GeckoTerminal supplies the data (so they
+    # never affect plain DexScreener pairs). These are the filters that make
+    # USE_GECKOTERMINAL=true worth it instead of just noisy.
+    min_vol_liq_ratio: float = 0.05          # 5m volume / liquidity floor
+    min_unique_buyer_ratio: float = 0.50     # unique buyers / total buys
+
+    # --- early-runner fast lane (EARLY_RUNNER_MODE) ---------------------------
+    # A brand-new pool can never reach MIN_SCORE because its 1h/6h/24h windows
+    # are empty. This lane lets a genuinely strong *young* pool alert, but only
+    # if every condition below holds (AND, not a sum — a rug cannot compensate).
+    early_max_age_minutes: float = 30.0
+    early_min_liquidity_usd: float = 15_000.0
+    early_min_vol_liq_ratio: float = 0.10
+    early_min_txns_5m: int = 20
+    early_min_buy_ratio: float = 0.60
+    early_min_unique_buyers: int = 15
+    early_max_chg_5m: float = 150.0          # already vertical = late
+    early_require_unique_buyers: bool = True
 
     # --- holder stance --------------------------------------------------------
     # "pump" (default) = early-runner mode. Early runners are usually dominated
@@ -214,6 +234,16 @@ class Filters:
             "SIG_REQUIRE_LP_LOCKED": ("require_lp_locked", _truthy),
             "SIG_MAX_BONUS": ("max_bonus", float),
             "SIG_MAX_PENALTY": ("max_penalty", float),
+            "SIG_MIN_VOL_LIQ": ("min_vol_liq_ratio", float),
+            "SIG_MIN_UNIQUE_BUYER_RATIO": ("min_unique_buyer_ratio", float),
+            "SIG_EARLY_MAX_AGE_MINUTES": ("early_max_age_minutes", float),
+            "SIG_EARLY_MIN_LIQUIDITY_USD": ("early_min_liquidity_usd", float),
+            "SIG_EARLY_MIN_VOL_LIQ": ("early_min_vol_liq_ratio", float),
+            "SIG_EARLY_MIN_TXNS_5M": ("early_min_txns_5m", int),
+            "SIG_EARLY_MIN_BUY_RATIO": ("early_min_buy_ratio", float),
+            "SIG_EARLY_MIN_UNIQUE_BUYERS": ("early_min_unique_buyers", int),
+            "SIG_EARLY_MAX_CHG_5M": ("early_max_chg_5m", float),
+            "SIG_EARLY_REQUIRE_UNIQUE_BUYERS": ("early_require_unique_buyers", _truthy),
         }
         for env_key, (attr, caster) in mapping.items():
             raw = os.getenv(env_key)
@@ -376,6 +406,21 @@ def hard_reject_reasons(
     if liquidity and _ratio(vol_5m, liquidity) > f.max_vol_liq_ratio:
         reasons.append("wash_turnover")
 
+    # Activity floor: a pool that barely trades relative to its size is dead or
+    # fake volume. Only meaningful alongside the volume floor above.
+    if liquidity and vol_5m > 0 and _ratio(vol_5m, liquidity) < f.min_vol_liq_ratio:
+        reasons.append("low_activity")
+
+    # Unique-buyer gates. `buyers` only exists on GeckoTerminal data, so this is
+    # a no-op for plain DexScreener pairs and an extra filter exactly when GT
+    # discovery is enabled.
+    buyers_5m = int(_dig(pair, "txns", "m5", "buyers"))
+    if buyers_5m:
+        if buys_5m >= f.min_txns_5m and _ratio(buyers_5m, buys_5m) < f.min_unique_buyer_ratio:
+            reasons.append("wash:few_unique_buyers")
+        if buyers_5m < f.min_unique_buyers_5m:
+            reasons.append("buyers5m_too_low")
+
     chg_5m = _num(_dig(pair, "priceChange", "m5"))
     chg_1h = _num(_dig(pair, "priceChange", "h1"))
     if chg_1h > f.max_chg_1h_late and chg_5m < 15:
@@ -422,6 +467,86 @@ def hard_reject_reasons(
             reasons.append("lp_unlocked")
 
     return reasons
+
+
+def early_runner_reasons(
+    pair: dict,
+    *,
+    security: Optional[dict] = None,
+    gt: Optional[dict] = None,
+    filters: Optional[Filters] = None,
+) -> List[str]:
+    """Conditions a young pool must ALL satisfy for the early-runner fast lane.
+
+    Returns a list of the conditions that failed; an empty list means the pool
+    qualifies. This is deliberately AND-based: unlike a weighted score, strong
+    volume cannot compensate for a missing unique-buyer base or a bad security
+    flag. ``bot.evaluate_token`` only uses this when ``EARLY_RUNNER_MODE=true``.
+    """
+    f = filters or Filters()
+    sec = normalize_security(security, gt)
+    reasons: List[str] = []
+
+    chain = str(pair.get("chainId") or "")
+    if is_major_asset(pair, chain):
+        reasons.append("major_asset")
+
+    liquidity = _num(_dig(pair, "liquidity", "usd"))
+    market_cap = _num(pair.get("marketCap")) or _num(pair.get("fdv"))
+    vol_5m = _num(_dig(pair, "volume", "m5"))
+    buys_5m = int(_dig(pair, "txns", "m5", "buys"))
+    sells_5m = int(_dig(pair, "txns", "m5", "sells"))
+    txns_5m = buys_5m + sells_5m
+    buyers_5m = int(_dig(pair, "txns", "m5", "buyers"))
+    chg_5m = _num(_dig(pair, "priceChange", "m5"))
+    created = pair.get("pairCreatedAt")
+    age = (time.time() - _num(created) / 1000.0) / 60.0 if created else None
+
+    if age is None or age > f.early_max_age_minutes:
+        reasons.append("not_early")
+    if liquidity < f.early_min_liquidity_usd:
+        reasons.append("early_liq")
+    if market_cap and liquidity and _ratio(liquidity, market_cap) < f.min_liquidity_mcap_ratio:
+        reasons.append("early_liq_mcap")
+    if not liquidity or _ratio(vol_5m, liquidity) < f.early_min_vol_liq_ratio:
+        reasons.append("early_activity")
+    if txns_5m < f.early_min_txns_5m:
+        reasons.append("early_txns")
+    if _ratio(buys_5m, txns_5m) < f.early_min_buy_ratio:
+        reasons.append("early_buy_ratio")
+    if buyers_5m:
+        if buyers_5m < f.early_min_unique_buyers:
+            reasons.append("early_unique_buyers")
+    elif f.early_require_unique_buyers:
+        # Without GeckoTerminal there is no unique-buyer proof, so the fast lane
+        # cannot vouch for the pool.
+        reasons.append("early_no_unique_buyer_data")
+    if chg_5m > f.early_max_chg_5m:
+        reasons.append("early_already_vertical")
+
+    # Same non-negotiables as the normal path.
+    if sec["honeypot"]:
+        reasons.append("honeypot")
+    if sec["buy_tax"] > f.max_tax_pct or sec["sell_tax"] > f.max_tax_pct:
+        reasons.append("tax")
+    if sec["open_source"] is False and f.require_open_source:
+        reasons.append("not_open_source")
+    for key in ("hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
+                "owner_change_balance", "transfer_pausable", "slippage_modifiable",
+                "take_back_ownership", "blacklist"):
+        if sec[key]:
+            reasons.append(key)
+    return reasons
+
+
+def qualifies_as_early_runner(
+    pair: dict,
+    *,
+    security: Optional[dict] = None,
+    gt: Optional[dict] = None,
+    filters: Optional[Filters] = None,
+) -> bool:
+    return not early_runner_reasons(pair, security=security, gt=gt, filters=filters)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

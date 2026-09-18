@@ -143,6 +143,7 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
         self._saved = {
             "USE_SIGNALS": bot.USE_SIGNALS,
             "SIGNAL_BONUS_WEIGHT": bot.SIGNAL_BONUS_WEIGHT,
+            "EARLY_RUNNER_MODE": bot.EARLY_RUNNER_MODE,
             "ALERT_THRESHOLD": bot.ALERT_THRESHOLD,
             "PHASE1_MIN_SCORE": bot.PHASE1_MIN_SCORE,
             "ALLOW_SECURITY_FALLBACK": bot.ALLOW_SECURITY_FALLBACK,
@@ -258,6 +259,36 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(sec)
         self.assertEqual(sec["source"], "honeypot.is")
         self.assertTrue(sec["is_honeypot"])
+
+    async def test_early_runner_lane_is_and_gated(self):
+        self._install_security(self._good_security())
+        bot.USE_SIGNALS = True
+        bot.SIGNAL_BONUS_WEIGHT = 0.0
+        bot.ALERT_THRESHOLD = 65
+        self._young = self._pair()
+        self._young.update({
+            "liquidity": {"usd": 30_000.0},
+            "marketCap": 1_500_000.0,
+            "volume": {"m5": 9_000.0, "h1": 12_000.0, "h6": 12_000.0, "h24": 12_000.0},
+            "txns": {"m5": {"buys": 40, "sells": 15, "buyers": 30, "sellers": 10},
+                     "h1": {"buys": 40, "sells": 15}},
+            "pairCreatedAt": (time.time() - 10 * 60) * 1000,
+        })
+
+        # Off: a strong young pool cannot reach the hand-tuned threshold.
+        bot.EARLY_RUNNER_MODE = False
+        self.assertIsNone(await bot.evaluate_token(None, dict(self._young)))
+
+        # On: the AND-gated fast lane lets it through.
+        bot.EARLY_RUNNER_MODE = True
+        result = await bot.evaluate_token(None, dict(self._young))
+        self.assertIsNotNone(result, "young strong pool should alert via the fast lane")
+
+        # Weak unique-buyer base disqualifies it even with the lane on.
+        weak = dict(self._young)
+        weak["txns"] = {"m5": {"buys": 40, "sells": 15, "buyers": 2, "sellers": 2},
+                        "h1": {"buys": 40, "sells": 15}}
+        self.assertIsNone(await bot.evaluate_token(None, weak))
 
     async def test_per_chain_floor_override(self):
         os.environ["BASE_MIN_LIQUIDITY_USD"] = "50000"

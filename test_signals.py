@@ -176,12 +176,32 @@ class TestRunnerSignals(unittest.TestCase):
         self.assertIn("buy_pressure_5m", strong.notes)
         self.assertTrue(any("unique buyers" in n for n in strong.notes))
 
-    def test_wash_trading_penalised(self):
+    def test_wash_trading_rejected(self):
+        # With unique-buyer data present, a few wallets cycling funds is now a
+        # hard reject (AND-gate), not merely a penalty.
         v = evaluate(
             make_pair(txns={"m5": {"buys": 30, "sells": 10, "buyers": 4, "sellers": 3}}),
             security=GOOD_SEC, gt=GOOD_GT,
         )
-        self.assertIn("wash:few_unique_buyers", v.notes)
+        self.assertTrue(v.rejected)
+        self.assertIn("wash:few_unique_buyers", v.reject_reasons)
+
+    def test_low_activity_rejected(self):
+        # 5m volume far below the liquidity floor -> dead/fake pool.
+        v = evaluate(
+            make_pair(liquidity={"usd": 100_000.0}, volume={"m5": 500.0, "h1": 5000.0}),
+            security=GOOD_SEC, gt=GOOD_GT,
+        )
+        self.assertIn("low_activity", v.reject_reasons)
+
+    def test_unique_buyer_gate_is_noop_without_gt_data(self):
+        # DexScreener pairs carry no `buyers`; the gate must not fire for them.
+        pair = make_pair()
+        pair["txns"]["m5"].pop("buyers", None)
+        pair["txns"]["m5"].pop("sellers", None)
+        v = evaluate(pair, security=GOOD_SEC)
+        self.assertNotIn("wash:few_unique_buyers", v.reject_reasons)
+        self.assertNotIn("buyers5m_too_low", v.reject_reasons)
 
     def test_history_acceleration_bonus(self):
         hist = PairHistory()
@@ -229,6 +249,54 @@ class TestNormalizeSecurity(unittest.TestCase):
         self.assertEqual(sec["top10_pct"], 22.5)
         self.assertEqual(sec["gt_score"], 65)
         self.assertIn("twitter", sec["socials"])
+
+
+class TestEarlyRunnerLane(unittest.TestCase):
+    """The AND-gated fast lane for young pools (EARLY_RUNNER_MODE)."""
+
+    def _young_pair(self, **over):
+        now_ms = time.time() * 1000
+        pair = make_pair(
+            liquidity={"usd": 30_000.0},
+            marketCap=1_500_000.0,
+            volume={"m5": 9_000.0, "h1": 12_000.0, "h6": 12_000.0, "h24": 12_000.0},
+            txns={"m5": {"buys": 40, "sells": 15, "buyers": 30, "sellers": 10},
+                  "h1": {"buys": 40, "sells": 15}},
+            priceChange={"m5": 20.0, "h1": 20.0, "h6": 20.0, "h24": 20.0},
+            pairCreatedAt=now_ms - 10 * 60 * 1000,  # 10 minutes old
+        )
+        for key, value in over.items():
+            pair[key] = value
+        return pair
+
+    def test_strong_young_pool_qualifies(self):
+        reasons = signals.early_runner_reasons(self._young_pair(), security=GOOD_SEC)
+        self.assertEqual(reasons, [])
+
+    def test_weak_unique_buyers_rejected(self):
+        pair = self._young_pair(
+            txns={"m5": {"buys": 40, "sells": 15, "buyers": 3, "sellers": 2}}
+        )
+        self.assertIn("early_unique_buyers", signals.early_runner_reasons(pair, security=GOOD_SEC))
+
+    def test_low_activity_rejected(self):
+        pair = self._young_pair(volume={"m5": 300.0, "h1": 300.0, "h6": 300.0, "h24": 300.0})
+        self.assertIn("early_activity", signals.early_runner_reasons(pair, security=GOOD_SEC))
+
+    def test_old_pool_rejected(self):
+        pair = self._young_pair(pairCreatedAt=(time.time() - 3600) * 1000)
+        self.assertIn("not_early", signals.early_runner_reasons(pair, security=GOOD_SEC))
+
+    def test_already_vertical_rejected(self):
+        pair = self._young_pair(priceChange={"m5": 400.0, "h1": 400.0, "h6": 400.0, "h24": 400.0})
+        self.assertIn("early_already_vertical", signals.early_runner_reasons(pair, security=GOOD_SEC))
+
+    def test_missing_unique_buyer_data_rejected(self):
+        pair = self._young_pair(txns={"m5": {"buys": 40, "sells": 15}})
+        self.assertIn("early_no_unique_buyer_data", signals.early_runner_reasons(pair, security=GOOD_SEC))
+
+    def test_qualifies_helper(self):
+        self.assertTrue(signals.qualifies_as_early_runner(self._young_pair(), security=GOOD_SEC))
 
 
 class TestPairHistory(unittest.TestCase):

@@ -19,7 +19,7 @@ Items marked **✅ fixed** were changed in this pass; everything else is a recom
 | --- | --- |
 | `signals.py` | Pure runner/false-positive engine: hard rug filters + runner bonus/penalty, cross-scan acceleration history. 26 unit tests. |
 | `discovery.py` | Working candidate discovery via GeckoTerminal (free, no key), mapped to the pair shape `bot.evaluate_token` already consumes. 10 unit tests. |
-| `test_signals.py`, `test_discovery.py`, `test_features.py` | `python -m unittest` suites, 47 tests, no network. |
+| `test_signals.py`, `test_discovery.py`, `test_features.py` | `python -m unittest` suites, 57 tests, no network. |
 | `label_outcomes.py` | Pass 2: turns logged feature rows into forward-return labels for offline training. |
 | `.env.example` | Complete reference incl. the new flags. |
 | `.gitignore` | Now ignores `*.log`, `bot-env/`, `*.db`, caches. |
@@ -89,6 +89,41 @@ Also added per-chain floor overrides (`BASE_MIN_LIQUIDITY_USD`,
 tightened without touching the others, and changed the `.env.example` discovery
 recommendation to `USE_GECKOTERMINAL=false` / `GT_SOURCES=trending` (the previous
 `new_pools,trending` was the noisiest possible source on Base).
+
+### 0d. Why `USE_GECKOTERMINAL=true` + `USE_SIGNALS=true` made it *worse*
+
+Those two flags were supposed to filter more and find runners earlier. They did
+the opposite, for reasons that are worth stating plainly:
+
+1. **Discovery and filtering are opposite forces.** GeckoTerminal `new_pools`
+   returns every newly created pool, including $2k-liquidity, 30-second-old,
+   unverified ones. The original bot discovered from DexScreener boosts/profiles —
+   a far smaller, curated set. Broadening discovery *must* increase raw noise;
+   it only helps if the filters are strong enough to pay for it.
+2. **The signal engine was additive, not gating.** `+bonus` up to 45 meant a
+   token with a hand score of ~40 could clear `MIN_SCORE=65`. A sum lets one
+   strong-looking metric compensate for missing ones — the exact failure mode
+   rugs exploit. Now the gate is the hand-tuned score plus AND-conditions.
+3. **Its thresholds were loosened** (liquidity 8000→4000, vol 500→250, age 3→1
+   min, txns 8→5, avg-trade 0.10→0.25, holders 50→10) on the strength of "early
+   runners are concentrated". That reasoning applies to *holder concentration*
+   only; loosening the liquidity/activity gates just admitted dead pools.
+4. **A young pool can never reach `MIN_SCORE`** because its 1h/6h/24h windows are
+   empty — so `new_pools` was simultaneously the reason it was noisy *and* the
+   reason it produced nothing useful. That is the real gap.
+
+**Added to fix #4 properly — `EARLY_RUNNER_MODE`.** A young pool may alert below
+`MIN_SCORE` only if *every* condition holds (`signals.early_runner_reasons`):
+age ≤ 30 min, liquidity ≥ $15k, liquidity/mcap ≥ 1%, 5m volume ≥ 10% of
+liquidity, ≥ 20 txns, buy ratio ≥ 60%, ≥ 15 **unique buyers**, 5m change ≤ 150%,
+and a clean security record. AND semantics mean strong volume cannot compensate
+for a missing unique-buyer base — which a weighted score always allows. Default
+off; needs `USE_SIGNALS=true`.
+
+**Also added — the AND-gates GeckoTerminal unlocks.** Unique buyers are data
+DexScreener does not return, so `SIG_MIN_UNIQUE_BUYER_RATIO` (unique wallets /
+buys) and `SIG_MIN_VOL_LIQ` are hard rejects that only activate on GT data. These
+are what make GT discovery worth enabling instead of just louder.
 
 **Deliberately deferred**
 * §5.1 modularising the 2.9k-line `bot.py` — large, mechanical, and best done with
@@ -402,7 +437,7 @@ routing). This is the main "quote" improvement left.
 
 ```bash
 # 1. nothing to install — signals.py / discovery.py are stdlib-only
-python -m unittest test_signals test_discovery test_features   # 47 tests
+python -m unittest test_signals test_discovery test_features   # 57 tests
 
 # 2. .env
 USE_SIGNALS=true
@@ -463,5 +498,5 @@ sklearn-ready CSV; `--fetch-current` labels the newest rows from live prices.
 Caveat for modelling: rows for the same token are **not** independent. Split by
 token, not by row, or you will leak the future into the training set.
 
-Tests: `python -m unittest -v test_signals test_discovery test_features` (47).
+Tests: `python -m unittest -v test_signals test_discovery test_features` (57).
 
