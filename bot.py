@@ -106,6 +106,18 @@ PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT", "1.0"))  # modelled fee per sid
 SECURITY_TTL = 1800
 SECURITY_FAIL_TTL = 120
 
+# Whether to accept a honeypot.is record when GoPlus has no data for a token.
+# OFF by default: the original bot DROPPED unknown tokens, and accepting a
+# substitute let brand-new unverified Base/BSC tokens straight through — that is
+# what caused most of the extra Base noise.
+ALLOW_SECURITY_FALLBACK = os.getenv("ALLOW_SECURITY_FALLBACK", "false").lower() == "true"
+
+# Weight applied to the signal engine's bonus (0.0-1.0). Default 0.0 means the
+# signal engine can only REMOVE candidates (hard rejects + penalties); it can
+# never promote a sub-threshold token into an alert. The hand-tuned score stays
+# the gate, exactly as in the original bot.
+SIGNAL_BONUS_WEIGHT = min(1.0, max(0.0, float(os.getenv("SIGNAL_BONUS_WEIGHT", "0.0"))))
+
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
@@ -172,6 +184,19 @@ _CHAIN_ENV_PREFIX = {
 def _env_key(chain: str, suffix: str) -> str:
     prefix = _CHAIN_ENV_PREFIX.get(chain, chain.upper())
     return f"{prefix}_{suffix}"
+
+def _chain_floor(chain: str, suffix: str, default: float) -> float:
+    """Per-chain threshold override, e.g. BASE_MIN_LIQUIDITY_USD=25000.
+
+    Lets you tighten one noisy chain (Base) without changing the others.
+    """
+    raw = os.getenv(_env_key(chain, suffix), "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning(f"Ignoring invalid {_env_key(chain, suffix)}={raw!r}")
+    return default
 
 # Runtime resolvers — env vars read fresh every time (fixes import-time caching)
 def get_router_v3(chain: str) -> str:
@@ -988,10 +1013,12 @@ def _security_placeholder(source: str) -> dict:
 
 
 async def get_honeypot_is_security(session, chain, token):
-    """Second-opinion honeypot/tax check via honeypot.is v2 (issue 4.6).
+    """Second-opinion honeypot/tax check via honeypot.is v2.
 
-    Used as a fallback when GoPlus is unreachable or has no record, so a single
-    provider outage no longer hides every token for 30 minutes.
+    Only trusted when honeypot.is actually simulated the token
+    (``simulationSuccess`` true and a ``honeypotResult`` present). Without that
+    requirement the fallback returned a permissive record for brand-new tokens
+    the service could not analyse, which let unvetted Base tokens through.
     """
     chain_id = HONEYPOT_IS_CHAIN_ID.get(chain)
     if not chain_id:
@@ -1000,8 +1027,11 @@ async def get_honeypot_is_security(session, chain, token):
     data = await fetch_json(session, url)
     if not isinstance(data, dict):
         return None
+    hp = data.get("honeypotResult")
+    if not data.get("simulationSuccess") or not isinstance(hp, dict) or "isHoneypot" not in hp:
+        logger.debug(f"honeypot.is could not simulate {chain} {token[:10]}... — treated as unknown")
+        return None
     sim = data.get("simulationResult") or {}
-    hp = data.get("honeypotResult") or {}
     code = data.get("contractCode") or {}
     sec = _security_placeholder("honeypot.is")
     sec.update({
@@ -1034,15 +1064,19 @@ async def get_token_security(session, chain, token):
     if data and "result" in data:
         result = data["result"].get(token.lower())
     if not result:
-        # GoPlus has no record or is down -> try honeypot.is before giving up.
-        fallback = await get_honeypot_is_security(session, chain, token)
-        if fallback:
-            security_cache[cache_key] = (fallback, now)
-            logger.info(f"GoPlus miss for {token[:10]}... — used honeypot.is fallback")
-            return fallback
+        # GoPlus has no record for this token. Default behaviour (matching the
+        # original bot) is to DROP it: unknown != safe. Set
+        # ALLOW_SECURITY_FALLBACK=true to accept a *successfully simulated*
+        # honeypot.is record instead.
+        if ALLOW_SECURITY_FALLBACK:
+            fallback = await get_honeypot_is_security(session, chain, token)
+            if fallback:
+                security_cache[cache_key] = (fallback, now)
+                logger.info(f"GoPlus miss for {token[:10]}... — used honeypot.is fallback")
+                return fallback
         security_cache[cache_key] = (None, now)
         if VERBOSE_LOGGING:
-            logger.info(f"Security lookup failed for {chain} {token[:10]}... (short-cached)")
+            logger.info(f"Security unknown for {chain} {token[:10]}... (short-cached, dropped)")
         return None
     security = {
         "is_honeypot": result.get("is_honeypot") == "1",
@@ -1407,7 +1441,12 @@ async def evaluate_token(session, pair):
     def reject(reason: str):
         return finish(reason)
 
-    min_liq = ROBINHOOD_MIN_LIQUIDITY_USD if chain == "robinhood" else MIN_LIQUIDITY_USD
+    # Per-chain floors so one noisy chain (e.g. Base) can be tightened without
+    # changing the others: BASE_MIN_LIQUIDITY_USD, BASE_MIN_VOL_5M_USD, ...
+    default_liq = ROBINHOOD_MIN_LIQUIDITY_USD if chain == "robinhood" else MIN_LIQUIDITY_USD
+    min_liq = _chain_floor(chain, "MIN_LIQUIDITY_USD", default_liq)
+    min_vol_5m = _chain_floor(chain, "MIN_VOL_5M_USD", MIN_VOL_5M_USD)
+    min_mcap = _chain_floor(chain, "MIN_MARKET_CAP_USD", MIN_MARKET_CAP_USD)
     liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
     feat["liquidity_usd"] = liquidity
     if liquidity < min_liq: return reject("liquidity")
@@ -1415,9 +1454,9 @@ async def evaluate_token(session, pair):
     if price < MIN_PRICE: return reject("price_too_low")
     market_cap = float(pair.get("marketCap") or 0)
     feat["market_cap_usd"] = market_cap
-    if market_cap < MIN_MARKET_CAP_USD: return reject("market_cap")
+    if market_cap < min_mcap: return reject("market_cap")
     vol_5m = float(pair.get("volume", {}).get("m5") or 0)
-    if vol_5m < MIN_VOL_5M_USD: return reject("vol_5m")
+    if vol_5m < min_vol_5m: return reject("vol_5m")
 
     vol_15m = float(pair.get("volume", {}).get("m15") or 0)
     vol_1h = float(pair.get("volume", {}).get("h1") or 0)
@@ -1536,23 +1575,33 @@ async def evaluate_token(session, pair):
     cex_pts = score_cex(cex_count, has_perps, tier1)
     score += cex_pts
 
-    total_score = max(0, score - penalties)
-    if verdict is not None:
-        total_score = max(0.0, total_score + verdict.bonus - verdict.penalty)
-    feat["hand_score"] = total_score
+    # The hand-tuned score is the alert gate, exactly as in the original bot.
+    # The signal engine is noise-reducing by default: its hard rejects and
+    # penalties always apply, but its bonus is weighted (default 0.0) so it can
+    # never promote a sub-threshold token into an alert.
+    legacy_total = max(0.0, score - penalties)
+    signal_bonus = verdict.bonus if verdict else 0.0
+    signal_penalty = verdict.penalty if verdict else 0.0
+    total_score = max(0.0, legacy_total - signal_penalty + signal_bonus * SIGNAL_BONUS_WEIGHT)
+    feat["hand_score"] = legacy_total
 
     if VERBOSE_LOGGING:
         logger.info(
-            f"{symbol}@{chain} score={total_score:.0f} | "
+            f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}) | "
             f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
             f"1h/6h={vol_1h/vol_6h if vol_6h>0 else 0:.2f} 6h/24h={vol_6h/vol_24h if vol_24h>0 else 0:.2f} | "
             f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} | "
             f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={top100:.1f}% | "
-            f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties}"
+            f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties} "
+            f"signal=+{signal_bonus:.0f}/-{signal_penalty:.0f}"
         )
 
-    if total_score < ALERT_THRESHOLD:
+    # Original gate: the token must clear the threshold on the hand-tuned score.
+    if legacy_total < ALERT_THRESHOLD:
         return reject("below_threshold")
+    # Signals may still veto a token the hand-tuned score would have alerted on.
+    if total_score < ALERT_THRESHOLD:
+        return reject("signal_penalised")
 
     return finish(None, {
         "chain": chain, "token_address": token, "symbol": symbol, "name": name,

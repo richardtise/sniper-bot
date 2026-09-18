@@ -150,22 +150,24 @@ class Filters:
     """All tunable thresholds. Override with ``Filters.from_env()``."""
 
     # --- discovery / liquidity ------------------------------------------------
-    min_liquidity_usd: float = 4_000.0
-    min_liquidity_mcap_ratio: float = 0.005   # liquidity >= 0.5% of mcap
+    # Restored to the original bot's strictness. The earlier pump-friendly
+    # defaults (4000 / 250 / 1 min / 5 txns) let a lot of Base noise through.
+    min_liquidity_usd: float = 8_000.0
+    min_liquidity_mcap_ratio: float = 0.010   # liquidity >= 1% of mcap
     max_fdv_mcap_ratio: float = 8.0           # huge unlocked supply = dilution
-    min_vol_5m_usd: float = 250.0
-    min_market_cap_usd: float = 10_000.0
+    min_vol_5m_usd: float = 500.0
+    min_market_cap_usd: float = 15_000.0
 
     # --- age / timing ---------------------------------------------------------
-    min_age_minutes: float = 1.0
+    min_age_minutes: float = 3.0
     max_age_minutes: float = 60.0 * 24 * 5   # beyond a week it is not a sniper
     fresh_age_minutes: float = 240.0         # bonus window
 
     # --- activity -------------------------------------------------------------
-    min_txns_5m: int = 5
-    min_unique_buyers_5m: int = 3
+    min_txns_5m: int = 8
+    min_unique_buyers_5m: int = 5
     min_buy_ratio_5m: float = 0.35
-    max_avg_trade_liq_ratio: float = 0.25    # one wallet moving the pool
+    max_avg_trade_liq_ratio: float = 0.10    # one wallet moving the pool
     max_vol_liq_ratio: float = 25.0          # absurd turnover = wash
 
     # --- holder stance --------------------------------------------------------
@@ -179,7 +181,7 @@ class Filters:
     max_tax_pct: float = 10.0
     max_top10_pct: float = 60.0     # used when holder_stance == "rug"
     max_creator_pct: float = 5.0    # used when holder_stance == "rug"
-    min_holders: int = 10
+    min_holders: int = 50
     require_lp_locked: bool = False          # penalty, not reject, by default
     require_open_source: bool = True
 
@@ -187,7 +189,9 @@ class Filters:
     max_chg_1h_late: float = 900.0           # >900% in an hour = blow-off risk
     max_dump_5m: float = 35.0                # -35% in 5m = distribution
 
-    # --- bonuses / penalties (points, on top of the legacy 0-100 score) -------
+    # --- bonuses / penalties --------------------------------------------------
+    # The bonus is only ever applied through SIGNAL_BONUS_WEIGHT in bot.py,
+    # which defaults to 0.0 (bonus cannot create an alert).
     max_bonus: float = 45.0
     max_penalty: float = 50.0
 

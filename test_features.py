@@ -6,6 +6,7 @@ Run with: python -m unittest -v test_features
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 
 os.environ.setdefault("TELEGRAM_TOKEN", "1:TEST")
@@ -133,5 +134,138 @@ class TestLabelOutcomes(unittest.TestCase):
         self.assertIn("hand_score", header)
 
 
+class TestFilterGates(unittest.IsolatedAsyncioTestCase):
+    """Guards against the pass-2 regression that flooded Base with alerts."""
+
+    async def asyncSetUp(self):
+        import signals as signals_module
+
+        self._saved = {
+            "USE_SIGNALS": bot.USE_SIGNALS,
+            "SIGNAL_BONUS_WEIGHT": bot.SIGNAL_BONUS_WEIGHT,
+            "ALERT_THRESHOLD": bot.ALERT_THRESHOLD,
+            "PHASE1_MIN_SCORE": bot.PHASE1_MIN_SCORE,
+            "ALLOW_SECURITY_FALLBACK": bot.ALLOW_SECURITY_FALLBACK,
+            "SIGNAL_FILTERS": bot.SIGNAL_FILTERS,
+            "PAIR_HISTORY": bot.PAIR_HISTORY,
+            "get_token_security": bot.get_token_security,
+            "get_holder_concentration": bot.get_holder_concentration,
+            "get_cex_listings": bot.get_cex_listings,
+            "fetch_json": bot.fetch_json,
+        }
+        bot.security_cache.clear()
+        bot.USE_SIGNALS = True
+        bot.SIGNAL_FILTERS = signals_module.Filters()
+        bot.PAIR_HISTORY = signals_module.PairHistory()
+        bot.PHASE1_MIN_SCORE = 0
+
+        async def fake_holders(session, chain, token):
+            return (0.0, 0.0, 0.0)
+
+        async def fake_cex(session, chain, token):
+            return (0, False, 0)
+
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+
+    async def asyncTearDown(self):
+        for key, value in self._saved.items():
+            setattr(bot, key, value)
+        bot.security_cache.clear()
+
+    def _pair(self):
+        now_ms = time.time() * 1000
+        return {
+            "chainId": "base", "dexId": "uniswap_v3", "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "MEH", "name": "Meh"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.001", "priceNative": "0.000001",
+            "liquidity": {"usd": 10_000.0}, "marketCap": 100_000.0,
+            "volume": {"m5": 1_000.0, "h1": 5_000.0, "h6": 20_000.0, "h24": 60_000.0},
+            "txns": {"m5": {"buys": 10, "sells": 5, "buyers": 8, "sellers": 4},
+                     "h1": {"buys": 30, "sells": 20}},
+            "priceChange": {"m5": 1.0, "h1": 5.0, "h6": 10.0, "h24": 20.0},
+            "pairCreatedAt": now_ms - 60 * 60 * 1000,
+            "source": "test",
+        }
+
+    def _good_security(self):
+        sec = bot._security_placeholder("goplus")
+        sec.update({"is_open_source": True, "lp_locked": True, "source": "goplus"})
+        return sec
+
+    def _install_security(self, security):
+        async def fake_security(session, chain, token):
+            return dict(security)
+        bot.get_token_security = fake_security
+
+    async def test_signal_bonus_cannot_promote_below_threshold(self):
+        self._install_security(self._good_security())
+        bot.SIGNAL_BONUS_WEIGHT = 1.0  # even at full bonus weight...
+        bot.ALERT_THRESHOLD = 0
+        promoted = await bot.evaluate_token(None, self._pair())
+        self.assertIsNotNone(promoted, "sanity: pair should clear a zero threshold")
+
+        # ...the hand-tuned score is still the gate.
+        bot.ALERT_THRESHOLD = 65
+        result = await bot.evaluate_token(None, self._pair())
+        self.assertIsNone(result, "signal bonus must not promote a sub-threshold token")
+
+    async def test_unknown_security_dropped_by_default(self):
+        calls = {"honeypot": 0}
+
+        async def fake_fetch(session, url, headers=None, use_coingecko_limiter=False):
+            if "gopluslabs" in url:
+                return {"result": {}}
+            if "honeypot.is" in url:
+                calls["honeypot"] += 1
+                return {"simulationSuccess": True, "honeypotResult": {"isHoneypot": False},
+                        "simulationResult": {"buyTax": 0, "sellTax": 0}, "contractCode": {}}
+            return None
+
+        bot.fetch_json = fake_fetch
+        bot.ALLOW_SECURITY_FALLBACK = False
+        self.assertIsNone(await bot.get_token_security(None, "base", "0xdead"))
+        self.assertEqual(calls["honeypot"], 0, "fallback must not be called when disabled")
+
+    async def test_fallback_requires_successful_simulation(self):
+        responses = {
+            "goplus": {"result": {}},
+            "no_sim": {"simulationSuccess": False, "honeypotResult": {"isHoneypot": False}},
+            "sim": {"simulationSuccess": True, "honeypotResult": {"isHoneypot": True},
+                    "simulationResult": {"buyTax": 0, "sellTax": 0}, "contractCode": {}},
+        }
+        state = {"mode": "no_sim"}
+
+        async def fake_fetch(session, url, headers=None, use_coingecko_limiter=False):
+            if "gopluslabs" in url:
+                return responses["goplus"]
+            if "honeypot.is" in url:
+                return responses[state["mode"]]
+            return None
+
+        self._saved_fetch = bot.fetch_json
+        bot.fetch_json = fake_fetch
+        bot.ALLOW_SECURITY_FALLBACK = True
+
+        bot.security_cache.clear()
+        self.assertIsNone(await bot.get_token_security(None, "base", "0xaaa"),
+                          "un-simulated honeypot.is data must be treated as unknown")
+
+        state["mode"] = "sim"
+        bot.security_cache.clear()
+        sec = await bot.get_token_security(None, "base", "0xbbb")
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["source"], "honeypot.is")
+        self.assertTrue(sec["is_honeypot"])
+
+    async def test_per_chain_floor_override(self):
+        os.environ["BASE_MIN_LIQUIDITY_USD"] = "50000"
+        self.addCleanup(lambda: os.environ.pop("BASE_MIN_LIQUIDITY_USD", None))
+        self.assertEqual(bot._chain_floor("base", "MIN_LIQUIDITY_USD", 8000.0), 50000.0)
+        self.assertEqual(bot._chain_floor("bsc", "MIN_LIQUIDITY_USD", 8000.0), 8000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

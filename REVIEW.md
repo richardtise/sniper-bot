@@ -19,7 +19,7 @@ Items marked **✅ fixed** were changed in this pass; everything else is a recom
 | --- | --- |
 | `signals.py` | Pure runner/false-positive engine: hard rug filters + runner bonus/penalty, cross-scan acceleration history. 26 unit tests. |
 | `discovery.py` | Working candidate discovery via GeckoTerminal (free, no key), mapped to the pair shape `bot.evaluate_token` already consumes. 10 unit tests. |
-| `test_signals.py`, `test_discovery.py`, `test_features.py` | `python -m unittest` suites, 43 tests, no network. |
+| `test_signals.py`, `test_discovery.py`, `test_features.py` | `python -m unittest` suites, 47 tests, no network. |
 | `label_outcomes.py` | Pass 2: turns logged feature rows into forward-return labels for offline training. |
 | `.env.example` | Complete reference incl. the new flags. |
 | `.gitignore` | Now ignores `*.log`, `bot-env/`, `*.db`, caches. |
@@ -63,6 +63,32 @@ the end of this section.
 | 5.5 Unescaped HTML | ✅ `esc()` applied to token names/symbols/tx hashes |
 | 5.6 `telebot` not in requirements | ✅ `test_telegram.py` rewritten on python-telegram-bot |
 | 5.7 Unused `.env` keys | ⚠️ Documented; `AUTO_BUY_*`/`SCANNER_API_KEY` are still dead config (remove or implement) |
+
+### 0c. Pass-2 regression — excess Base noise (fixed)
+
+Pass 2 accidentally made the bot **less** selective than the original, which
+showed up as a flood of Base alerts. Three separate causes:
+
+1. **Permissive security fallback (no flag needed).** `get_token_security` accepted
+   a honeypot.is record whenever GoPlus had no data — with `_security_placeholder`
+   defaults, an unanalysable token looked "safe". The original code **dropped
+   unknown tokens**. *Fixed:* `ALLOW_SECURITY_FALLBACK` (default `false`) restores
+   the drop; when enabled, honeypot.is is only trusted if it actually simulated
+   (`simulationSuccess` + `honeypotResult`).
+2. **Additive signal bonus.** `total_score = hand + bonus - penalty` with
+   `max_bonus = 45` let a legacy ~40 token clear `MIN_SCORE=65`. *Fixed:*
+   `SIGNAL_BONUS_WEIGHT` (default `0.0`) weights the bonus, and the alert gate is
+   the hand-tuned score again (`legacy_total >= ALERT_THRESHOLD`); signals can
+   only veto or demote.
+3. **Loosened signal thresholds.** liquidity 8000→4000, 5m vol 500→250, age
+   3→1 min, txns 8→5, avg-trade 0.10→0.25, holders 50→10. *Fixed:* restored the
+   strict values in `signals.py` and `.env.example`.
+
+Also added per-chain floor overrides (`BASE_MIN_LIQUIDITY_USD`,
+`BASE_MIN_VOL_5M_USD`, `BASE_MIN_MARKET_CAP_USD`) so one noisy chain can be
+tightened without touching the others, and changed the `.env.example` discovery
+recommendation to `USE_GECKOTERMINAL=false` / `GT_SOURCES=trending` (the previous
+`new_pools,trending` was the noisiest possible source on Base).
 
 **Deliberately deferred**
 * §5.1 modularising the 2.9k-line `bot.py` — large, mechanical, and best done with
@@ -376,7 +402,7 @@ routing). This is the main "quote" improvement left.
 
 ```bash
 # 1. nothing to install — signals.py / discovery.py are stdlib-only
-python -m unittest test_signals test_discovery test_features   # 43 tests
+python -m unittest test_signals test_discovery test_features   # 47 tests
 
 # 2. .env
 USE_SIGNALS=true
@@ -437,5 +463,5 @@ sklearn-ready CSV; `--fetch-current` labels the newest rows from live prices.
 Caveat for modelling: rows for the same token are **not** independent. Split by
 token, not by row, or you will leak the future into the training set.
 
-Tests: `python -m unittest -v test_signals test_discovery test_features` (43).
+Tests: `python -m unittest -v test_signals test_discovery test_features` (47).
 

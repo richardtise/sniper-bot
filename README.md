@@ -52,9 +52,12 @@ The handful you are most likely to change:
 | `MAX_ALLOWED_TAX` | `10` | Reject tokens above this buy/sell tax %. |
 | `MORALIS_API_KEY` | — | Enables holder-concentration scoring. |
 | `COINGECKO_API_KEY` | — | Enables CEX-listing scoring. |
-| `USE_GECKOTERMINAL` | `false` | Discover candidates via GeckoTerminal instead of DexScreener's paid boost/profile lists. Recommended `true`. |
-| `USE_SIGNALS` | `false` | Enable the signal engine (runner bonus / false-positive filters). |
+| `USE_GECKOTERMINAL` | `false` | Keep `false` for the original DexScreener discovery. `true` widens the net to GeckoTerminal and **will add a lot of Base noise** if you use `new_pools`. |
+| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties). |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned `MIN_SCORE` stays the gate; a bonus can never create an alert. |
+| `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
+| `BASE_MIN_LIQUIDITY_USD` etc. | — | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
 | `ALLOWED_USER_IDS` | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
 | `LOG_FEATURES` | `false` | Log a feature row for every token evaluation (see [Training data](#training-data)). |
 
@@ -139,9 +142,15 @@ token at different times) — split by token, not by row, when validating.
 
 ## Notes
 
-- Default discovery uses DexScreener's paid boost/profile lists because the
-  DexScreener "all pairs" endpoint is dead (404). Set `USE_GECKOTERMINAL=true` for
-  real `new_pools`/`trending` discovery.
+- **Filtering / Base noise.** The hand-tuned score (`MIN_SCORE`) is the only gate,
+  as in the original bot. Signals can veto and penalise, but their bonus is
+  weighted by `SIGNAL_BONUS_WEIGHT` (default `0.0`) so they cannot promote noise.
+  If a chain is still too noisy, tighten it directly:
+  `BASE_MIN_LIQUIDITY_USD`, `BASE_MIN_VOL_5M_USD`, `BASE_MIN_MARKET_CAP_USD`.
+- Default discovery uses DexScreener's boost/profile lists because the DexScreener
+  "all pairs" endpoint is dead (404). `USE_GECKOTERMINAL=true` widens discovery
+  (and noise) considerably — if you use it, prefer `GT_SOURCES=trending` over
+  `new_pools`.
 - Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Liquidity on
   Aerodrome (Base) or V4 venues may not be tradeable.
 - See [`REVIEW.md`](REVIEW.md) for the detailed code review, known issues and
