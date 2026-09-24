@@ -48,24 +48,58 @@ The handful you are most likely to change:
 | Variable | Default | Purpose |
 |---|---|---|
 | `PAPER_TRADING` | `true` | Simulate trades. Set to `false` only with a funded hot wallet. |
-| `MIN_SCORE` | `65` | Alert threshold (0–100). |
+| `MIN_SCORE` | `65` | Alert threshold (0–100), scaled per chain — see [Alert gate](#alert-gate). |
+| `SCORE_NORMALIZE` | `true` | Scale the alert bar to the points actually reachable on a chain/age. `false` gates on raw `MIN_SCORE`. |
+| `MIN_EFFECTIVE_SCORE` | `35` | Floor for the scaled threshold, so scaling can't become a rubber stamp. |
 | `MAX_ALLOWED_TAX` | `10` | Reject tokens above this buy/sell tax %. |
-| `MORALIS_API_KEY` | — | Enables holder-concentration scoring. |
-| `COINGECKO_API_KEY` | — | Enables CEX-listing scoring. |
-| `USE_GECKOTERMINAL` | `false` | Keep `false` for the original DexScreener discovery. `true` finds pools earlier but adds noise; pair it with `USE_SIGNALS=true` and the AND-gates below. |
-| `GT_SOURCES` | `trending` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. |
-| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. |
-| `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned `MIN_SCORE` stays the gate; a bonus can never create an alert. |
-| `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach `MIN_SCORE`). Every AND-condition in `SIG_EARLY_*` must hold. |
+| `ETHERSCAN_API_KEY` | — | Contract verification on all four chains, including Robinhood (chainid 4663). `SCANNER_API_KEY` is accepted as an alias. |
+| `MORALIS_API_KEY` | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
+| `COINGECKO_API_KEY` | — | Enables CEX-listing scoring (never applies to Robinhood). |
+| `USE_GECKOTERMINAL` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list, so prefer `true`. |
+| `GT_SOURCES` | `new_pools,trending` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. |
+| `USE_SIGNALS` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. |
+| `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
+| `SIG_REQUIRE_OPEN_SOURCE` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
+| `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — | Per-chain threshold override, same convention as the floors below. |
 | `BASE_MIN_LIQUIDITY_USD` etc. | — | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
 | `ALLOWED_USER_IDS` | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
 | `LOG_FEATURES` | `false` | Log a feature row for every token evaluation (see [Training data](#training-data)). |
+| `TRY_BLOCKSCOUT_HOLDERS` | `false` | Retry Blockscout for Robinhood holders. Off because that host answers with a Cloudflare challenge. |
 
 Per-chain routing addresses (`ETH_QUOTER_V2`, `BSC_ROUTER_V3`, …) can be
 overridden in `.env`, but working defaults are compiled in for all four chains.
 `/debug` prints each contract as `OK` or `NO CODE` so a bad address is obvious.
+
+## Alert gate
+
+The score is out of 100, but those 100 points are only meaningful if they are all
+*earnable* — and they are not:
+
+| Points | Why they can be unreachable |
+|---|---|
+| 20 — holder concentration | Blocked by provider: Robinhood's Blockscout instance returns a Cloudflare challenge, and the Moralis free tier is easily suspended. Now sourced from GeckoTerminal, but GT publishes no 51–100 band, so 4 of the 20 stay unmeasurable. |
+| 5 — CEX listings | No Robinhood token is listed on CoinGecko, so this can never score there. |
+| 7 + 5 — 1h/6h and 6h/24h volume tiers | Age-gated: a pool younger than 1h (or 6h) has no such window to measure. |
+
+With `SCORE_NORMALIZE=true` the bar becomes
+`MIN_SCORE × (reachable points ÷ 100)`, floored at `MIN_EFFECTIVE_SCORE`. Without
+it, a young Robinhood runner was being asked for 65 out of a reachable ~43, which
+is why the bot could run for days and never alert. `VERBOSE_LOGGING=true` logs
+the effective threshold on every evaluation.
+
+## Data sources
+
+| Data | Source | Notes |
+|---|---|---|
+| Discovery | GeckoTerminal | Free, keyless. Gives unique buyers/sellers, which DexScreener does not. |
+| Security / tax | GoPlus (+ honeypot.is fallback) | BSC, Ethereum, Base. |
+| Security / verification | Etherscan v2 | All four chains incl. Robinhood (4663). |
+| Holder concentration | GeckoTerminal | All four chains. Moralis is used first on BSC/ETH/Base only when it answers, because it alone gives an exact top-100. |
+| CEX listings | CoinGecko | Never applies to Robinhood. |
+
 
 ## Usage
 

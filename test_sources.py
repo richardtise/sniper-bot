@@ -1,0 +1,275 @@
+"""Tests for the holder/security data sources and the chain-aware alert gate.
+
+Covers the fixes for the "no alerts at all" state:
+
+* holder concentration now comes from GeckoTerminal (Blockscout is Cloudflare
+  blocked, Moralis's free tier is suspended);
+* contract verification on Robinhood comes from Etherscan, and a provider
+  outage no longer looks like an unverified token;
+* the alert gate scales to the points actually reachable on a chain/age, so a
+  young Robinhood runner is not required to score 65 out of a reachable ~43;
+* SIG_REQUIRE_OPEN_SOURCE is configurable (and off by default).
+
+Run with: python -m unittest -v test_sources
+"""
+
+import os
+import unittest
+
+os.environ.setdefault("TELEGRAM_TOKEN", "1:TEST")
+os.environ.setdefault("CHAT_ID", "1")
+os.environ.setdefault("WALLET_PRIVATE_KEY", "")
+
+import bot  # noqa: E402  (import after env stubs)
+import signals  # noqa: E402
+
+
+# A trimmed but structurally faithful GeckoTerminal /tokens/{addr}/info payload.
+GT_INFO = {
+    "data": {
+        "id": "robinhood_0x3c934eee3fd33be89d0c0a5d073dcf2ea3b3dc26",
+        "type": "token",
+        "attributes": {
+            "address": "0x3c934eee3fd33be89d0c0a5d073dcf2ea3b3dc26",
+            "symbol": "SCHIFFY",
+            "holders": {
+                "count": 5226,
+                "distribution_percentage": {
+                    "top_10": "4.5944",
+                    "11_30": "6.6805",
+                    "31_50": "5.3374",
+                    "rest": "83.3877",
+                },
+            },
+            "gt_score": 74.92,
+        },
+    }
+}
+
+
+class TestGeckoTerminalHolders(unittest.TestCase):
+    def test_parses_bands_into_top10_and_top50(self):
+        data = bot._gt_holder_data(GT_INFO)
+        self.assertTrue(data.measured)
+        self.assertAlmostEqual(data.top10, 4.5944, places=4)
+        # 11_30 and 31_50 are cumulative bands, so top50 is their sum.
+        self.assertAlmostEqual(data.top50, 4.5944 + 6.6805 + 5.3374, places=4)
+        self.assertEqual(data.holder_count, 5226)
+        self.assertEqual(data.source, "geckoterminal")
+
+    def test_top100_is_unmeasured_not_zero(self):
+        """GT publishes no 51-100 band, so top100 must be None, never 0.0.
+
+        Scoring it as 0.0 would silently punish a token; scoring it as a guess
+        would silently reward one. None lets the gate scale down instead.
+        """
+        self.assertIsNone(bot._gt_holder_data(GT_INFO).top100)
+
+    def test_missing_distribution_is_unmeasured(self):
+        for payload in ({}, {"data": {}}, {"data": {"attributes": {}}},
+                        {"data": {"attributes": {"holders": {}}}},
+                        {"data": {"attributes": {"holders": {"distribution_percentage": {}}}}}):
+            data = bot._gt_holder_data(payload)
+            self.assertFalse(data.measured, msg=repr(payload))
+            self.assertEqual(data.source, "")
+
+    def test_non_numeric_bands_are_unmeasured(self):
+        bad = {"data": {"attributes": {"holders": {"distribution_percentage": {"top_10": "n/a"}}}}}
+        self.assertFalse(bot._gt_holder_data(bad).measured)
+
+    def test_top50_is_clamped_to_100(self):
+        over = {"data": {"attributes": {"holders": {"distribution_percentage": {
+            "top_10": "80", "11_30": "25", "31_50": "10"}}}}}
+        self.assertEqual(bot._gt_holder_data(over).top50, 100.0)
+
+
+class TestScoreHolder(unittest.TestCase):
+    def test_none_top100_skips_only_that_block(self):
+        """A None top100 must cost exactly the HOLDER_TOP100_PTS block."""
+        with_t100 = bot.score_holder(80.0, 90.0, 95.0, 600)
+        without_t100 = bot.score_holder(80.0, 90.0, None, 600)
+        self.assertEqual(with_t100 - without_t100, bot.HOLDER_TOP100_PTS)
+
+    def test_top100_zero_still_scores_zero_for_that_block(self):
+        self.assertEqual(bot.score_holder(80.0, 90.0, 0.0, 600),
+                         bot.score_holder(80.0, 90.0, None, 600))
+
+    def test_schiffy_profile_earns_nothing(self):
+        """SCHIFFY is genuinely well distributed (top10 ~4.6%), so no points.
+
+        Holder scoring *rewards* concentration, so a healthy float scores zero.
+        This is why fixing the provider alone does not make SCHIFFY alert.
+        """
+        self.assertEqual(bot.score_holder(4.59, 16.61, None, 450), 0)
+
+
+class TestMaxPossibleScore(unittest.TestCase):
+    def test_older_robinhood_token_loses_only_the_cex_points(self):
+        # Robinhood cannot score CEX (no CoinGecko listing) but can score holders.
+        without_cex = bot.max_possible_score("robinhood", 450, has_top100=True, has_cex=False)
+        full = bot.max_possible_score("bsc", 450, has_top100=True, has_cex=True)
+        self.assertAlmostEqual(full - without_cex, bot.CEX_LISTING_PTS + bot.CEX_PERPS_PTS)
+
+    def test_missing_top100_lowers_the_ceiling(self):
+        with_t100 = bot.max_possible_score("robinhood", 450, has_top100=True, has_cex=False)
+        without_t100 = bot.max_possible_score("robinhood", 450, has_top100=False, has_cex=False)
+        self.assertAlmostEqual(with_t100 - without_t100, bot.HOLDER_TOP100_PTS)
+
+    def test_age_gates_lower_the_ceiling_for_young_pools(self):
+        """A 1h-old pool cannot score the 6h/24h tier at all; a 10m one loses
+        both the 1h/6h and 6h/24h tiers plus the 1h buy-pressure block."""
+        old = bot.max_possible_score("robinhood", 450, has_top100=True, has_cex=False)
+        one_hour = bot.max_possible_score("robinhood", 60, has_top100=True, has_cex=False)
+        ten_min = bot.max_possible_score("robinhood", 10, has_top100=True, has_cex=False)
+        self.assertLess(one_hour, old)
+        self.assertLess(ten_min, one_hour)
+
+    def test_ceiling_is_never_above_100(self):
+        for chain in ("bsc", "ethereum", "base", "robinhood"):
+            for age in (0.5, 10, 60, 61, 360, 361, 5000):
+                ceiling = bot.max_possible_score(chain, age, has_top100=True, has_cex=True)
+                self.assertLessEqual(ceiling, 100.0 + 1e-9, msg=f"{chain}@{age}")
+
+    def test_ceiling_matches_a_perfect_token(self):
+        """The ceiling must be achievable: driving every scorer to its top tier
+        must reproduce it. Guards against the ceiling drifting from the scorer."""
+        age = 450
+        recomputed = (
+            bot.score_volume_liquidity(1000.0, 1000.0)
+            + bot.score_5m_1h(1000.0, 1000.0, age)
+            + bot.score_1h_6h(1000.0, 1000.0, age)
+            + bot.score_6h_24h(1000.0, 1000.0, age)
+            + bot.BUY_PRESSURE_5M_PTS + bot.BUY_PRESSURE_1H_PTS
+            + bot.score_price(1000.0, 1000.0, 1000.0, age)
+            + bot.SECURITY_PTS
+            + bot.score_holder(100.0, 100.0, 100.0, age)
+            + bot.score_cex(bot.CEX_LISTING_PTS, True, 1)
+        )
+        self.assertAlmostEqual(
+            recomputed, bot.max_possible_score("bsc", age, has_top100=True, has_cex=True)
+        )
+
+
+class TestEffectiveThreshold(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("SCORE_NORMALIZE", "MIN_EFFECTIVE_SCORE", "MIN_SCORE",
+                        "ROBINHOOD_MIN_SCORE", "BASE_MIN_SCORE")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_scaling_is_off_when_disabled(self):
+        os.environ["SCORE_NORMALIZE"] = "false"
+        self.assertEqual(bot.effective_threshold("robinhood", 450), float(bot.ALERT_THRESHOLD))
+        self.assertEqual(bot.effective_threshold("bsc", 450), float(bot.ALERT_THRESHOLD))
+
+    def test_robinhood_threshold_is_below_the_raw_threshold(self):
+        """The whole point: 5 unreachable CEX points + 4 unmeasurable holder
+        points must not be silently demanded."""
+        os.environ["SCORE_NORMALIZE"] = "true"
+        os.environ["MIN_EFFECTIVE_SCORE"] = "0"
+        t = bot.effective_threshold("robinhood", 450, has_top100=False, has_cex=False)
+        self.assertLess(t, float(bot.ALERT_THRESHOLD))
+        self.assertGreater(t, 0.0)
+
+    def test_young_pool_threshold_is_lower_still(self):
+        os.environ["SCORE_NORMALIZE"] = "true"
+        os.environ["MIN_EFFECTIVE_SCORE"] = "0"
+        old = bot.effective_threshold("robinhood", 450, has_top100=False, has_cex=False)
+        young = bot.effective_threshold("robinhood", 10, has_top100=False, has_cex=False)
+        self.assertLess(young, old)
+
+    def test_floor_is_respected(self):
+        os.environ["SCORE_NORMALIZE"] = "true"
+        os.environ["MIN_EFFECTIVE_SCORE"] = "35"
+        t = bot.effective_threshold("robinhood", 0.5, has_top100=False, has_cex=False)
+        self.assertGreaterEqual(t, 35.0)
+
+    def test_chain_override_wins(self):
+        os.environ["SCORE_NORMALIZE"] = "false"
+        os.environ["ROBINHOOD_MIN_SCORE"] = "48"
+        self.assertEqual(bot.effective_threshold("robinhood", 450), 48.0)
+        # and does not leak into other chains
+        self.assertEqual(bot.effective_threshold("bsc", 450), float(bot.ALERT_THRESHOLD))
+
+    def test_threshold_never_exceeds_the_configured_bar(self):
+        os.environ["SCORE_NORMALIZE"] = "true"
+        os.environ["MIN_EFFECTIVE_SCORE"] = "0"
+        for chain in ("bsc", "ethereum", "base", "robinhood"):
+            for age in (1, 30, 120, 500):
+                self.assertLessEqual(bot.effective_threshold(chain, age), float(bot.ALERT_THRESHOLD))
+
+    def test_cex_data_availability(self):
+        self.assertFalse(bot.has_cex_data("robinhood"))
+        self.assertTrue(bot.has_cex_data("bsc"))
+
+
+class TestEtherscanChainMap(unittest.TestCase):
+    def test_robinhood_chain_id_is_present(self):
+        """Etherscan EAAS lists Robinhood Chain as chainid 4663."""
+        self.assertEqual(bot.ETHERSCAN_CHAIN_ID["robinhood"], "4663")
+
+    def test_all_networks_have_an_etherscan_chain_id(self):
+        for chain in bot.NETWORKS:
+            self.assertIn(chain, bot.ETHERSCAN_CHAIN_ID)
+
+    def test_scanner_api_key_is_accepted_as_etherscan_alias(self):
+        """Deployments already carry an Etherscan key under SCANNER_API_KEY."""
+        import importlib
+        os.environ["SCANNER_API_KEY"] = "TESTKEY123"
+        os.environ.pop("ETHERSCAN_API_KEY", None)
+        reloaded = importlib.reload(bot)
+        self.assertEqual(reloaded.ETHERSCAN_API_KEY, "TESTKEY123")
+        # restore module state for the rest of the suite
+        os.environ.pop("SCANNER_API_KEY", None)
+        importlib.reload(bot)
+
+
+class TestOpenSourceRequirement(unittest.TestCase):
+    def test_signals_default_does_not_require_open_source(self):
+        """Most Robinhood tokens are unverified; requiring source rejected the
+        whole chain."""
+        self.assertFalse(signals.Filters().require_open_source)
+
+    def test_env_can_restore_the_old_behaviour(self):
+        os.environ["SIG_REQUIRE_OPEN_SOURCE"] = "true"
+        try:
+            self.assertTrue(signals.Filters.from_env().require_open_source)
+        finally:
+            os.environ.pop("SIG_REQUIRE_OPEN_SOURCE", None)
+
+    def test_env_can_explicitly_disable_it(self):
+        os.environ["SIG_REQUIRE_OPEN_SOURCE"] = "false"
+        try:
+            self.assertFalse(signals.Filters.from_env().require_open_source)
+        finally:
+            os.environ.pop("SIG_REQUIRE_OPEN_SOURCE", None)
+
+    def test_unverified_token_is_not_rejected_by_default(self):
+        pair = {
+            "chainId": "robinhood",
+            "baseToken": {"address": "0xabc", "symbol": "X"},
+            "quoteToken": {"address": "0xdef", "symbol": "WETH"},
+            "priceUsd": "0.01", "liquidity": {"usd": 50_000},
+            "marketCap": 500_000, "fdv": 500_000,
+            "volume": {"m5": 20_000, "h1": 200_000, "h6": 400_000, "h24": 400_000},
+            "txns": {"m5": {"buys": 40, "sells": 10, "buyers": 35, "sellers": 9},
+                     "h1": {"buys": 300, "sells": 100}},
+            "priceChange": {"m5": 8, "h1": 20, "h6": 50, "h24": 60},
+            "pairCreatedAt": 1790242400000,
+        }
+        sec = {"is_honeypot": False, "buy_tax": 0.0, "sell_tax": 0.0,
+               "is_open_source": False, "source": "etherscan"}
+        verdict = signals.evaluate(pair, security=sec, filters=signals.Filters())
+        self.assertNotIn("not_open_source", verdict.reject_reasons)
+
+
+if __name__ == "__main__":
+    unittest.main()

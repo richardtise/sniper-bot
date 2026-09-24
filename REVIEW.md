@@ -13,6 +13,71 @@ Items marked **✅ fixed** were changed in this pass; everything else is a recom
 
 ---
 
+## Pass 3 — why the bot produced no alerts at all, and the fixes
+
+After pass 2 the scanner went *silent*: no alerts on any chain for days. The cause
+was not over-tight filtering in the abstract but four concrete, independent faults,
+three of them silent provider failures that made 25 of the 100 score points
+permanently unearnable.
+
+| # | Fault | Evidence | Fix |
+| --- | --- | --- | --- |
+| 3.1 | **Robinhood holder concentration was always 0.** `get_robinhood_holders` called `robinhoodchain.blockscout.com/api/v2/tokens/{addr}/holders`, which now answers every request with a Cloudflare managed challenge. `fetch_json` retries only 429/5xx, so a **403** fell through to `return None` and holders became `(0,0,0)`. | `curl` → HTTP 403 + `<title>Just a moment...</title>` | Holder concentration now comes from GeckoTerminal `/networks/{net}/tokens/{addr}/info`, which publishes exact `top_10` / `11_30` / `31_50` bands, free and keyless, on all four chains. Blockscout is kept behind `TRY_BLOCKSCOUT_HOLDERS` (default `false`). |
+| 3.2 | **Moralis made holders 0 on *every* chain.** The configured key returns `401 "Your Moralis Free usage is paused"`, and the code cached that as a successful `(0,0,0)` — indistinguishable from "measured 0%". | Live API call | `HolderData` now carries a `source`, so "provider unavailable" is distinguishable from "0% concentration". GeckoTerminal backs Moralis up on BSC/ETH/Base. |
+| 3.3 | **Blocked Blockscout also faked "unverified".** The same 403 left `is_verified=False`, so every Robinhood token took `PENALTY_UNVERIFIED_CONTRACT` **and** tripped `signals`' `not_open_source` hard reject. SCHIFFY, for instance, **is verified**. | Etherscan `getsourcecode` returns its source | Verification now comes from Etherscan v2 (`chainid=4663`; `SCANNER_API_KEY` is accepted as an alias because it already holds an Etherscan key). The penalty applies only when `verification_known` is true — our own outage must not look like a bad token. |
+| 3.4 | **`require_open_source` was unconfigurable.** It defaulted to `True` and was absent from `Filters.from_env()`'s mapping, so there was no `SIG_REQUIRE_OPEN_SOURCE` and no way to turn it off without editing code. | — | Default is now `False` (most Robinhood tokens are unverified, including the ones that run) and `SIG_REQUIRE_OPEN_SOURCE` exists. |
+
+### The scoring deadlock
+
+Those faults, plus two structural ones, meant the gate could not be reached:
+
+* **Holder concentration — 20 pts** unearnable on every chain (3.1, 3.2). GT restores
+  top-10 and top-50, but publishes **no 51-100 band**, so 4 of the 20 stay
+  unmeasurable. `top100` is now `None` rather than a guess.
+* **CEX listings — 5 pts** unearnable on Robinhood: no Robinhood token is on CoinGecko.
+* **Age gates.** A 1-hour-old pool cannot score the `1h/6h` tier (capped at 0.3×) or
+  `6h/24h` (also 0.3×). Empirically its ceiling is **~58.6**, not 100.
+
+Requiring a flat **65** out of a reachable **~43–58** is what produced silence. Measured
+against every live Robinhood pool, the maximum attainable score was **32.0** and **0 of
+40 would have alerted**.
+
+**Fix — `max_possible_score()` + `effective_threshold()`.** The ceiling is computed by
+calling the *real* scorers with ideal inputs, so it cannot drift out of sync with them,
+and the bar becomes `MIN_SCORE × (reachable ÷ 100)`, floored at `MIN_EFFECTIVE_SCORE`
+(default 35, itself capped by `MIN_SCORE`). `SCORE_NORMALIZE=false` restores the raw
+gate; `ROBINHOOD_MIN_SCORE` etc. override per chain.
+
+| Age | reachable (Robinhood) | old bar | new bar |
+| --- | --- | --- | --- |
+| 10m | 53.0 | 65 | 35.0 |
+| 1h | 58.6 | 65 | 38.1 |
+| 2h–6h | 81.8 | 65 | 53.1 |
+| 12h+ | 89.2 | 65 | 58.0 |
+
+Replaying SCHIFFY's own GeckoTerminal candles through the scorer: it was 0.3 points short
+at 1h, and **would have alerted at 2h at 56×, 3h at 16× and 4h at 4× from those prices** —
+whereas under the old flat 65 it never alerted at any age.
+
+### What was checked and deliberately *not* changed
+
+* **Age gates** — kept. They are the only thing stopping 30-second-old, $2k-liquidity
+  pools, and with the gate now scaled they no longer need to be loosened. The
+  discontinuity they create (the bar jumps at 60min/6h because more points become
+  measurable) is inherent to the original step functions.
+* **`SCANNER_API_KEY`** is *not* dead config after all — see 3.3. It is an Etherscan key
+  and now does verification work. `AUTO_BUY_*` remains dead.
+* **Live trading** still needs a real hot wallet; nothing here was tested with funds.
+
+### Verification
+
+`python -m unittest test_signals test_discovery test_features test_telegram test_sources`
+— **85 tests**, all passing, no network. `test_sources.py` covers the GT band parsing,
+the `None` top-100 contract, the ceiling matching a perfect token, threshold scaling,
+the floor, per-chain overrides and the open-source flag.
+
+---
+
 ## 0. What was added in this pass
 
 | File | Purpose |

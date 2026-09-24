@@ -203,7 +203,13 @@ class Filters:
     max_creator_pct: float = 5.0    # used when holder_stance == "rug"
     min_holders: int = 50
     require_lp_locked: bool = False          # penalty, not reject, by default
-    require_open_source: bool = True
+    # Verified source is NOT required by default. On Robinhood Chain most
+    # tokens — including the ones that actually run — publish no verified
+    # source, and verification status is provider-dependent (Blockscout is
+    # Cloudflare-blocked; Etherscan reports the truth). Requiring it rejected
+    # the entire chain. Set SIG_REQUIRE_OPEN_SOURCE=true to restore the old
+    # hard reject.
+    require_open_source: bool = False
 
     # --- late-entry / dump guards --------------------------------------------
     max_chg_1h_late: float = 900.0           # >900% in an hour = blow-off risk
@@ -232,6 +238,7 @@ class Filters:
             "SIG_MAX_CREATOR_PCT": ("max_creator_pct", float),
             "SIG_MIN_HOLDERS": ("min_holders", int),
             "SIG_REQUIRE_LP_LOCKED": ("require_lp_locked", _truthy),
+            "SIG_REQUIRE_OPEN_SOURCE": ("require_open_source", _truthy),
             "SIG_MAX_BONUS": ("max_bonus", float),
             "SIG_MAX_PENALTY": ("max_penalty", float),
             "SIG_MIN_VOL_LIQ": ("min_vol_liq_ratio", float),

@@ -161,7 +161,8 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
         bot.PHASE1_MIN_SCORE = 0
 
         async def fake_holders(session, chain, token):
-            return (0.0, 0.0, 0.0)
+            # No provider data: an unmeasured HolderData, not measured zeros.
+            return bot.HolderData()
 
         async def fake_cex(session, chain, token):
             return (0, False, 0)

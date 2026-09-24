@@ -82,10 +82,18 @@ class TestHardFilters(unittest.TestCase):
         v = evaluate(make_pair(), security=sec)
         self.assertIn("hidden_owner", v.reject_reasons)
 
-    def test_not_open_source_rejected(self):
+    def test_not_open_source_rejected_when_required(self):
+        # Opt-in only: most Robinhood Chain tokens are unverified, so requiring
+        # source by default rejected the whole chain. See SIG_REQUIRE_OPEN_SOURCE.
+        sec = dict(GOOD_SEC, is_open_source=False)
+        v = evaluate(make_pair(), security=sec,
+                     filters=Filters(require_open_source=True))
+        self.assertIn("not_open_source", v.reject_reasons)
+
+    def test_not_open_source_allowed_by_default(self):
         sec = dict(GOOD_SEC, is_open_source=False)
         v = evaluate(make_pair(), security=sec)
-        self.assertIn("not_open_source", v.reject_reasons)
+        self.assertNotIn("not_open_source", v.reject_reasons)
 
     def test_top10_concentration_rejected_in_rug_mode(self):
         gt = dict(GOOD_GT, holders={"count": 800, "distribution_percentage": {"top_10": "75.0"}})

@@ -33,7 +33,7 @@ from contextlib import asynccontextmanager
 from collections import deque
 from datetime import datetime, timezone
 from html import escape as html_escape
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, NamedTuple, Optional, Tuple, Any
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
@@ -112,6 +112,10 @@ PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT", "1.0"))  # modelled fee per sid
 SECURITY_TTL = 1800
 SECURITY_FAIL_TTL = 120
 
+# Holder concentration rarely changes scan-to-scan, so it caches longer than
+# security. Applies to every provider (GeckoTerminal, Moralis, Blockscout).
+HOLDER_TTL = 600
+
 # Whether to accept a honeypot.is record when GoPlus has no data for a token.
 # OFF by default: the original bot DROPPED unknown tokens, and accepting a
 # substitute let brand-new unverified Base/BSC tokens straight through — that is
@@ -140,6 +144,33 @@ CHAIN_TO_GOPLUS_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
 # honeypot.is uses numeric chain ids; used as a second opinion when GoPlus is down.
 HONEYPOT_IS_CHAIN_ID = {"bsc": "56", "ethereum": "1", "base": "8453"}
 BLOCKSCOUT_URLS = {"robinhood": "https://robinhoodchain.blockscout.com/api/v2"}
+
+# ── Etherscan v2 ─────────────────────────────────────────────────────────────
+# One key covers every EAAS chain, and Robinhood Chain is chainid 4663 (status
+# "Ok" in Etherscan's chain list, explorer https://robin.etherscan.io/).
+#
+# SCANNER_API_KEY is accepted as an alias: that is the name already present in
+# the deployed .env, and the value in it is in fact an Etherscan key.
+#
+# Used for: contract verification (``getsourcecode``) and supply sanity. Note
+# that Etherscan's *holder* endpoints (``tokenholderlist``, ``topholders``,
+# ``tokenholdercount``) are API-Pro only, so holders come from GeckoTerminal.
+ETHERSCAN_API_KEY = (
+    os.getenv("ETHERSCAN_API_KEY", "").strip()
+    or os.getenv("SCANNER_API_KEY", "").strip()
+)
+ETHERSCAN_CHAIN_ID = {
+    "ethereum": "1", "bsc": "56", "base": "8453", "robinhood": "4663",
+}
+ETHERSCAN_API = "https://api.etherscan.io/v2/api"
+
+# ── GeckoTerminal token info ─────────────────────────────────────────────────
+# Free, keyless, and — unlike Blockscout (Cloudflare 403) and the now-suspended
+# Moralis free tier — actually reachable on every supported chain. Publishes the
+# holder distribution as exact bands: top_10, 11_30 and 31_50. That yields real
+# top10/top50 figures; there is no 51-100 band, so top100 stays *unmeasured*
+# (None) rather than being guessed, and the alert gate is scaled down to match.
+GT_CHAIN_SLUG = {"ethereum": "eth", "bsc": "bsc", "base": "base", "robinhood": "robinhood"}
 
 RPCS = {
     "ethereum": os.getenv("ETH_RPC", "https://ethereum-rpc.publicnode.com"),
@@ -511,7 +542,7 @@ FEATURE_FIELDS = [
     "buys_5m", "sells_5m", "buyers_5m", "sellers_5m", "buys_1h", "sells_1h",
     "buy_ratio_5m", "buy_ratio_1h",
     "chg_5m", "chg_15m", "chg_1h", "chg_6h", "chg_24h",
-    "top10", "top50", "top100", "holder_count", "creator_pct",
+    "top10", "top50", "top100", "holder_count", "creator_pct", "holder_source",
     "buy_tax", "sell_tax",
     "is_honeypot", "is_open_source", "is_proxy", "is_mintable",
     "owner_change_balance", "transfer_pausable", "slippage_modifiable",
@@ -519,7 +550,7 @@ FEATURE_FIELDS = [
     "is_blacklisted", "is_whitelisted", "lp_locked",
     "security_source", "security_known",
     "signal_bonus", "signal_penalty", "signal_notes",
-    "base_score", "hand_score", "phase1_pass",
+    "base_score", "hand_score", "phase1_pass", "alert_threshold",
     "rejected", "reject_reasons", "passed_threshold", "alert_sent", "paper_mode",
     "early_runner",
 ]
@@ -536,7 +567,7 @@ _FEATURE_INT_FIELDS = {
 }
 _FEATURE_TEXT_FIELDS = {
     "ts_utc", "chain", "token_address", "pair_address", "symbol", "source",
-    "security_source", "signal_notes", "reject_reasons",
+    "security_source", "signal_notes", "reject_reasons", "holder_source",
 }
 
 
@@ -1125,14 +1156,63 @@ async def get_token_security(session, chain, token):
     security_cache[cache_key] = (security, now)
     return security
 
+async def get_etherscan_security(session, chain, token):
+    """Contract verification (+ supply sanity) via Etherscan v2.
+
+    Etherscan's EAAS covers Robinhood Chain (chainid 4663), which is what makes
+    this work where Blockscout does not: ``robinhoodchain.blockscout.com`` now
+    answers every request with a Cloudflare managed challenge (HTTP 403), so the
+    old code marked *every* Robinhood token unverified and applied the
+    ``PENALTY_UNVERIFIED_CONTRACT`` penalty to all of them. Tokens like SCHIFFY
+    are in fact verified.
+
+    Returns ``None`` when no API key is configured or the call fails, so the
+    caller can tell "unverified" apart from "could not check".
+    """
+    chain_id = ETHERSCAN_CHAIN_ID.get(chain)
+    if not chain_id or not ETHERSCAN_API_KEY:
+        return None
+    params = (
+        f"chainid={chain_id}&module=contract&action=getsourcecode"
+        f"&address={token}&apikey={ETHERSCAN_API_KEY}"
+    )
+    data = await fetch_json(session, f"{ETHERSCAN_API}?{params}")
+    if not isinstance(data, dict) or data.get("status") != "1":
+        return None
+    rows = data.get("result")
+    if not isinstance(rows, list) or not rows:
+        return None
+    row = rows[0] or {}
+    source_code = (row.get("SourceCode") or "").strip()
+    # Etherscan returns a result row with an empty SourceCode for an unverified
+    # contract, and `status: 1` either way — so verification is the presence of
+    # source, not the status field.
+    verified = bool(source_code)
+    return {
+        "is_verified": verified,
+        "is_open_source": verified,
+        "is_proxy": (row.get("Proxy") or "0") == "1",
+        "contract_name": row.get("ContractName") or "",
+        "verification_known": True,
+        "source": "etherscan",
+    }
+
+
 async def get_robinhood_security(session, token):
+    """Security record for a Robinhood Chain token.
+
+    Etherscan is authoritative and works; Blockscout is kept only as a fallback
+    for deployments that have no Etherscan key (it is usually Cloudflare-blocked,
+    in which case ``verification_known`` stays False and no penalty is applied —
+    we must not punish a token for our own provider outage).
+    """
     cache_key = f"robinhood_sec:{token.lower()}"
     now = time.time()
     if cache_key in security_cache:
         cached, ts = security_cache[cache_key]
-        if now - ts < 900:
+        if now - ts < SECURITY_TTL:
             return cached
-    base = BLOCKSCOUT_URLS["robinhood"]
+
     security = {
         "is_honeypot": False, "buy_tax": 0, "sell_tax": 0,
         "is_whitelisted": False, "is_blacklisted": False,
@@ -1140,14 +1220,26 @@ async def get_robinhood_security(session, token):
         "can_take_back_ownership": False, "owner_change_balance": False,
         "is_mintable": False, "slippage_modifiable": False,
         "transfer_pausable": False, "lp_locked": False,
-        "is_verified": False, "source": "blockscout",
+        "is_verified": False, "verification_known": False,
+        "source": "none",
     }
+
+    eth = await get_etherscan_security(session, "robinhood", token)
+    if eth:
+        security.update(eth)
+        security_cache[cache_key] = (security, now)
+        return security
+
+    # ── Fallback: Blockscout (frequently Cloudflare-blocked) ────────────────
+    base = BLOCKSCOUT_URLS["robinhood"]
     url = f"{base}/smart-contracts/{token}"
     data = await fetch_json(session, url)
     if data:
-        security["is_verified"] = data.get("is_verified", False)
-        security["is_open_source"] = data.get("is_verified", False)
+        security["is_verified"] = bool(data.get("is_verified"))
+        security["is_open_source"] = bool(data.get("is_verified"))
         security["is_proxy"] = data.get("proxy_type") is not None
+        security["verification_known"] = True
+        security["source"] = "blockscout"
     url2 = f"{base}/tokens/{token}"
     token_data = await fetch_json(session, url2)
     if token_data:
@@ -1161,43 +1253,147 @@ async def get_robinhood_security(session, token):
 # HOLDER CONCENTRATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def get_holder_concentration(session, chain, token):
-    if chain == "robinhood":
-        return await get_robinhood_holders(session, token)
-    return await get_moralis_holders(session, chain, token)
+class HolderData(NamedTuple):
+    """Holder concentration as *measured*, with provenance.
 
-async def get_moralis_holders(session, chain, token):
+    ``source`` is empty when nothing could be measured — that is deliberately
+    distinct from measuring 0%, because the alert gate scales down for data it
+    could not obtain, and must not treat "provider down" as "perfectly
+    distributed" or vice-versa.
+
+    ``top100`` is ``None`` when the provider publishes no 51-100 band. Guessing
+    it would silently inflate the score.
+    """
+    top10: float = 0.0
+    top50: float = 0.0
+    top100: Optional[float] = None
+    source: str = ""
+    holder_count: int = 0
+
+    @property
+    def measured(self) -> bool:
+        return bool(self.source)
+
+
+def _gt_holder_data(info: dict) -> HolderData:
+    """Parse a GeckoTerminal token-info payload into :class:`HolderData`.
+
+    GT publishes cumulative-per-band percentages: ``top_10``, ``11_30`` and
+    ``31_50``. So top-10 is direct, and top-50 is their sum. There is no
+    ``51_100`` band, hence ``top100=None``.
+    """
+    attrs = ((info or {}).get("data") or {}).get("attributes") or {}
+    holders = attrs.get("holders") or {}
+    dist = holders.get("distribution_percentage") or {}
+    if not dist:
+        return HolderData()
+    try:
+        top10 = float(dist.get("top_10") or 0)
+        top50 = top10 + float(dist.get("11_30") or 0) + float(dist.get("31_50") or 0)
+    except (TypeError, ValueError):
+        return HolderData()
+    try:
+        count = int(holders.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return HolderData(
+        top10=top10, top50=min(top50, 100.0), top100=None,
+        source="geckoterminal", holder_count=count,
+    )
+
+
+async def get_geckoterminal_holders(session, chain, token) -> HolderData:
+    """Holder distribution from GeckoTerminal — free, keyless, and reachable.
+
+    This is the replacement for Blockscout (Cloudflare 403 on
+    ``robinhoodchain.blockscout.com``) and for Moralis (whose free tier is
+    suspended). Works on all four chains including Robinhood.
+    """
+    net = GT_CHAIN_SLUG.get(chain)
+    if not net:
+        return HolderData()
+    cache_key = f"gt_holders:{chain}:{token.lower()}"
+    now = time.time()
+    if cache_key in holder_cache:
+        data, ts = holder_cache[cache_key]
+        if now - ts < HOLDER_TTL:
+            return data
+    url = f"https://api.geckoterminal.com/api/v2/networks/{net}/tokens/{token}/info"
+    data = await fetch_json(session, url, headers={"Accept": "application/json"})
+    result = _gt_holder_data(data) if data else HolderData()
+    # A miss is cached briefly so a provider outage cannot hide every token.
+    holder_cache[cache_key] = (result, now)
+    return result
+
+
+async def get_holder_concentration(session, chain, token) -> HolderData:
+    """Best available holder concentration for a chain.
+
+    Preference order per chain:
+
+    * Robinhood — GeckoTerminal. Moralis has no Robinhood support and the
+      Blockscout instance is Cloudflare-blocked.
+    * Others — Moralis first (it is the only source that also yields an exact
+      top-100 figure), then GeckoTerminal.
+
+    A blank ``source`` means nothing could be measured; callers must scale the
+    alert gate accordingly instead of scoring 0% concentration.
+    """
+    gt = await get_geckoterminal_holders(session, chain, token)
+    if chain == "robinhood":
+        # Blockscout is Cloudflare-blocked (HTTP 403) so it is no longer tried
+        # by default. Keep it behind an opt-in flag for anyone self-hosting an
+        # un-proxied instance.
+        if not gt.measured and os.getenv("TRY_BLOCKSCOUT_HOLDERS", "false").lower() == "true":
+            legacy = await get_robinhood_holders(session, token)
+            if legacy[0] or legacy[1] or legacy[2]:
+                return HolderData(top10=legacy[0], top50=legacy[1], top100=legacy[2],
+                                  source="blockscout")
+        return gt
+
+    moralis = await get_moralis_holders(session, chain, token)
+    if moralis.measured:
+        # Moralis gives top-100, which GT cannot; prefer it when it answers.
+        return moralis
+    return gt
+
+
+async def get_moralis_holders(session, chain, token) -> HolderData:
     if not MORALIS_API_KEY:
-        return 0.0, 0.0, 0.0
+        return HolderData()
     moralis_chain = CHAIN_TO_MORALIS.get(chain)
     if not moralis_chain:
-        return 0.0, 0.0, 0.0
+        return HolderData()
     cache_key = f"moralis:{moralis_chain}:{token.lower()}"
     now = time.time()
     if cache_key in holder_cache:
-        (top10, top50, top100), ts = holder_cache[cache_key]
-        if now - ts < 600:
-            return top10, top50, top100
+        data, ts = holder_cache[cache_key]
+        if now - ts < HOLDER_TTL:
+            return data
     url = f"https://deep-index.moralis.io/api/v2.2/erc20/{token}/owners?chain={moralis_chain}&order=DESC&limit=100"
     headers = {"X-API-Key": MORALIS_API_KEY}
     data = await fetch_json(session, url, headers=headers)
     if not data or "result" not in data:
-        holder_cache[cache_key] = ((0.0, 0.0, 0.0), now)
-        return 0.0, 0.0, 0.0
+        # Distinguish "provider refused/unavailable" from "0% concentration".
+        holder_cache[cache_key] = (HolderData(), now)
+        return HolderData()
     holders = data.get("result", [])
     total_supply = float(data.get("total_supply") or 0)
-    if total_supply == 0:
-        holder_cache[cache_key] = ((0.0, 0.0, 0.0), now)
-        return 0.0, 0.0, 0.0
+    if total_supply == 0 or not holders:
+        holder_cache[cache_key] = (HolderData(), now)
+        return HolderData()
     balances = [float(h.get("balance", 0)) for h in holders]
     top10 = sum(balances[:10])
     top50 = sum(balances[:50]) if len(balances) >= 50 else sum(balances)
     top100 = sum(balances[:100]) if len(balances) >= 100 else sum(balances)
-    pct10 = (top10 / total_supply) * 100
-    pct50 = (top50 / total_supply) * 100
-    pct100 = (top100 / total_supply) * 100
-    holder_cache[cache_key] = ((pct10, pct50, pct100), now)
-    return pct10, pct50, pct100
+    result = HolderData(
+        top10=(top10 / total_supply) * 100,
+        top50=(top50 / total_supply) * 100,
+        top100=(top100 / total_supply) * 100,
+        source="moralis", holder_count=len(holders),
+    )
+    holder_cache[cache_key] = (result, now)
+    return result
 
 async def get_robinhood_holders(session, token):
     cache_key = f"robinhood_holders:{token.lower()}"
@@ -1364,6 +1560,13 @@ def score_6h_24h(vol_6h, vol_24h, age_minutes):
     return 0
 
 def score_holder(top10, top50, top100, age_minutes):
+    """Holder-concentration points.
+
+    ``top100`` may be ``None`` when the provider publishes no 51-100 band (as
+    GeckoTerminal does not). That block is then skipped rather than scored as if
+    concentration were zero — ``_max_possible_score`` compensates by lowering the
+    alert gate for the points that were genuinely unmeasurable.
+    """
     pts = 0
     age_discount = 0.3 if age_minutes and age_minutes < 120 else 1.0
     if top10 >= 80: pts += HOLDER_TOP10_PTS * age_discount
@@ -1373,9 +1576,10 @@ def score_holder(top10, top50, top100, age_minutes):
     if top50 >= 90: pts += HOLDER_TOP50_PTS
     elif top50 >= 75: pts += HOLDER_TOP50_PTS * 0.75
     elif top50 >= 60: pts += HOLDER_TOP50_PTS * 0.5
-    if top100 >= 95: pts += HOLDER_TOP100_PTS
-    elif top100 >= 85: pts += HOLDER_TOP100_PTS * 0.75
-    elif top100 >= 70: pts += HOLDER_TOP100_PTS * 0.5
+    if top100 is not None:
+        if top100 >= 95: pts += HOLDER_TOP100_PTS
+        elif top100 >= 85: pts += HOLDER_TOP100_PTS * 0.75
+        elif top100 >= 70: pts += HOLDER_TOP100_PTS * 0.5
     return pts
 
 def score_cex(cex_count, has_perps, tier1):
@@ -1400,6 +1604,77 @@ def score_price(chg_5m, chg_1h, chg_6h, age_minutes):
     return pts
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ALERT GATE — chain- and data-aware
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def max_possible_score(chain, age_minutes, *, has_top100=True, has_cex=True):
+    """Highest score a token on this chain, at this age, could possibly reach.
+
+    The 0-100 scale is only meaningful if all 100 points are *earnable*. They are
+    not, and never were:
+
+    * **Holder concentration (20 pts)** came back empty on every chain, because
+      Moralis's free tier is suspended and Robinhood's Blockscout instance is
+      Cloudflare-blocked. Now supplied by GeckoTerminal, but GT publishes no
+      51-100 band, so 4 of those 20 points stay unmeasurable (``has_top100``).
+    * **CEX listings (5 pts)** are unreachable for Robinhood: no Robinhood token
+      is listed on CoinGecko, so ``get_cex_listings`` can never return anything.
+    * **Age gates** cap the long-window branches: a 1-hour-old pool cannot score
+      the 1h/6h or 6h/24h tiers at all.
+
+    This mirrors the real scorers by calling them with ideal inputs, so it cannot
+    drift out of sync with them. It is used to scale the alert threshold down to
+    what is actually reachable, instead of silently requiring 65 out of ~43.
+    """
+    v = 1.0  # any positive volume lets each ratio branch be driven to its top tier
+    top = 0.0
+    top += score_volume_liquidity(v, v)                 # vol/liq >= 1.0
+    top += score_5m_1h(v, v, age_minutes)               # 5m/1h normalised >= 8
+    top += score_1h_6h(v, v, age_minutes)               # 1h/6h normalised >= 6
+    top += score_6h_24h(v, v, age_minutes)              # 6h/24h normalised >= 4
+    top += BUY_PRESSURE_5M_PTS                          # buy ratio >= 0.85
+    if age_minutes is not None and age_minutes > 60:
+        top += BUY_PRESSURE_1H_PTS                      # buy ratio 1h >= 0.80
+    top += score_price(1000.0, 1000.0, 1000.0, age_minutes)
+    top += SECURITY_PTS
+    top += score_holder(100.0, 100.0, 100.0 if has_top100 else None, age_minutes)
+    if has_cex:
+        top += score_cex(CEX_LISTING_PTS, True, 1)
+    return top
+
+
+def has_cex_data(chain) -> bool:
+    """Whether CEX-listing scoring can ever fire for this chain."""
+    platform = CHAIN_TO_COINGECKO_PLATFORM.get(chain)
+    return bool(platform and platform != "robinhood")
+
+
+def effective_threshold(chain, age_minutes, *, has_top100=True, has_cex=None):
+    """The alert threshold, scaled to the points actually reachable here.
+
+    ``ROBINHOOD_MIN_SCORE`` / ``BASE_MIN_SCORE`` … override the base for one
+    chain using the same convention as the ``*_MIN_LIQUIDITY_USD`` floors. Set
+    ``SCORE_NORMALIZE=false`` to disable scaling entirely and gate on the raw
+    ``MIN_SCORE`` for every chain.
+    """
+    base = _chain_floor(chain, "MIN_SCORE", float(ALERT_THRESHOLD))
+    if os.getenv("SCORE_NORMALIZE", "true").lower() != "true":
+        return base
+    if has_cex is None:
+        has_cex = has_cex_data(chain)
+    ceiling = max_possible_score(chain, age_minutes, has_top100=has_top100, has_cex=has_cex)
+    if ceiling <= 0:
+        return base
+    scaled = base * (ceiling / 100.0)
+    # Never let scaling push the bar below the floor: a token still has to look
+    # genuinely strong, not merely "best of a bad batch". The floor is itself
+    # capped by ``base`` so an explicit MIN_SCORE below the floor (e.g. 0, to
+    # alert on everything while tuning) still means what it says.
+    floor = min(base, float(os.getenv("MIN_EFFECTIVE_SCORE", "35")))
+    return max(floor, min(base, scaled))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TOKEN EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1408,7 +1683,11 @@ def _apply_security_to_feature(feat: dict, security: Optional[dict]):
     if not security:
         return
     feat["security_source"] = security.get("source")
-    feat["security_known"] = 1
+    # ``security_known`` means "we actually got an answer", not merely "a dict
+    # exists" — the Robinhood path always returns a dict, even when both
+    # providers failed, and logging that as known would poison the training set.
+    known = security.get("verification_known")
+    feat["security_known"] = 1 if (known is None or known) else 0
     for key in (
         "is_honeypot", "is_open_source", "is_proxy", "is_mintable",
         "owner_change_balance", "transfer_pausable", "slippage_modifiable",
@@ -1419,7 +1698,10 @@ def _apply_security_to_feature(feat: dict, security: Optional[dict]):
         feat[key] = None if value is None else int(bool(value))
     feat["buy_tax"] = float(security.get("buy_tax") or 0)
     feat["sell_tax"] = float(security.get("sell_tax") or 0)
-    feat["holder_count"] = int(security.get("holder_count") or 0)
+    # GeckoTerminal does not report a creator share, so only overwrite the
+    # provider's holder count when it actually supplied one.
+    if security.get("holder_count"):
+        feat["holder_count"] = int(security.get("holder_count") or 0)
     # GoPlus reports creator_percent as a fraction; store it as a percentage.
     feat["creator_pct"] = float(security.get("creator_percent") or 0) * 100
 
@@ -1561,7 +1843,12 @@ async def evaluate_token(session, pair):
                 security.get("slippage_modifiable"), security.get("transfer_pausable"),
             ]): return reject("risky_contract_flag")
         else:
-            if not security.get("is_verified", False): penalties += PENALTY_UNVERIFIED_CONTRACT
+            # Only penalise when we actually obtained a verification answer.
+            # ``verification_known`` is False when Etherscan has no key and
+            # Blockscout is Cloudflare-blocked — an outage on our side must not
+            # look like an unverified token.
+            if security.get("verification_known") and not security.get("is_verified", False):
+                penalties += PENALTY_UNVERIFIED_CONTRACT
         score += SECURITY_PTS
     else:
         return reject("security_unknown")
@@ -1587,10 +1874,14 @@ async def evaluate_token(session, pair):
         return reject("phase1_gate")
     feat["phase1_pass"] = 1
 
-    top10, top50, top100 = await get_holder_concentration(session, chain, token)
+    holders = await get_holder_concentration(session, chain, token)
+    top10, top50, top100 = holders.top10, holders.top50, holders.top100
     holder_pts = score_holder(top10, top50, top100, age_minutes)
     score += holder_pts
-    feat["top10"], feat["top50"], feat["top100"] = top10, top50, top100
+    feat["top10"], feat["top50"] = top10, top50
+    feat["top100"] = top100
+    feat["holder_source"] = holders.source
+    feat["holder_count"] = holders.holder_count
 
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
@@ -1606,11 +1897,23 @@ async def evaluate_token(session, pair):
     total_score = max(0.0, legacy_total - signal_penalty + signal_bonus * SIGNAL_BONUS_WEIGHT)
     feat["hand_score"] = legacy_total
 
+    # ── Chain- and data-aware gate ───────────────────────────────────────────
+    # 25 of the 100 points are not earnable on Robinhood (20 holder, 5 CEX) and
+    # the age gates cap the long-window branches for young pools. Requiring a raw
+    # 65 of a reachable ~43 is what produced total silence. Scale the bar to what
+    # this chain/age can actually reach.
+    threshold = effective_threshold(
+        chain, age_minutes,
+        has_top100=top100 is not None,
+        has_cex=has_cex_data(chain),
+    )
+    feat["alert_threshold"] = threshold
+
     # Early-runner fast lane: a pool younger than its long volume windows can
-    # never reach MIN_SCORE, so allow an AND-gated exception. This is what makes
-    # USE_GECKOTERMINAL=new_pools useful rather than just noisy.
+    # never reach the threshold, so allow an AND-gated exception. This is what
+    # makes USE_GECKOTERMINAL=new_pools useful rather than just noisy.
     early_ok = False
-    if EARLY_RUNNER_MODE and total_score < ALERT_THRESHOLD:
+    if EARLY_RUNNER_MODE and total_score < threshold:
         early_reasons = signals.early_runner_reasons(pair, security=security, filters=SIGNAL_FILTERS)
         if not early_reasons:
             early_ok = True
@@ -1619,23 +1922,25 @@ async def evaluate_token(session, pair):
     feat["early_runner"] = 1 if early_ok else 0
 
     if VERBOSE_LOGGING:
+        t100 = f"{top100:.1f}%" if top100 is not None else "n/a"
         logger.info(
-            f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}) | "
+            f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}/{threshold:.1f}) | "
             f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
             f"1h/6h={vol_1h/vol_6h if vol_6h>0 else 0:.2f} 6h/24h={vol_6h/vol_24h if vol_24h>0 else 0:.2f} | "
             f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} | "
-            f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={top100:.1f}% | "
+            f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={t100} "
+            f"({holders.source or 'unavailable'}) | "
             f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties} "
             f"signal=+{signal_bonus:.0f}/-{signal_penalty:.0f}"
             + ("  [EARLY]" if early_ok else "")
         )
 
-    # Original gate: the token must clear the threshold on the hand-tuned score,
-    # unless the strict early-runner lane vouched for it.
-    if legacy_total < ALERT_THRESHOLD and not early_ok:
+    # Original gate: the token must clear the (scaled) threshold on the
+    # hand-tuned score, unless the strict early-runner lane vouched for it.
+    if legacy_total < threshold and not early_ok:
         return reject("below_threshold")
     # Signals may still veto a token the hand-tuned score would have alerted on.
-    if total_score < ALERT_THRESHOLD and not early_ok:
+    if total_score < threshold and not early_ok:
         return reject("signal_penalised")
 
     return finish(None, {
