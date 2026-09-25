@@ -14,6 +14,7 @@ Run with: python -m unittest -v test_sources
 """
 
 import os
+import time
 import unittest
 
 os.environ.setdefault("TELEGRAM_TOKEN", "1:TEST")
@@ -269,6 +270,79 @@ class TestOpenSourceRequirement(unittest.TestCase):
                "is_open_source": False, "source": "etherscan"}
         verdict = signals.evaluate(pair, security=sec, filters=signals.Filters())
         self.assertNotIn("not_open_source", verdict.reject_reasons)
+
+
+class TestGeckoTerminalThrottle(unittest.TestCase):
+    """GT's free tier is ~30 calls/min and answers a burst with 429.
+
+    Holder lookups and discovery both hit api.geckoterminal.com, so they must
+    share one budget — otherwise each path believes it owns the whole quota.
+    """
+
+    def setUp(self):
+        self._saved_interval = bot.GT_MIN_INTERVAL
+        self._saved_last = bot._gt_last_call
+        self._saved_fetch = bot.fetch_json
+        bot._gt_last_call = 0.0
+
+    def tearDown(self):
+        bot.GT_MIN_INTERVAL = self._saved_interval
+        bot._gt_last_call = self._saved_last
+        bot.fetch_json = self._saved_fetch
+
+    def test_serialises_calls_to_the_configured_interval(self):
+        import asyncio
+
+        calls = []
+
+        async def fake_fetch(session, url, **kwargs):
+            calls.append(time.monotonic())
+            return {"ok": True}
+
+        bot.fetch_json = fake_fetch
+        bot.GT_MIN_INTERVAL = 0.15
+
+        async def go():
+            await asyncio.gather(*(bot.gt_fetch_json(None, f"u{i}") for i in range(4)))
+
+        start = time.monotonic()
+        asyncio.run(go())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(len(calls), 4)
+        # 4 calls at a 0.15s spacing cannot finish in less than ~0.45s.
+        self.assertGreaterEqual(elapsed, 0.4)
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        for gap in gaps:
+            self.assertGreaterEqual(gap, 0.10)
+
+    def test_zero_interval_disables_the_wait(self):
+        import asyncio
+
+        async def fake_fetch(session, url, **kwargs):
+            return {"ok": True}
+
+        bot.fetch_json = fake_fetch
+        bot.GT_MIN_INTERVAL = 0.0
+
+        async def go():
+            await asyncio.gather(*(bot.gt_fetch_json(None, f"u{i}") for i in range(3)))
+
+        start = time.monotonic()
+        asyncio.run(go())
+        self.assertLess(time.monotonic() - start, 0.2)
+
+    def test_lock_survives_a_new_event_loop(self):
+        """Per-test asyncio.run() creates a fresh loop each time."""
+        import asyncio
+
+        async def fake_fetch(session, url, **kwargs):
+            return {"ok": True}
+
+        bot.fetch_json = fake_fetch
+        bot.GT_MIN_INTERVAL = 0.0
+        asyncio.run(bot.gt_fetch_json(None, "u1"))
+        asyncio.run(bot.gt_fetch_json(None, "u2"))  # must not raise
 
 
 if __name__ == "__main__":

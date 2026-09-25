@@ -973,6 +973,44 @@ async def fetch_json(session, url, headers=None, use_coingecko_limiter=False):
 
 _gt_client = None
 
+# ── Shared GeckoTerminal budget ──────────────────────────────────────────────
+# GT's free tier allows roughly 30 calls/minute and answers a burst with 429.
+# Discovery (discovery.py) throttles itself, but the token-info calls for holder
+# concentration go through fetch_json directly, so without a *shared* limiter the
+# two paths would each believe they owned the whole budget and collectively blow
+# it. One process-wide limiter therefore covers both.
+GT_MIN_INTERVAL = float(os.getenv("GT_MIN_INTERVAL_S", "2.1"))  # ~28 calls/min
+_gt_throttle_lock: Optional[asyncio.Lock] = None
+_gt_throttle_loop = None
+_gt_last_call = 0.0
+
+
+def _gt_lock() -> asyncio.Lock:
+    """A limiter lock bound to the running loop.
+
+    Recreated when the loop changes so this stays safe under the per-test
+    ``asyncio.run()`` pattern, which spins up a fresh loop each time.
+    """
+    global _gt_throttle_lock, _gt_throttle_loop
+    loop = asyncio.get_running_loop()
+    if _gt_throttle_lock is None or _gt_throttle_loop is not loop:
+        _gt_throttle_lock = asyncio.Lock()
+        _gt_throttle_loop = loop
+    return _gt_throttle_lock
+
+
+async def gt_fetch_json(session, url, **kwargs):
+    """``fetch_json`` plus the shared GeckoTerminal rate limit."""
+    global _gt_last_call
+    if GT_MIN_INTERVAL > 0:
+        async with _gt_lock():
+            wait = GT_MIN_INTERVAL - (time.time() - _gt_last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _gt_last_call = time.time()
+    return await fetch_json(session, url, **kwargs)
+
+
 async def get_geckoterminal_pairs(session, network):
     """Candidate discovery via GeckoTerminal (see discovery.py).
 
@@ -983,9 +1021,11 @@ async def get_geckoterminal_pairs(session, network):
     sources = tuple(
         s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending").split(",") if s.strip()
     )
-    fetcher = lambda url: fetch_json(session, url)  # noqa: E731
+    fetcher = lambda url: gt_fetch_json(session, url)  # noqa: E731
     if _gt_client is None:
-        _gt_client = discovery.GeckoTerminal(fetcher)
+        # min_interval_s=0: gt_fetch_json already applies the shared budget, and
+        # stacking a second 2.1s wait would halve throughput for no benefit.
+        _gt_client = discovery.GeckoTerminal(fetcher, min_interval_s=0.0)
     else:
         _gt_client.fetch = fetcher
     pairs = await _gt_client.candidates(network, kinds=sources)
@@ -1319,7 +1359,7 @@ async def get_geckoterminal_holders(session, chain, token) -> HolderData:
         if now - ts < HOLDER_TTL:
             return data
     url = f"https://api.geckoterminal.com/api/v2/networks/{net}/tokens/{token}/info"
-    data = await fetch_json(session, url, headers={"Accept": "application/json"})
+    data = await gt_fetch_json(session, url, headers={"Accept": "application/json"})
     result = _gt_holder_data(data) if data else HolderData()
     # A miss is cached briefly so a provider outage cannot hide every token.
     holder_cache[cache_key] = (result, now)

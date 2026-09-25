@@ -96,9 +96,35 @@ the effective threshold on every evaluation.
 |---|---|---|
 | Discovery | GeckoTerminal | Free, keyless. Gives unique buyers/sellers, which DexScreener does not. |
 | Security / tax | GoPlus (+ honeypot.is fallback) | BSC, Ethereum, Base. |
-| Security / verification | Etherscan v2 | All four chains incl. Robinhood (4663). |
+| Security / verification | Etherscan v2 | All four chains incl. Robinhood (4663). Free tier covers `getsourcecode`. |
 | Holder concentration | GeckoTerminal | All four chains. Moralis is used first on BSC/ETH/Base only when it answers, because it alone gives an exact top-100. |
 | CEX listings | CoinGecko | Never applies to Robinhood. |
+
+### Why so much comes from GeckoTerminal
+
+Holder concentration is the one input where every alternative is either paid or
+does not cover Robinhood Chain (4663):
+
+| Provider | Robinhood (4663)? | Holder endpoint | Free tier |
+|---|---|---|---|
+| **GeckoTerminal** | yes | top-10 / 11-30 / 31-50 bands | **free, keyless, no signup** |
+| Etherscan | yes | PRO only | free for verification |
+| Moralis | **no** | — | trial; free usage is easily "paused" |
+| GoldRush (Covalent) | yes | top holders | **14-day trial**, then $10/mo |
+| Bitquery | yes | `EVM.Holders` top-N | **10K points, first month only** |
+| Ankr | **no** | — | Premium plan only |
+| GoPlus | **no** | — | free, but no Robinhood |
+
+So the bot deliberately does not depend on a trial that will expire. GeckoTerminal
+publishes `top_10`, `11_30` and `31_50` — enough for exact top-10 and top-50, but
+**no 51-100 band**, so `top100` stays unmeasured (`None`) rather than guessed and
+the alert gate scales down for those 4 points. Ethereum holders also come from
+GeckoTerminal today because a suspended Moralis key returns 401 and would
+otherwise zero the score on every chain.
+
+GeckoTerminal's free tier is ~30 calls/min, so discovery and holder lookups share
+one limiter (`GT_MIN_INTERVAL_S`, default 2.1s ≈ 28/min). A burst gets HTTP 429.
+
 
 
 ## Usage
