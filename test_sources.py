@@ -345,5 +345,125 @@ class TestGeckoTerminalThrottle(unittest.TestCase):
         asyncio.run(bot.gt_fetch_json(None, "u2"))  # must not raise
 
 
+class TestAlertFormatting(unittest.TestCase):
+    """Regression: an unmeasured top-100 must not crash the alert.
+
+    GeckoTerminal publishes no 51-100 band, so ``holder_pct`` carries
+    ``top100=None``. ``send_alert`` formatted it with ``:.1f``, raising
+    "unsupported format string passed to NoneType.__format__". Because the alert
+    text is built outside the try that guards ``tg_send``, that killed the whole
+    scan cycle on every alert — so the bot looked like it found nothing while it
+    was actually finding candidates and dying at the last step.
+    """
+
+    def test_fmt_pct_handles_unmeasured(self):
+        self.assertEqual(bot._fmt_pct(None), "n/a")
+        self.assertEqual(bot._fmt_pct(4.5944), "4.6%")
+        self.assertEqual(bot._fmt_pct(0), "0.0%")
+        self.assertEqual(bot._fmt_pct("bad"), "n/a")
+
+    def _alert(self, top100):
+        return {
+            "chain": "robinhood", "token_address": "0x" + "ab" * 20, "symbol": "X",
+            "name": "X", "pair_address": "0x" + "cd" * 20, "total_score": 61.0,
+            "vol_5m": 1.0, "liquidity": 1.0, "market_cap": 1.0,
+            "buys_5m": 1, "sells_5m": 1, "buys_1h": 1, "sells_1h": 1,
+            "chg_5m": 1.0, "chg_1h": 1.0, "chg_6h": 1.0,
+            "security": {"source": "etherscan", "is_verified": True},
+            "holder_pct": (4.59, 16.61, top100),
+            "cex_count": 0, "has_perps": False, "tier1": 0,
+            "age_minutes": None,          # also null for GT pools with no created_at
+            "dex_url": "", "price_usd": 1.0, "price_native": 0.0,
+            "signal_bonus": 0.0, "signal_penalty": 0.0, "signal_notes": [],
+        }
+
+    def test_send_alert_survives_unmeasured_top100_and_null_age(self):
+        import asyncio
+
+        sent = []
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved_tg = bot.tg_send
+        saved_kb = bot.build_alert_keyboard
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: None
+        try:
+            asyncio.run(bot.send_alert(self._alert(None)))
+        finally:
+            bot.tg_send = saved_tg
+            bot.build_alert_keyboard = saved_kb
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Top 100: n/a", sent[0])
+        self.assertIn("Age: <b>? min</b>", sent[0])
+
+    def test_send_alert_still_renders_a_measured_top100(self):
+        import asyncio
+
+        sent = []
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved_tg = bot.tg_send
+        saved_kb = bot.build_alert_keyboard
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: None
+        try:
+            asyncio.run(bot.send_alert(self._alert(85.0)))
+        finally:
+            bot.tg_send = saved_tg
+            bot.build_alert_keyboard = saved_kb
+
+        self.assertIn("Top 100: 85.0%", sent[0])
+
+    def test_alert_build_failure_does_not_propagate(self):
+        """A send failure is logged, not raised, so the cycle continues."""
+        import asyncio
+
+        async def boom(text, **kwargs):
+            raise RuntimeError("telegram down")
+
+        saved_tg = bot.tg_send
+        saved_kb = bot.build_alert_keyboard
+        bot.tg_send = boom
+        bot.build_alert_keyboard = lambda *a, **k: None
+        try:
+            asyncio.run(bot.send_alert(self._alert(None)))  # must not raise
+        finally:
+            bot.tg_send = saved_tg
+            bot.build_alert_keyboard = saved_kb
+
+
+    def test_etherscan_alert_shows_verification_not_goplus(self):
+        """Robinhood's security source is Etherscan; the alert must say so and
+        surface the verification result instead of mislabelling it GoPlus."""
+        import asyncio
+
+        sent = []
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved_tg = bot.tg_send
+        saved_kb = bot.build_alert_keyboard
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: None
+        try:
+            alert = self._alert(None)
+            alert["security"] = {"source": "etherscan", "is_verified": True,
+                                 "verification_known": True}
+            asyncio.run(bot.send_alert(alert))
+        finally:
+            bot.tg_send = saved_tg
+            bot.build_alert_keyboard = saved_kb
+
+        self.assertIn("Security (Etherscan)", sent[0])
+        self.assertIn("Verified source: ✅ Yes", sent[0])
+        self.assertNotIn("GoPlus", sent[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -69,12 +69,40 @@ whereas under the old flat 65 it never alerted at any age.
   and now does verification work. `AUTO_BUY_*` remains dead.
 * **Live trading** still needs a real hot wallet; nothing here was tested with funds.
 
+### Pass 3a — the alert formatter crashed every alert
+
+Once the gate was reachable, tokens started clearing it — and the bot immediately
+began dying with `unsupported format string passed to NoneType.__format__` roughly
+every 60s, while `/health` and the heartbeat still reported **Alerts sent: 0**.
+
+Cause: `holder_pct` carries `top100=None` (correct — GeckoTerminal publishes no
+51-100 band), but `send_alert` rendered it with `f"  Top 100: {pct100:.1f}%"`.
+
+The reason this killed the *scan cycle* rather than just one alert: the alert text
+was built **outside** the `try` block, which only wrapped `tg_send`. A formatting
+error therefore propagated to the cycle's `except`, skipping `db_record_alert` — so
+the cooldown never armed and the same token was retried and re-crashed every cycle.
+
+Three fixes:
+
+1. `_fmt_pct()` renders `None` as `n/a`; `age_minutes` gets the same treatment
+   (`?`) since GeckoTerminal pools occasionally have no `created_at`.
+2. The per-result alert pipeline in the scan loop is now wrapped in `try/except`,
+   so no alert can ever take down scanning again.
+3. The alert header read **"Security (GoPlus)"** on Robinhood, where the source is
+   actually Etherscan — hiding the verification result, which is the whole point of
+   querying it. It now reports `Security (Etherscan)` with `Verified source: ✅/⚠️/❓`.
+
+The tell was the combination of *repeated* crashes and `Alerts sent: 0`: a bot that
+finds nothing does not crash. It was finding candidates and dying at the last step.
+
 ### Verification
 
 `python -m unittest test_signals test_discovery test_features test_telegram test_sources`
-— **85 tests**, all passing, no network. `test_sources.py` covers the GT band parsing,
+— **93 tests**, all passing, no network. `test_sources.py` covers the GT band parsing,
 the `None` top-100 contract, the ceiling matching a perfect token, threshold scaling,
-the floor, per-chain overrides and the open-source flag.
+the floor, per-chain overrides, the open-source flag, the shared GT rate limiter, and
+the alert formatter including the exact `top100=None` crash.
 
 ---
 

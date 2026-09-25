@@ -1922,6 +1922,11 @@ async def evaluate_token(session, pair):
     feat["top100"] = top100
     feat["holder_source"] = holders.source
     feat["holder_count"] = holders.holder_count
+    # GeckoTerminal has no 51-100 band, so top100 is legitimately None. Format
+    # defensively: a ":.1f" on None raises and, inside the scanner, silently
+    # drops the token.
+    age_display = f"{age_minutes:.0f}" if age_minutes is not None else "?"
+    t100 = f"{top100:.1f}%" if top100 is not None else "n/a"
 
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
@@ -1958,17 +1963,16 @@ async def evaluate_token(session, pair):
         if not early_reasons:
             early_ok = True
             if VERBOSE_LOGGING:
-                logger.info(f"Early-runner lane {symbol}@{chain} age={age_minutes:.0f}m score={total_score:.0f}")
+                logger.info(f"Early-runner lane {symbol}@{chain} age={age_display}m score={total_score:.0f}")
     feat["early_runner"] = 1 if early_ok else 0
 
     if VERBOSE_LOGGING:
-        t100 = f"{top100:.1f}%" if top100 is not None else "n/a"
         logger.info(
             f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}/{threshold:.1f}) | "
             f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
             f"1h/6h={vol_1h/vol_6h if vol_6h>0 else 0:.2f} 6h/24h={vol_6h/vol_24h if vol_24h>0 else 0:.2f} | "
             f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} | "
-            f"age={age_minutes:.0f}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={t100} "
+            f"age={age_display}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={t100} "
             f"({holders.source or 'unavailable'}) | "
             f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties} "
             f"signal=+{signal_bonus:.0f}/-{signal_penalty:.0f}"
@@ -3198,6 +3202,23 @@ async def telegram_polling_task():
 # ALERT SENDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_pct(value) -> str:
+    """Render a holder percentage that may legitimately be unmeasured.
+
+    GeckoTerminal publishes no 51-100 band, so ``top100`` is ``None`` rather than
+    a guess. Formatting that with ``:.1f`` raised
+    "unsupported format string passed to NoneType.__format__", which — because
+    the alert text is built outside the try that guards ``tg_send`` — killed the
+    whole scan cycle on every alert.
+    """
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 async def send_alert(alert):
     global alerts_sent
     sec = alert.get("security") or {}
@@ -3205,18 +3226,32 @@ async def send_alert(alert):
     buy_pct_5m = (alert['buys_5m'] / (alert['buys_5m'] + alert['sells_5m']) * 100) if (alert['buys_5m'] + alert['sells_5m']) > 0 else 0
     buy_pct_1h = (alert['buys_1h'] / (alert['buys_1h'] + alert['sells_1h']) * 100) if (alert['buys_1h'] + alert['sells_1h']) > 0 else 0
 
-    if sec.get("source") == "blockscout":
+    if sec.get("source") == "etherscan":
+        # Robinhood's real security source. Labelling this "GoPlus" hid the
+        # verification result, which is the one thing Etherscan actually tells us.
+        if sec.get("verification_known"):
+            verified = "✅ Yes" if sec.get("is_verified") else "⚠️ No"
+        else:
+            verified = "❓ Unknown"
+        sec_text = (
+            f"<b>Security (Etherscan):</b>\n"
+            f"  Verified source: {verified}\n"
+            f"  Proxy: {'❌ YES' if sec.get('is_proxy') else '✅ No'}\n"
+        )
+    elif sec.get("source") == "blockscout":
         sec_text = (
             f"<b>Security (Blockscout):</b>\n"
             f"  Verified: {'✅' if sec.get('is_verified') else '⚠️ No'}\n"
             f"  Proxy: {'❌ YES' if sec.get('is_proxy') else '✅ No'}\n"
         )
     else:
+        buy_tax = sec.get('buy_tax') or 0
+        sell_tax = sec.get('sell_tax') or 0
         sec_text = (
             f"<b>Security (GoPlus):</b> {'✅' if sec else '❓'}\n"
             f"  Honeypot: {'✅ No' if not sec or not sec.get('is_honeypot') else '❌ YES'}\n"
-            f"  Buy Tax: {sec.get('buy_tax', 0):.1f}%\n"
-            f"  Sell Tax: {sec.get('sell_tax', 0):.1f}%\n"
+            f"  Buy Tax: {buy_tax:.1f}%\n"
+            f"  Sell Tax: {sell_tax:.1f}%\n"
         )
 
     age_display = f"{alert['age_minutes']:.0f}" if alert.get("age_minutes") is not None else "?"
@@ -3235,9 +3270,9 @@ async def send_alert(alert):
         f"<b>Buy Pressure 1h:</b> {buy_pct_1h:.1f}% ({alert['buys_1h']}B / {alert['sells_1h']}S)\n\n"
         f"{sec_text}\n"
         f"<b>Holder Concentration:</b>\n"
-        f"  Top 10: {pct10:.1f}%\n"
-        f"  Top 50: {pct50:.1f}%\n"
-        f"  Top 100: {pct100:.1f}%\n\n"
+        f"  Top 10: {_fmt_pct(pct10)}\n"
+        f"  Top 50: {_fmt_pct(pct50)}\n"
+        f"  Top 100: {_fmt_pct(pct100)}\n\n"
         f"<b>CEX Listings:</b> {alert['cex_count']} (perps: {'✅' if alert['has_perps'] else '❌'})\n\n"
         f"<b>Signal Engine:</b> +{alert.get('signal_bonus', 0):.0f} / -{alert.get('signal_penalty', 0):.0f}\n"
         + (f"<i>{esc(', '.join(alert.get('signal_notes', [])))}</i>\n" if alert.get('signal_notes') else "")
@@ -3324,18 +3359,28 @@ async def bot_task():
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for result in results:
                         if not result or isinstance(result, Exception): continue
-                        last_alert = db_get_last_alert(result["chain"], result["token_address"])
-                        should_alert = True
-                        if last_alert:
-                            hours_since = (time.time() - last_alert["alert_time"]) / 3600
-                            if hours_since < RE_ALERT_COOLDOWN_HOURS:
-                                if (result["total_score"] - last_alert["total_score"]) < SCORE_IMPROVEMENT_THRESHOLD:
-                                    should_alert = False
-                        if should_alert:
-                            await send_alert(result)
-                            db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
-                            cycle_alerts += 1
-                            await asyncio.sleep(1)
+                        # An alert that fails to build or send must never take
+                        # down the scan cycle — that failure mode looked exactly
+                        # like "the bot found nothing" while it was in fact
+                        # finding candidates and dying on every send.
+                        try:
+                            last_alert = db_get_last_alert(result["chain"], result["token_address"])
+                            should_alert = True
+                            if last_alert:
+                                hours_since = (time.time() - last_alert["alert_time"]) / 3600
+                                if hours_since < RE_ALERT_COOLDOWN_HOURS:
+                                    if (result["total_score"] - last_alert["total_score"]) < SCORE_IMPROVEMENT_THRESHOLD:
+                                        should_alert = False
+                            if should_alert:
+                                await send_alert(result)
+                                db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
+                                cycle_alerts += 1
+                                await asyncio.sleep(1)
+                        except Exception:
+                            logger.error(
+                                f"Alert pipeline failed for {result.get('symbol')}@{result.get('chain')}",
+                                exc_info=True,
+                            )
 
                 cycle_duration = time.time() - cycle_start
                 logger.info(f"Cycle complete in {cycle_duration:.1f}s. Alerts: {cycle_alerts}. Sleeping {SCAN_INTERVAL}s...")
