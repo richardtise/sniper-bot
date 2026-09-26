@@ -1979,13 +1979,15 @@ async def evaluate_token(session, pair):
             + ("  [EARLY]" if early_ok else "")
         )
 
-    # Original gate: the token must clear the (scaled) threshold on the
-    # hand-tuned score, unless the strict early-runner lane vouched for it.
-    if legacy_total < threshold and not early_ok:
-        return reject("below_threshold")
-    # Signals may still veto a token the hand-tuned score would have alerted on.
+    # The gate is `total_score`, which already folds in the signal penalties and
+    # the weighted bonus. Gating on `legacy_total` as well made
+    # SIGNAL_BONUS_WEIGHT dead as a promotion control: at any weight the bonus
+    # was ignored, because `legacy_total` never contains it. Since
+    # total_score = legacy_total - signal_penalty + bonus*weight, and the weight
+    # defaults to 0.0, gating on total_score alone is *identical* to the old
+    # two-gate form at the default while letting the knob actually work above it.
     if total_score < threshold and not early_ok:
-        return reject("signal_penalised")
+        return reject("below_threshold")
 
     return finish(None, {
         "chain": chain, "token_address": token, "symbol": symbol, "name": name,

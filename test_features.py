@@ -201,17 +201,35 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
             return dict(security)
         bot.get_token_security = fake_security
 
-    async def test_signal_bonus_cannot_promote_below_threshold(self):
+    async def test_signal_bonus_cannot_promote_at_the_default_weight(self):
+        """SIGNAL_BONUS_WEIGHT defaults to 0.0, so the hand score stays the gate.
+
+        This is the pass-2 anti-noise guarantee and it must not regress.
+        """
         self._install_security(self._good_security())
-        bot.SIGNAL_BONUS_WEIGHT = 1.0  # even at full bonus weight...
+        bot.SIGNAL_BONUS_WEIGHT = 0.0
         bot.ALERT_THRESHOLD = 0
         promoted = await bot.evaluate_token(None, self._pair())
         self.assertIsNotNone(promoted, "sanity: pair should clear a zero threshold")
 
-        # ...the hand-tuned score is still the gate.
         bot.ALERT_THRESHOLD = 65
         result = await bot.evaluate_token(None, self._pair())
-        self.assertIsNone(result, "signal bonus must not promote a sub-threshold token")
+        self.assertIsNone(result, "at weight 0.0 the bonus must not promote anything")
+
+    async def test_signal_bonus_can_promote_when_explicitly_weighted(self):
+        """Above 0.0 the knob is now live; before this change it did nothing.
+
+        The gate used to read `legacy_total`, which never contains the bonus, so
+        SIGNAL_BONUS_WEIGHT could not promote a token at *any* value. The gate is
+        now `total_score` (identical at the 0.0 default). This pins the opt-in
+        behaviour so the risk of re-opening the pass-2 flood stays a deliberate
+        choice rather than an accident.
+        """
+        self._install_security(self._good_security())
+        bot.SIGNAL_BONUS_WEIGHT = 1.0
+        bot.ALERT_THRESHOLD = 65
+        result = await bot.evaluate_token(None, self._pair())
+        self.assertIsNotNone(result, "a fully weighted bonus should be able to promote")
 
     async def test_unknown_security_dropped_by_default(self):
         calls = {"honeypot": 0}

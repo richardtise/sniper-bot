@@ -162,7 +162,16 @@ class Filters:
 
     # --- age / timing ---------------------------------------------------------
     min_age_minutes: float = 3.0
-    max_age_minutes: float = 60.0 * 24 * 5   # beyond a week it is not a sniper
+    # No upper age limit by default. Pool *age* is not a quality signal: a pool
+    # can be old and dead, or old and just re-ignited by a catalyst. The old
+    # 5-day cap silently discarded the second kind — measured across 122 live
+    # pools, 91 were older than 5 days and 4 were rejected on age alone,
+    # including a 27-day-old pool up 40,605% in 24h and an 8-day-old one up
+    # 2,533%. Dead pools are already rejected by the activity floors below
+    # (vol5m_too_low, low_activity, txns5m), which measure *current* life rather
+    # than creation date. Set SIG_MAX_AGE_MINUTES to restore a hard cap; 0 means
+    # no limit.
+    max_age_minutes: float = 0.0
     fresh_age_minutes: float = 240.0         # bonus window
 
     # --- activity -------------------------------------------------------------
@@ -390,7 +399,8 @@ def hard_reject_reasons(
     if age is not None:
         if age < f.min_age_minutes:
             reasons.append("too_new")
-        if age > f.max_age_minutes:
+        # 0 (the default) disables the upper bound entirely; see Filters.
+        if f.max_age_minutes and age > f.max_age_minutes:
             reasons.append("too_old")
 
     # --- quote quality --------------------------------------------------------

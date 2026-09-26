@@ -96,13 +96,70 @@ Three fixes:
 The tell was the combination of *repeated* crashes and `Alerts sent: 0`: a bot that
 finds nothing does not crash. It was finding candidates and dying at the last step.
 
+### Pass 3b — the age cap was discarding the best runners
+
+`SIG_MAX_AGE_MINUTES` defaulted to 5 days and was a **hard reject**. Pool age is
+not a quality signal — a pool can be old and dead, or old and freshly re-ignited
+by a catalyst — and the activity floors (`vol5m_too_low`, `low_activity`,
+`txns5m`) already separate those two using *current* life rather than creation
+date. Measured across 122 live pools on Robinhood/BSC/Base:
+
+* **91 of 122 were older than 5 days**, so the cap was aimed at the majority of
+  the universe;
+* **4 were rejected on age alone** — i.e. they passed every other gate — with the
+  only blocking reason being `too_old`:
+
+| Token | Age | 5m volume | vol/liq | txns 5m | 24h Δ |
+| --- | --- | --- | --- | --- | --- |
+| SHRUB | 27d | $69,426 | 0.38 | 53 | **+40,605%** |
+| CASHED | 8d | $35,816 | 0.28 | 168 | **+2,533%** |
+| astro | 18d | $13,874 | 0.05 | 12 | −63% |
+| HOODCATS | 7d | $5,187 | 0.07 | 100 | −23% |
+
+Two of the four were multi-thousand-percent runners. **Fixed:** the cap now
+defaults to `0` = no limit, with `SIG_MAX_AGE_MINUTES=7200` restoring the old
+behaviour. `tests/test_sources.py::TestAgeGate` pins both, including that a dead
+27-day pool is *still* rejected by the activity floors.
+
+#### The second, deeper blocker — `SIGNAL_BONUS_WEIGHT` was dead
+
+Removing the cap is necessary but not sufficient, and finding out why surfaced a
+real bug. The alert gate read:
+
+```python
+if legacy_total < threshold:      # legacy_total never contains the bonus
+    return reject("below_threshold")
+if total_score < threshold:
+    return reject("signal_penalised")
+```
+
+`total_score = legacy_total - signal_penalty + bonus * SIGNAL_BONUS_WEIGHT`, so
+gating on `legacy_total` meant **the bonus could not promote a token at any
+weight**. The knob was advertised as a promotion control and did nothing.
+
+The gate is now `total_score` alone. Because `total_score <= legacy_total` when
+the weight is `0.0`, this is *arithmetically identical* to the old two-gate form
+at the default — the pass-2 anti-noise guarantee is preserved — while making the
+knob live above it.
+
+Measured on the live SHRUB pool (hand 42, signal +26/−13, bar 58):
+
+| Config | Result |
+| --- | --- |
+| default (`weight 0.0`) | rejected (28 vs 58) |
+| `weight 1.0` | rejected (54 vs 58) — the hand component sets the bar |
+| `ROBINHOOD_MIN_SCORE=50`, `weight 0.0` | rejected (28 vs 44.6) |
+| **`ROBINHOOD_MIN_SCORE=45`, `weight 1.0`** | **ALERT (54 vs 40.2)** |
+
+So catching this pattern needs the age cap gone **and** a lower bar **and**
+promotion enabled. That combination re-opens the pass-2 flood vector, so the
+defaults stay conservative (`weight 0.0`) and the trade-off is documented in
+`.env.example` and the README rather than silently applied.
+
 ### Verification
 
 `python -m unittest test_signals test_discovery test_features test_telegram test_sources`
-— **93 tests**, all passing, no network. `test_sources.py` covers the GT band parsing,
-the `None` top-100 contract, the ceiling matching a perfect token, threshold scaling,
-the floor, per-chain overrides, the open-source flag, the shared GT rate limiter, and
-the alert formatter including the exact `top100=None` crash.
+— **103 tests**, all passing, no network.
 
 ---
 

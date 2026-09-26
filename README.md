@@ -60,6 +60,8 @@ The handful you are most likely to change:
 | `USE_SIGNALS` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. |
 | `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. |
 | `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. |
+| `SIG_MAX_AGE_MINUTES` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | How far the signal engine may *promote* a token (0–1). `0.0` = signals only veto. Raising it lets runner signals rescue a token the hand score under-rates — see [Catching re-ignited pools](#catching-re-ignited-pools). |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_REQUIRE_OPEN_SOURCE` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
@@ -72,6 +74,41 @@ The handful you are most likely to change:
 Per-chain routing addresses (`ETH_QUOTER_V2`, `BSC_ROUTER_V3`, …) can be
 overridden in `.env`, but working defaults are compiled in for all four chains.
 `/debug` prints each contract as `OK` or `NO CODE` so a bad address is obvious.
+
+## Catching re-ignited pools
+
+A pool can sit dead for weeks and then run on a catalyst. Two things used to
+make those invisible:
+
+1. **A hard 5-day age cap** (`SIG_MAX_AGE_MINUTES`). It rejected on creation date
+   rather than on current life. Measured across 122 live pools: 91 were older than
+   5 days and 4 were rejected on age alone — including a **27-day-old pool up
+   40,605% in 24h** and an **8-day-old pool up 2,533%**. The cap is now `0`
+   (disabled); dead pools are still rejected by `vol5m_too_low`,
+   `low_activity` and `txns5m`, which measure *current* activity. Set
+   `SIG_MAX_AGE_MINUTES=7200` to restore the old behaviour.
+2. **`SIGNAL_BONUS_WEIGHT` did nothing.** The gate read the hand score, which
+   never contains the bonus, so at *any* weight the bonus could not promote. The
+   gate is now `total_score` — identical at the `0.0` default, but the knob is
+   live above it.
+
+Removing the age cap is necessary but not sufficient: the hand score measures
+*short-term volume concentration*, so a pool whose volume is spread across the
+hour still scores low. The 27-day pool above scored hand 42 against a bar of 58,
+with a strong signal bonus of +26 that could not lift it past the hand gate. To
+actually catch that pattern you must also lower the bar and let signals promote:
+
+```dotenv
+SIG_MAX_AGE_MINUTES=0        # already the default
+ROBINHOOD_MIN_SCORE=45       # lower the per-chain bar
+SIGNAL_BONUS_WEIGHT=1.0      # let signals promote
+```
+
+With that combination the same pool alerted (score 54 vs bar 40.2). **This is a
+noise trade-off, not a free win** — pass 2 of this repo had to be reverted because
+an additive bonus flooded Base with junk. Raise `SIGNAL_BONUS_WEIGHT` in small
+steps and watch what arrives. `VERBOSE_LOGGING=true` prints
+`score (hand=X/threshold)` on every evaluation so you can see the margin.
 
 ## Alert gate
 

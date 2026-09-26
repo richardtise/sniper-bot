@@ -345,6 +345,97 @@ class TestGeckoTerminalThrottle(unittest.TestCase):
         asyncio.run(bot.gt_fetch_json(None, "u2"))  # must not raise
 
 
+class TestAgeGate(unittest.TestCase):
+    """Pool age must not be a hard reject.
+
+    Age was capped at 5 days, which discarded the "old pool, freshly re-ignited"
+    pattern. Measured across 122 live pools, 91 were older than 5 days and 4 were
+    rejected on age alone — including a 27-day-old pool up 40,605% in 24h and an
+    8-day-old one up 2,533%. Dead pools are already caught by the activity floors,
+    which measure current life rather than creation date.
+    """
+
+    def _pair(self, age_minutes):
+        now_ms = time.time() * 1000
+        return {
+            "chainId": "robinhood",
+            "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "SHRUB", "name": "Shrub"},
+            "quoteToken": {"address": "0x" + "ef" * 20, "symbol": "WETH", "name": "WETH"},
+            "priceUsd": "0.01", "priceNative": "0.000004",
+            "liquidity": {"usd": 176_000.0},
+            "marketCap": 2_000_000.0, "fdv": 2_000_000.0,
+            "volume": {"m5": 80_000.0, "h1": 400_000.0, "h6": 500_000.0, "h24": 600_000.0},
+            "txns": {"m5": {"buys": 40, "sells": 8, "buyers": 35, "sellers": 7},
+                     "h1": {"buys": 613, "sells": 139}},
+            "priceChange": {"m5": 5.0, "h1": 40.0, "h6": 300.0, "h24": 39_000.0},
+            "pairCreatedAt": now_ms - age_minutes * 60 * 1000,
+        }
+
+    def test_default_has_no_upper_age_limit(self):
+        self.assertEqual(signals.Filters().max_age_minutes, 0.0)
+
+    def test_a_month_old_pool_is_not_rejected_for_age(self):
+        v = signals.evaluate(self._pair(27 * 24 * 60), filters=signals.Filters())
+        self.assertNotIn("too_old", v.reject_reasons)
+
+    def test_a_year_old_pool_is_not_rejected_for_age(self):
+        v = signals.evaluate(self._pair(365 * 24 * 60), filters=signals.Filters())
+        self.assertNotIn("too_old", v.reject_reasons)
+
+    def test_the_cap_still_works_when_explicitly_set(self):
+        f = signals.Filters(max_age_minutes=7200.0)
+        v = signals.evaluate(self._pair(27 * 24 * 60), filters=f)
+        self.assertIn("too_old", v.reject_reasons)
+
+    def test_env_override_restores_the_old_cap(self):
+        os.environ["SIG_MAX_AGE_MINUTES"] = "7200"
+        try:
+            self.assertEqual(signals.Filters.from_env().max_age_minutes, 7200.0)
+        finally:
+            os.environ.pop("SIG_MAX_AGE_MINUTES", None)
+
+    def test_zero_env_means_no_limit(self):
+        os.environ["SIG_MAX_AGE_MINUTES"] = "0"
+        try:
+            self.assertEqual(signals.Filters.from_env().max_age_minutes, 0.0)
+        finally:
+            os.environ.pop("SIG_MAX_AGE_MINUTES", None)
+
+    def test_dead_old_pools_are_still_rejected_by_activity_floors(self):
+        """Removing the age cap must not let dormant pools through.
+
+        The activity gates measure *current* life, so an old pool that is not
+        trading is still refused — the age cap was never what protected us.
+        """
+        dead = self._pair(27 * 24 * 60)
+        dead["volume"] = {"m5": 12.0, "h1": 40.0, "h6": 100.0, "h24": 150.0}
+        dead["txns"] = {"m5": {"buys": 1, "sells": 1, "buyers": 1, "sellers": 1},
+                        "h1": {"buys": 3, "sells": 2}}
+        v = signals.evaluate(dead, filters=signals.Filters())
+        self.assertTrue(v.rejected)
+        self.assertNotIn("too_old", v.reject_reasons)
+        self.assertTrue(
+            {"vol5m_too_low", "low_activity"} & set(v.reject_reasons),
+            f"expected an activity-floor reject, got {v.reject_reasons}",
+        )
+
+    def test_min_age_still_protects_against_brand_new_pools(self):
+        v = signals.evaluate(self._pair(0.5), filters=signals.Filters())
+        self.assertIn("too_new", v.reject_reasons)
+
+    def test_very_old_pool_keeps_a_full_scoring_ceiling(self):
+        """Old pools are scored on *more* evidence and held to a higher bar, so
+        dropping the cap does not hand them a discount."""
+        old = bot.max_possible_score("robinhood", 30 * 24 * 60, has_top100=False, has_cex=False)
+        young = bot.max_possible_score("robinhood", 10, has_top100=False, has_cex=False)
+        self.assertGreater(old, young)
+        self.assertGreater(
+            bot.effective_threshold("robinhood", 30 * 24 * 60, has_top100=False, has_cex=False),
+            bot.effective_threshold("robinhood", 10, has_top100=False, has_cex=False),
+        )
+
+
 class TestAlertFormatting(unittest.TestCase):
     """Regression: an unmeasured top-100 must not crash the alert.
 
