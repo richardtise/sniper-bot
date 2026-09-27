@@ -550,6 +550,18 @@ FEATURE_FIELDS = [
     "is_blacklisted", "is_whitelisted", "lp_locked",
     "security_source", "security_known",
     "signal_bonus", "signal_penalty", "signal_notes",
+    # Per-component score breakdown. The total alone cannot answer "which part of
+    # the model withheld the points", which is the question every miss raises.
+    # Stored for every evaluation that gets far enough to be scored.
+    "score_vol_liq", "score_vol_5m_1h", "score_vol_1h_6h", "score_vol_6h_24h",
+    "score_buy_5m", "score_buy_1h", "score_price",
+    "score_holder", "score_security", "score_cex",
+    "penalties_total",
+    # Theoretical ceiling this chain/age could reach, i.e. the number the alert
+    # threshold is scaled against. `hand_score / ceiling_score` is the honest
+    # "how close was it" ratio; hand_score / alert_threshold is not, because the
+    # threshold is itself a fraction of the ceiling.
+    "ceiling_score",
     "base_score", "hand_score", "phase1_pass", "alert_threshold",
     "rejected", "reject_reasons", "passed_threshold", "alert_sent", "paper_mode",
     "early_runner",
@@ -1790,17 +1802,17 @@ async def evaluate_token(session, pair):
     min_liq = _chain_floor(chain, "MIN_LIQUIDITY_USD", default_liq)
     min_vol_5m = _chain_floor(chain, "MIN_VOL_5M_USD", MIN_VOL_5M_USD)
     min_mcap = _chain_floor(chain, "MIN_MARKET_CAP_USD", MIN_MARKET_CAP_USD)
-    liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
-    feat["liquidity_usd"] = liquidity
-    if liquidity < min_liq: return reject("liquidity")
-    price = float(pair.get("priceUsd") or 0)
-    if price < MIN_PRICE: return reject("price_too_low")
-    market_cap = float(pair.get("marketCap") or 0)
-    feat["market_cap_usd"] = market_cap
-    if market_cap < min_mcap: return reject("market_cap")
-    vol_5m = float(pair.get("volume", {}).get("m5") or 0)
-    if vol_5m < min_vol_5m: return reject("vol_5m")
 
+    # ── Raw metrics are read *before* the floors ────────────────────────────
+    # The floors below return early, and a return used to leave the row with
+    # zeros for every window, ratio and transaction count — because the block
+    # that fills them sat after the checks. A token rejected for a thin 5-minute
+    # read was then indistinguishable from one that never traded, which poisons
+    # any model trained on the table (the losers are the class you most need).
+    liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+    price = float(pair.get("priceUsd") or 0)
+    market_cap = float(pair.get("marketCap") or 0)
+    vol_5m = float(pair.get("volume", {}).get("m5") or 0)
     vol_15m = float(pair.get("volume", {}).get("m15") or 0)
     vol_1h = float(pair.get("volume", {}).get("h1") or 0)
     vol_24h = float(pair.get("volume", {}).get("h24") or 0)
@@ -1822,6 +1834,8 @@ async def evaluate_token(session, pair):
     age_minutes = (time.time() - pair_created / 1000) / 60 if pair_created else None
 
     feat.update({
+        "liquidity_usd": liquidity,
+        "market_cap_usd": market_cap,
         "age_minutes": age_minutes,
         "vol_5m": vol_5m, "vol_15m": vol_15m, "vol_1h": vol_1h,
         "vol_6h": vol_6h, "vol_24h": vol_24h,
@@ -1836,39 +1850,69 @@ async def evaluate_token(session, pair):
         "buy_ratio_1h": (buys_1h / (buys_1h + sells_1h)) if (buys_1h + sells_1h) else 0.0,
         "chg_5m": chg_5m, "chg_15m": chg_15m, "chg_1h": chg_1h,
         "chg_6h": chg_6h, "chg_24h": chg_24h,
+        # Provisional ceiling and bar: `has_top100=False` because the holder
+        # lookup has not run yet. Both are overwritten with the authoritative
+        # values next to `effective_threshold` when the evaluation gets that far.
+        # Recorded here so a token rejected early still shows the bar it faced —
+        # otherwise "48 against a bar of 64" is unanswerable for exactly the
+        # rows you most want to study.
+        "ceiling_score": max_possible_score(
+            chain, age_minutes, has_top100=False, has_cex=has_cex_data(chain)
+        ),
+        "alert_threshold": effective_threshold(
+            chain, age_minutes, has_top100=False, has_cex=has_cex_data(chain)
+        ),
     })
 
+    # ── Floors (same order as before: first failure still wins the label) ────
+    if liquidity < min_liq: return reject("liquidity")
+    if price < MIN_PRICE: return reject("price_too_low")
+    if market_cap < min_mcap: return reject("market_cap")
+    if vol_5m < min_vol_5m: return reject("vol_5m")
     if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
         return reject("robinhood_too_new")
 
     score = 0; penalties = 0
-    score += score_volume_liquidity(vol_5m, liquidity)
-    score += score_5m_1h(vol_5m, vol_1h, age_minutes)
-    score += score_1h_6h(vol_1h, vol_6h, age_minutes)
-    score += score_6h_24h(vol_6h, vol_24h, age_minutes)
+    s_vol_liq = score_volume_liquidity(vol_5m, liquidity)
+    s_5m_1h = score_5m_1h(vol_5m, vol_1h, age_minutes)
+    s_1h_6h = score_1h_6h(vol_1h, vol_6h, age_minutes)
+    s_6h_24h = score_6h_24h(vol_6h, vol_24h, age_minutes)
+    score += s_vol_liq + s_5m_1h + s_1h_6h + s_6h_24h
+    feat.update({
+        "score_vol_liq": s_vol_liq, "score_vol_5m_1h": s_5m_1h,
+        "score_vol_1h_6h": s_1h_6h, "score_vol_6h_24h": s_6h_24h,
+    })
 
+    s_buy_5m = 0.0
     total_5m = buys_5m + sells_5m
     if total_5m > 0:
         buy_ratio_5m = buys_5m / total_5m
-        if buy_ratio_5m >= 0.85: score += BUY_PRESSURE_5M_PTS
-        elif buy_ratio_5m >= 0.70: score += BUY_PRESSURE_5M_PTS * 0.75
-        elif buy_ratio_5m >= 0.55: score += BUY_PRESSURE_5M_PTS * 0.5
-        elif buy_ratio_5m >= 0.45: score += BUY_PRESSURE_5M_PTS * 0.25
+        if buy_ratio_5m >= 0.85: s_buy_5m = BUY_PRESSURE_5M_PTS
+        elif buy_ratio_5m >= 0.70: s_buy_5m = BUY_PRESSURE_5M_PTS * 0.75
+        elif buy_ratio_5m >= 0.55: s_buy_5m = BUY_PRESSURE_5M_PTS * 0.5
+        elif buy_ratio_5m >= 0.45: s_buy_5m = BUY_PRESSURE_5M_PTS * 0.25
+        score += s_buy_5m
         if buy_ratio_5m < 0.35: penalties += PENALTY_SELL_PRESSURE_5M
         if total_5m < 5: penalties += PENALTY_LOW_TX_5M
     else:
         penalties += PENALTY_LOW_TX_5M
 
+    s_buy_1h = 0.0
     total_1h = buys_1h + sells_1h
     if age_minutes is not None and age_minutes > 60 and total_1h > 0:
         buy_ratio_1h = buys_1h / total_1h
-        if buy_ratio_1h >= 0.80: score += BUY_PRESSURE_1H_PTS
-        elif buy_ratio_1h >= 0.65: score += BUY_PRESSURE_1H_PTS * 0.75
-        elif buy_ratio_1h >= 0.50: score += BUY_PRESSURE_1H_PTS * 0.5
+        if buy_ratio_1h >= 0.80: s_buy_1h = BUY_PRESSURE_1H_PTS
+        elif buy_ratio_1h >= 0.65: s_buy_1h = BUY_PRESSURE_1H_PTS * 0.75
+        elif buy_ratio_1h >= 0.50: s_buy_1h = BUY_PRESSURE_1H_PTS * 0.5
+        score += s_buy_1h
         if buy_ratio_1h < 0.35: penalties += PENALTY_SELL_PRESSURE_1H
         if total_1h < 10: penalties += PENALTY_LOW_TX_1H
 
-    score += score_price(chg_5m, chg_1h, chg_6h, age_minutes)
+    s_price = score_price(chg_5m, chg_1h, chg_6h, age_minutes)
+    score += s_price
+    feat.update({
+        "score_buy_5m": s_buy_5m, "score_buy_1h": s_buy_1h, "score_price": s_price,
+    })
 
     security = await get_token_security(session, chain, token)
     _apply_security_to_feature(feat, security)
@@ -1890,11 +1934,15 @@ async def evaluate_token(session, pair):
             if security.get("verification_known") and not security.get("is_verified", False):
                 penalties += PENALTY_UNVERIFIED_CONTRACT
         score += SECURITY_PTS
+        feat["score_security"] = SECURITY_PTS
     else:
         return reject("security_unknown")
 
     # ── Optional signal engine (signals.py): reject rugs before enrichment ──
     verdict = None
+    # Recorded before the veto so a signal-rejected row still shows what the hand
+    # score had already deducted (sell pressure, low tx counts, unverified).
+    feat["penalties_total"] = penalties
     if USE_SIGNALS:
         verdict = signals.evaluate(pair, security=security, filters=SIGNAL_FILTERS)
         PAIR_HISTORY.observe(pair, security=security, score=score - penalties)
@@ -1922,6 +1970,7 @@ async def evaluate_token(session, pair):
     feat["top100"] = top100
     feat["holder_source"] = holders.source
     feat["holder_count"] = holders.holder_count
+    feat["score_holder"] = holder_pts
     # GeckoTerminal has no 51-100 band, so top100 is legitimately None. Format
     # defensively: a ":.1f" on None raises and, inside the scanner, silently
     # drops the token.
@@ -1931,6 +1980,7 @@ async def evaluate_token(session, pair):
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
     cex_pts = score_cex(cex_count, has_perps, tier1)
     score += cex_pts
+    feat["score_cex"] = cex_pts
 
     # The hand-tuned score is the alert gate, exactly as in the original bot.
     # The signal engine is noise-reducing by default: its hard rejects and
@@ -1947,12 +1997,20 @@ async def evaluate_token(session, pair):
     # the age gates cap the long-window branches for young pools. Requiring a raw
     # 65 of a reachable ~43 is what produced total silence. Scale the bar to what
     # this chain/age can actually reach.
+    has_top100 = top100 is not None
     threshold = effective_threshold(
         chain, age_minutes,
-        has_top100=top100 is not None,
+        has_top100=has_top100,
         has_cex=has_cex_data(chain),
     )
     feat["alert_threshold"] = threshold
+    # Authoritative ceiling (now that the top-100 band is known to be measurable
+    # or not). `hand_score / ceiling_score` is how much of the *reachable* score
+    # the token actually earned, which is the number to look at when a runner
+    # scored "48 against a bar of 64".
+    feat["ceiling_score"] = max_possible_score(
+        chain, age_minutes, has_top100=has_top100, has_cex=has_cex_data(chain)
+    )
 
     # Early-runner fast lane: a pool younger than its long volume windows can
     # never reach the threshold, so allow an AND-gated exception. This is what

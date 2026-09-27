@@ -57,7 +57,7 @@ The handful you are most likely to change:
 | `COINGECKO_API_KEY` | — | Enables CEX-listing scoring (never applies to Robinhood). |
 | `USE_GECKOTERMINAL` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list, so prefer `true`. |
 | `GT_SOURCES` | `new_pools,trending` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. |
-| `USE_SIGNALS` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. |
+| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
 | `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. |
 | `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. |
 | `SIG_MAX_AGE_MINUTES` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
@@ -197,6 +197,28 @@ redeploys.
 python -m unittest -v test_signals test_discovery test_features
 ```
 
+## Research tooling (`diag/`)
+
+Offline tools for asking *why* the bot missed something, without running a
+scan. They share no state with the bot and are safe to run alongside it (read-only
+against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
+
+| Tool | What it answers |
+|---|---|
+| `diag/component_audit.py` | **Do the score components rank forward returns?** Rebuilds trailing windows from 5-minute OHLCV for a pool universe, scores every bar with the bot's real functions, and reports rank correlation, a per-pool sign test and AUC for ≥10/25/50/100 % moves. |
+| `diag/holders_from_logs.py` | **Exact top-10/50/100 holder concentration, free.** Replays every `Transfer` log over Base JSON-RPC. Self-validating: it reproduces GeckoTerminal's published bands. |
+| `diag/legs_boar.py` | The `boar` case study: what the model scored at each bar of the move, and what the price did next. |
+| `diag/log_boar_row.py` | The exact `features` row the bot would write for any token, no scan required. |
+| `diag/repro_boar.py` | Reproduces the hard-reject decision for the boar fixtures. |
+| `diag/compare_decisions.py` | **Decision-neutrality check.** Runs 13 fixture cases through two revisions of `bot.py` and exits non-zero if any reject reason or alert decision changed — use it before shipping a refactor of `evaluate_token`. |
+
+```bash
+bot-env/bin/python diag/component_audit.py --pages 3 --csv diag/.cache/audit.csv
+bot-env/bin/python diag/holders_from_logs.py 0xTokenAddress
+bot-env/bin/python diag/compare_decisions.py            # HEAD vs working tree
+python -m unittest -v test_audit_tools
+```
+
 ## Training data
 
 Set `LOG_FEATURES=true` and the bot writes one row per token evaluation — including
@@ -206,6 +228,30 @@ security flags, signal-engine bonus/penalty, the hand-tuned score, and whether a
 alert was sent. It is fire-and-forget (a background thread writes it), so the
 scanner never slows down.
 
+Two properties matter when the table is used to find out *why* a runner was
+missed:
+
+- **Every row carries the raw inputs, even floor rejects.** The metrics are read
+  before the per-chain floors (`liquidity`, `vol_5m`, `market_cap`, `price`), so a
+  token dropped early is still a usable row rather than a row of zeros. Before
+  this, a thin 5-minute read was indistinguishable from a token that never traded.
+- **The score is recorded as a breakdown, not just a total.** `score_vol_liq`,
+  `score_vol_5m_1h`, `score_vol_1h_6h`, `score_vol_6h_24h`, `score_buy_5m`,
+  `score_buy_1h`, `score_price`, `score_holder`, `score_security`, `score_cex`
+  and `penalties_total` sum to `hand_score`, so a token that scored 48 against a
+  bar of 64 can be attributed to the components that withheld the points.
+  `ceiling_score` is the reachable maximum the bar was scaled against, and
+  `alert_threshold` is the bar itself — recorded provisionally even for rows
+  rejected before the holder lookup runs.
+
+```sql
+-- How close did each token ever get, and what stopped it?
+SELECT symbol, chain, MAX(hand_score) AS best, MAX(ceiling_score) AS ceiling,
+       MAX(alert_threshold) AS bar, MAX(reject_reasons) AS last_reason,
+       COUNT(*) AS scans
+FROM features GROUP BY chain, token_address ORDER BY best * 1.0 / ceiling DESC;
+```
+
 `label_outcomes.py` turns those rows into supervised labels using the forward
 maximum price each token reached (the repeated scans act as the price series):
 
@@ -213,6 +259,12 @@ maximum price each token reached (the repeated scans act as the price series):
 python label_outcomes.py                      # writes max_mult_1h/6h/24h + hit_Nx_* labels
 python label_outcomes.py --fetch-current      # also label the newest rows from live prices
 python label_outcomes.py --export training.csv
+```
+
+To see the exact row the bot would write for any token, without running a scan:
+
+```bash
+bot-env/bin/python diag/log_boar_row.py [token_address]   # defaults to the boar case
 ```
 
 Then train offline, e.g. logistic regression on "did it 2× within 24h":

@@ -26,6 +26,9 @@ logs/
 *.sqlite3
 coingecko_id_cache.json
 
+# --- research tool caches (GeckoTerminal OHLCV / pool listings) ---
+diag/.cache/
+
 # --- os ---
 .DS_Store
 Thumbs.db

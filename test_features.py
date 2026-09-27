@@ -84,6 +84,52 @@ class TestFeatureLogger(unittest.TestCase):
         conn.close()
         self.assertEqual(count, 0)
 
+    def test_migration_adds_new_columns_to_an_existing_table(self):
+        """A deployment's existing features table must gain the new columns.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing table, so the
+        added score-breakdown columns only appear because ``init_db`` calls
+        ``ensure_feature_columns``.
+        """
+        db = os.path.join(self.tmpdir, "old.db")
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE features (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "ts_utc TEXT, chain TEXT, token_address TEXT, hand_score REAL, "
+            "rejected INTEGER, reject_reasons TEXT)"
+        )
+        conn.commit()
+
+        bot.ensure_feature_columns(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(features)")}
+        conn.close()
+
+        for field in ("score_vol_liq", "score_buy_5m", "penalties_total",
+                      "ceiling_score", "score_holder", "score_cex"):
+            self.assertIn(field, cols, f"{field} was not migrated onto the old table")
+
+    def test_writer_persists_the_score_breakdown(self):
+        logger = bot.FeatureLogger(self.db, enabled=True)
+        logger.start()
+        row = bot._empty_feature()
+        row.update({
+            "ts_utc": "2026-09-26T13:53:00+00:00", "ts_epoch": 1.0,
+            "chain": "base", "token_address": "0xboar", "symbol": "boar",
+            "score_vol_liq": 4.0, "score_buy_5m": 6.0, "score_price": 0.0,
+            "penalties_total": 0.0, "ceiling_score": 98.25,
+            "hand_score": 48.0, "alert_threshold": 63.86,
+        })
+        logger.log_row(row)
+        logger.stop()
+
+        conn = sqlite3.connect(self.db)
+        got = conn.execute(
+            "SELECT score_vol_liq, penalties_total, ceiling_score, hand_score, "
+            "alert_threshold FROM features"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(got, (4.0, 0.0, 98.25, 48.0, 63.86))
+
 
 class TestLabelOutcomes(unittest.TestCase):
     def setUp(self):
@@ -314,6 +360,164 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(lambda: os.environ.pop("BASE_MIN_LIQUIDITY_USD", None))
         self.assertEqual(bot._chain_floor("base", "MIN_LIQUIDITY_USD", 8000.0), 50000.0)
         self.assertEqual(bot._chain_floor("bsc", "MIN_LIQUIDITY_USD", 8000.0), 8000.0)
+
+
+class _RecordingLogger:
+    """Stands in for the FeatureLogger so tests can read the rows as logged."""
+
+    def __init__(self):
+        self.rows = []
+
+    def log_row(self, row):
+        self.rows.append(dict(row))
+
+    def mark_alert_sent(self, *a, **k):
+        pass
+
+    def stats(self):
+        return {}
+
+
+class TestScoreBreakdownLogging(unittest.IsolatedAsyncioTestCase):
+    """Every evaluation must leave a row a model can actually learn from.
+
+    Two regressions are pinned here, both of which bit on the boar miss:
+
+    * a floor reject used to be logged with zeros for every window and ratio,
+      because the block that filled them sat *after* the floor checks;
+    * only the hand total was stored, so "48 against a bar of 64" could not be
+      attributed to the components that withheld the points.
+    """
+
+    async def asyncSetUp(self):
+        import signals as signals_module
+
+        self._saved = {
+            "FEATURE_LOGGER": bot.FEATURE_LOGGER,
+            "USE_SIGNALS": bot.USE_SIGNALS,
+            "SIGNAL_FILTERS": bot.SIGNAL_FILTERS,
+            "SIGNAL_BONUS_WEIGHT": bot.SIGNAL_BONUS_WEIGHT,
+            "EARLY_RUNNER_MODE": bot.EARLY_RUNNER_MODE,
+            "ALERT_THRESHOLD": bot.ALERT_THRESHOLD,
+            "PHASE1_MIN_SCORE": bot.PHASE1_MIN_SCORE,
+            "PAIR_HISTORY": bot.PAIR_HISTORY,
+            "get_token_security": bot.get_token_security,
+            "get_holder_concentration": bot.get_holder_concentration,
+            "get_cex_listings": bot.get_cex_listings,
+        }
+        self.recorder = _RecordingLogger()
+        bot.FEATURE_LOGGER = self.recorder
+        bot.USE_SIGNALS = True
+        bot.SIGNAL_FILTERS = signals_module.Filters()
+        bot.PAIR_HISTORY = signals_module.PairHistory()
+        bot.SIGNAL_BONUS_WEIGHT = 0.0
+        bot.PHASE1_MIN_SCORE = 0
+        bot.security_cache.clear()
+
+    async def asyncTearDown(self):
+        for key, value in self._saved.items():
+            setattr(bot, key, value)
+        bot.security_cache.clear()
+
+    def _pair(self, **over):
+        now_ms = time.time() * 1000
+        pair = {
+            "chainId": "base", "dexId": "uniswap_v4", "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "MEH", "name": "Meh"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.001", "priceNative": "0.000001",
+            "liquidity": {"usd": 10_000.0}, "marketCap": 100_000.0,
+            "volume": {"m5": 1_000.0, "h1": 5_000.0, "h6": 20_000.0, "h24": 60_000.0},
+            "txns": {"m5": {"buys": 10, "sells": 5, "buyers": 8, "sellers": 4},
+                     "h1": {"buys": 30, "sells": 20}},
+            "priceChange": {"m5": 1.0, "h1": 5.0, "h6": 10.0, "h24": 20.0},
+            "pairCreatedAt": now_ms - 60 * 60 * 1000,
+            "source": "test",
+        }
+        pair.update(over)
+        return pair
+
+    def _install_scaffold(self, holders=None, cex=(0, False, 0)):
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("goplus")
+            sec.update({"is_open_source": True, "lp_locked": True, "source": "goplus"})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return holders if holders is not None else bot.HolderData()
+
+        async def fake_cex(session, chain, token):
+            return cex
+
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+
+    async def test_floor_reject_still_carries_the_raw_metrics(self):
+        """A thin-liquidity reject is still a usable training row."""
+        self._install_scaffold()
+        pair = self._pair(liquidity={"usd": 500.0}, marketCap=90_000.0,
+                          volume={"m5": 400.0, "h1": 900.0, "h6": 1_200.0, "h24": 2_000.0})
+
+        self.assertIsNone(await bot.evaluate_token(None, pair))
+
+        self.assertEqual(len(self.recorder.rows), 1)
+        row = self.recorder.rows[0]
+        self.assertEqual(row["rejected"], 1)
+        self.assertEqual(row["reject_reasons"], "liquidity")
+        # The metrics that used to be lost:
+        self.assertEqual(row["liquidity_usd"], 500.0)
+        self.assertEqual(row["market_cap_usd"], 90_000.0)
+        self.assertEqual(row["vol_5m"], 400.0)
+        self.assertEqual(row["vol_5m_1h"], 400.0 / 900.0)
+        self.assertEqual(row["buys_5m"], 10)
+        self.assertIsNotNone(row["age_minutes"])
+        self.assertGreater(row["ceiling_score"], 0)
+        # Not reached, so legitimately absent rather than a wrong zero.
+        self.assertIsNone(row["hand_score"])
+
+    async def test_components_reconstruct_the_hand_score(self):
+        """Sum of the logged components minus penalties must equal hand_score."""
+        self._install_scaffold()
+        bot.ALERT_THRESHOLD = 0  # exercise the scored path, not the gate
+        pair = self._pair()
+
+        result = await bot.evaluate_token(None, pair)
+        self.assertIsNotNone(result, "sanity: the fixture should clear the gate")
+
+        row = self.recorder.rows[0]
+        components = [
+            "score_vol_liq", "score_vol_5m_1h", "score_vol_1h_6h", "score_vol_6h_24h",
+            "score_buy_5m", "score_buy_1h", "score_price",
+            "score_holder", "score_security", "score_cex",
+        ]
+        for name in components:
+            self.assertIsNotNone(row[name], f"{name} must be logged on a scored row")
+
+        total = sum(float(row[name]) for name in components)
+        rebuilt = max(0.0, total - float(row["penalties_total"]))
+        self.assertAlmostEqual(rebuilt, float(row["hand_score"]), places=6)
+        # The bar is a fraction of the ceiling; storing both makes the margin
+        # interpretable ("48 of a reachable 98", not "48 of 64").
+        self.assertGreater(row["ceiling_score"], 0)
+        self.assertLessEqual(row["alert_threshold"], row["ceiling_score"])
+
+    async def test_signal_veto_still_logs_the_components(self):
+        """The deep-pool/thin-5m case (boar): vetoed, but fully attributed."""
+        self._install_scaffold()
+        pair = self._pair(liquidity={"usd": 25_000.0},
+                          volume={"m5": 1_000.0, "h1": 40_000.0,
+                                  "h6": 120_000.0, "h24": 300_000.0})
+
+        self.assertIsNone(await bot.evaluate_token(None, pair))
+
+        row = self.recorder.rows[0]
+        self.assertIn("low_activity", row["reject_reasons"])
+        self.assertIn("score_vol_liq", row)
+        self.assertIsNotNone(row["score_vol_liq"])
+        self.assertIsNotNone(row["penalties_total"])
+        self.assertEqual(row["hand_score"], None,
+                         "a vetoed token has no hand score; components explain why")
 
 
 if __name__ == "__main__":
