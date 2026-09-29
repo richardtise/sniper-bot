@@ -253,3 +253,51 @@ class TestPaginationAndSplitTTL(unittest.TestCase):
 
         cands = asyncio.run(run())
         self.assertEqual(len(cands), 1)
+
+
+class TestPerSourcePages(unittest.TestCase):
+    """Freshness is per source: new_pools page 1 is the newest cohort, while
+    trending rewards depth. One page count for everything wasted calls on the
+    feed where depth buys least."""
+
+    def test_source_pages_override_max_pages_per_kind(self):
+        fetch = FakeFetch({
+            "new_pools?page=1": payload([gt_pool(address="0xn1", token="0xn1t")]),
+            "new_pools?page=2": payload([gt_pool(address="0xn2", token="0xn2t",
+                                                 symbol="DEEP")]),
+            "trending_pools?page=1": payload([gt_pool(address="0xt1", token="0xt1t",
+                                                      symbol="TREND1")]),
+            "trending_pools?page=2": payload([gt_pool(address="0xt2", token="0xt2t",
+                                                      symbol="TREND2")]),
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=0,
+                           page_size=1,
+                           source_pages={"new_pools": 1, "trending": 2})
+
+        async def run():
+            return await gt.candidates("bsc", kinds=("new_pools", "trending"))
+
+        cands = asyncio.run(run())
+        symbols = {p["baseToken"]["symbol"] for p in cands}
+        # new_pools stopped at page 1 (its override), trending walked to page 2.
+        self.assertEqual(symbols, {"RUN", "TREND1", "TREND2"})
+        self.assertFalse(any("new_pools?page=2" in u for u in fetch.calls))
+        self.assertTrue(any("trending_pools?page=2" in u for u in fetch.calls))
+
+    def test_pages_kwarg_still_overrides_every_source(self):
+        fetch = FakeFetch({
+            "new_pools?page=1": payload([gt_pool(address="0xn1", token="0xn1t")]),
+            "new_pools?page=2": payload([gt_pool(address="0xn2", token="0xn2t",
+                                                 symbol="DEEP")]),
+            "trending_pools?page=1": payload([gt_pool(address="0xt1", token="0xt1t",
+                                                      symbol="TREND1")]),
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=0, page_size=1,
+                           source_pages={"new_pools": 1, "trending": 2})
+
+        async def run():
+            return await gt.candidates("bsc", kinds=("new_pools", "trending"), pages=1)
+
+        cands = asyncio.run(run())
+        self.assertEqual({p["baseToken"]["symbol"] for p in cands}, {"RUN", "TREND1"})
+        self.assertFalse(any("page=2" in u for u in fetch.calls))

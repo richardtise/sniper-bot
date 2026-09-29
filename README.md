@@ -56,9 +56,10 @@ The handful you are most likely to change:
 | `MORALIS_API_KEY` | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
 | `COINGECKO_API_KEY` | — | Enables CEX-listing scoring (never applies to Robinhood). |
 | `USE_GECKOTERMINAL` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list, so prefer `true`. |
-| `GT_SOURCES` | `new_pools,trending,top_volume` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. `top_volume` = liquid universe between the two — catches runners neither brand-new nor page-1 trending. |
-| `GT_PAGES` | `3` | Pages walked per source per chain. Page 1 of `new_pools` covers ~2–4 min of births; 1 page samples the firehose. 3 is ~the free-tier max across 4 chains + holder lookups. |
+| `GT_SOURCES` | `new_pools,trending,top_volume` | `new_pools` = earliest (only feed carrying a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` makes a sub-50k entry mathematically impossible. |
+| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort (page 2 is 5–7m, page 3 is 7–9m), so depth there buys little; `trending` rewards a second page. Each page is one call against the shared GT budget. |
 | `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
+| `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (off) | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Set e.g. `200000` for early-entries-only. |
 | `NEAR_MISS_POINTS` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
 | `WATCHLIST_ENABLED` | `true` | Re-price pools that dropped out of the feeds (born quiet, runs days later — the CATTO shape). DexScreener lookups, no GT budget cost. |
 | `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
@@ -113,6 +114,57 @@ noise trade-off, not a free win** — pass 2 of this repo had to be reverted bec
 an additive bonus flooded Base with junk. Raise `SIGNAL_BONUS_WEIGHT` in small
 steps and watch what arrives. `VERBOSE_LOGGING=true` prints
 `score (hand=X/threshold)` on every evaluation so you can see the margin.
+
+## Detection latency — "why do I only get pinged after the pump?"
+
+Being late is two different failures that look identical in a log full of reject
+reasons, and they need opposite fixes:
+
+* **discovery latency** — the bot never *looked* at the pool until it was big; or
+* **gate latency** — the bot looked early and the score/threshold said no.
+
+A hard mcap ceiling or looser filters only address the second. If the feed never
+carried the pool while it was small, no amount of filter tuning can help.
+
+**The feeds are not interchangeable.** Measured on Robinhood Chain 2026-09-29:
+
+| Source | Age of pools offered | Median mcap |
+|---|---|---|
+| `new_pools` page 1 | **3.2 – 5.5 min** | **$6,663** (15/20 under $50k) |
+| `new_pools` page 3 | 7.1 – 9.2 min | $4,687 |
+| `trending` pages 1–3 | 234 min – 133,194 min (median ~31 days) | $3,537,366 |
+| `top_volume` page 1 | median 24 h | $12,407,781 |
+
+`trending` and `top_volume` are *lagging*: the youngest pool trending could offer
+was 234 minutes old and already past $300k. Running them without `new_pools` makes
+a sub-50k entry **mathematically impossible** — the pool only ever enters the
+pipeline after the move that made it trend. That is the single most common cause
+of "it pings me at $3M".
+
+Two structural guarantees now protect latency:
+
+1. **Discovery runs for every chain before any evaluation.** The loop used to
+   interleave discover→evaluate per chain, and because holder lookups draw on the
+   same GeckoTerminal budget as discovery, the last chain in `NETWORKS`
+   (`robinhood`) was not even *listed* until minutes into the cycle. Discovery is
+   now Phase A for all chains; enrichment is Phase B.
+2. **Page depth is per source.** Page 1 of `new_pools` *is* the newest cohort, so
+   depth there buys little, while `trending` rewards a second page
+   (`GT_PAGES_NEW=1`, `GT_PAGES_TRENDING=2`, `GT_PAGES_TOP=1`).
+
+**Read the latency straight off the log.** Every token is logged once, before any
+floor can reject it:
+
+```
+FIRST SIGHT PSF@robinhood age=2.0m mcap=$12,256 liq=$13,919 v5=$3,551 [geckoterminal:new_pools]
+```
+
+That line is the answer to "was I early?": `age` is how long the pool had existed
+at first sighting, `mcap` is what it was worth then. If first sightings cluster at
+`age=180m mcap=$3M`, discovery is the problem (wrong `GT_SOURCES`). If they cluster
+at `age=3m mcap=$6k` and you still get no alert, the gate is the problem — and
+`NEAR_MISS_POINTS` plus the `features` table will show which component withheld
+the points.
 
 ## Alert gate
 

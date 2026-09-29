@@ -523,3 +523,159 @@ class TestScoreBreakdownLogging(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestFirstSightLatency(unittest.IsolatedAsyncioTestCase):
+    """The log must answer "was it seen early?" independently of the gate.
+
+    Detection latency and score are separate failures that look identical in a
+    reject-only log. First sight is therefore logged *before* the floors, so a
+    token that is instantly rejected still records the age/mcap at which the
+    scanner first laid eyes on it.
+    """
+
+    async def asyncSetUp(self):
+        self._saved_first_sight = dict(bot._first_sight)
+        bot._first_sight.clear()
+        self._saved_logger = bot.FEATURE_LOGGER
+
+    async def asyncTearDown(self):
+        bot._first_sight.clear()
+        bot._first_sight.update(self._saved_first_sight)
+        bot.FEATURE_LOGGER = self._saved_logger
+
+    def _young_pair(self, **over):
+        now_ms = time.time() * 1000
+        pair = {
+            "chainId": "robinhood", "dexId": "uniswap", "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "CATTO", "name": "Catto"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.00001", "priceNative": "0.000000001",
+            # Deliberately below the liquidity floor: the sighting must still log.
+            "liquidity": {"usd": 4_500.0}, "marketCap": 6_000.0,
+            "volume": {"m5": 520.0, "h1": 900.0, "h6": 900.0, "h24": 900.0},
+            "txns": {"m5": {"buys": 6, "sells": 1, "buyers": 5, "sellers": 1},
+                     "h1": {"buys": 6, "sells": 1}},
+            "priceChange": {"m5": 3.0, "h1": 3.0, "h6": 3.0, "h24": 3.0},
+            "pairCreatedAt": now_ms - 3 * 60 * 1000,   # three minutes old
+            "source": "geckoterminal:new_pools",
+        }
+        pair.update(over)
+        return pair
+
+    async def test_first_sight_logs_age_and_mcap_before_floors(self):
+        with self.assertLogs("pump_bot_v5", level="INFO") as cm:
+            result = await bot.evaluate_token(None, self._young_pair())
+
+        self.assertIsNone(result, "sanity: this fixture must fail a floor")
+        text = "\n".join(cm.output)
+        self.assertIn("FIRST SIGHT CATTO@robinhood", text)
+        self.assertIn("mcap=$6,000", text)
+        self.assertIn("liq=$4,500", text)
+        self.assertIn("geckoterminal:new_pools", text)
+        # ~3 minutes old: proves the sighting is timestamped, not just counted.
+        self.assertIn("age=3.0m", text)
+
+    async def test_first_sight_logged_only_once_per_token(self):
+        pair = self._young_pair()
+        with self.assertLogs("pump_bot_v5", level="INFO") as first:
+            await bot.evaluate_token(None, pair)
+        self.assertIn("FIRST SIGHT", "\n".join(first.output))
+
+        # A second evaluation of the same token must not re-log the sighting.
+        with self.assertNoLogs("pump_bot_v5", level="INFO"):
+            await bot.evaluate_token(None, pair)
+
+
+class TestMarketCapCeiling(unittest.IsolatedAsyncioTestCase):
+    """A mcap floor without a ceiling alerts on tokens that have already run.
+
+    2026-09-29: the scanner pinged a $3M and a $22M token. Nothing in the code
+    said "too big to enter" — MAX_MARKET_CAP_USD defaults to 0 (disabled), so
+    these tests pin both the rejection and the no-op default.
+    """
+
+    async def asyncSetUp(self):
+        self._saved = {
+            "FEATURE_LOGGER": bot.FEATURE_LOGGER,
+            "USE_SIGNALS": bot.USE_SIGNALS,
+            "PHASE1_MIN_SCORE": bot.PHASE1_MIN_SCORE,
+            "ALERT_THRESHOLD": bot.ALERT_THRESHOLD,
+            "get_token_security": bot.get_token_security,
+            "get_holder_concentration": bot.get_holder_concentration,
+            "get_cex_listings": bot.get_cex_listings,
+        }
+        self._saved_env = os.environ.get("MAX_MARKET_CAP_USD")
+        self.recorder = _RecordingLogger()
+        bot.FEATURE_LOGGER = self.recorder
+        bot.USE_SIGNALS = False
+        bot.PHASE1_MIN_SCORE = 0
+        # These tests are about the ceiling, not the score gate.
+        bot.ALERT_THRESHOLD = 0
+
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("goplus")
+            sec.update({"is_open_source": True, "lp_locked": True, "source": "goplus"})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return bot.HolderData()
+
+        async def fake_cex(session, chain, token):
+            return (0, False, 0)
+
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+
+    async def asyncTearDown(self):
+        for key, value in self._saved.items():
+            setattr(bot, key, value)
+        if self._saved_env is None:
+            os.environ.pop("MAX_MARKET_CAP_USD", None)
+        else:
+            os.environ["MAX_MARKET_CAP_USD"] = self._saved_env
+
+    def _pair(self, market_cap):
+        now_ms = time.time() * 1000
+        return {
+            "chainId": "robinhood", "dexId": "uniswap", "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "STKDOG", "name": "Dog"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.00002", "priceNative": "0.000000008",
+            "liquidity": {"usd": 519_343.0}, "marketCap": market_cap,
+            "volume": {"m5": 210_931.0, "h1": 3_236_015.0,
+                       "h6": 10_293_411.0, "h24": 10_293_411.0},
+            "txns": {"m5": {"buys": 114, "sells": 78, "buyers": 90, "sellers": 60},
+                     "h1": {"buys": 1626, "sells": 1201}},
+            "priceChange": {"m5": 30.64, "h1": 44.56, "h6": 5824.0, "h24": 5824.0},
+            "pairCreatedAt": now_ms - 180 * 60 * 1000,
+            "source": "geckoterminal:trending",
+        }
+
+    async def test_ceiling_rejects_already_run_token(self):
+        os.environ["MAX_MARKET_CAP_USD"] = "200000"
+        self.assertIsNone(await bot.evaluate_token(None, self._pair(2_183_213.0)))
+        row = self.recorder.rows[-1]
+        self.assertEqual(row["reject_reasons"], "mcap_too_high")
+        # The metrics are still logged — a ceiling reject stays studyable.
+        self.assertEqual(row["market_cap_usd"], 2_183_213.0)
+
+    async def test_ceiling_allows_an_early_sized_token(self):
+        os.environ["MAX_MARKET_CAP_USD"] = "200000"
+        result = await bot.evaluate_token(None, self._pair(45_000.0))
+        self.assertIsNotNone(result, "a $45k mcap must not hit the ceiling")
+
+    async def test_ceiling_disabled_by_default(self):
+        os.environ.pop("MAX_MARKET_CAP_USD", None)
+        result = await bot.evaluate_token(None, self._pair(2_183_213.0))
+        self.assertIsNotNone(result, "0/unset must keep the old permissive behaviour")
+
+    async def test_per_chain_ceiling_override(self):
+        os.environ.pop("MAX_MARKET_CAP_USD", None)
+        os.environ["ROBINHOOD_MAX_MARKET_CAP_USD"] = "100000"
+        try:
+            self.assertIsNone(await bot.evaluate_token(None, self._pair(2_183_213.0)))
+            self.assertEqual(self.recorder.rows[-1]["reject_reasons"], "mcap_too_high")
+        finally:
+            os.environ.pop("ROBINHOOD_MAX_MARKET_CAP_USD", None)

@@ -1041,6 +1041,34 @@ def db_log_paper_trade(chain, token_address, symbol, action, amount_native, amou
     )
     db_conn.commit()
 
+# ── First-sight latency instrumentation ──────────────────────────────────────
+# "It only pings me after the pump" is a question about *detection* latency, not
+# scoring, and the two are invisible to each other in a log full of reject
+# reasons. This records the first moment the scanner ever sees a token and logs
+# its age and mcap right then, so the log itself answers whether a runner was
+# seen at $6k on minute 3 (early, and the gate is the problem) or at $3M on hour
+# 5 (discovery is the problem). Deliberately logged *before* the floors so a
+# first sighting is recorded even when the token is instantly rejected.
+_first_sight: Dict[str, float] = {}
+FIRST_SIGHT_TTL = 6 * 3600
+
+
+def _first_sight_note(chain, token, symbol, pair, *, liquidity, market_cap, age_minutes):
+    """Log a token the first time the scanner sees it, with age and mcap."""
+    key = f"{chain}:{str(token).lower()}"
+    now = time.time()
+    if key in _first_sight:
+        return
+    _first_sight[key] = now
+    v5 = float((pair.get("volume") or {}).get("m5") or 0)
+    src = str(pair.get("source") or "?")
+    age_txt = f"{age_minutes:.1f}m" if age_minutes is not None else "?"
+    logger.info(
+        f"FIRST SIGHT {symbol}@{chain} age={age_txt} mcap=${market_cap:,.0f} "
+        f"liq=${liquidity:,.0f} v5=${v5:,.0f} [{src}]"
+    )
+
+
 def prune_caches():
     now = time.time()
     for cache, ttl in [(security_cache, 1800), (coingecko_ticker_cache, 7200)]:
@@ -1050,6 +1078,9 @@ def prune_caches():
     stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
     for k in stale:
         del holder_cache[k]
+    stale = [k for k, ts in _first_sight.items() if now - ts > FIRST_SIGHT_TTL]
+    for k in stale:
+        del _first_sight[k]
     if PAIR_HISTORY is not None:
         PAIR_HISTORY.prune(now)
 
@@ -1235,17 +1266,22 @@ async def get_geckoterminal_pairs(session, network):
     Replaces the DexScreener `latest/dex/pairs/{chain}` call, which 404s and
     silently left the scanner with only paid boost/profile tokens.
 
-    Depth is tunable per deployment: GT_PAGES (default 3) walks that many
-    pages per source, GT_SOURCES may include top_volume (the liquid universe
-    between "just born" and "already trending"), and GT_LIST_TTL_* keep the
-    fast-churn new_pools feed fresh without re-fetching top_volume every
-    cycle. All of it shares the GT_MIN_INTERVAL_S budget with holder lookups.
+    Depth is tunable per deployment and per source: GT_PAGES_NEW (default 1),
+    GT_PAGES_TRENDING (2), GT_PAGES_TOP (1). Page 1 of new_pools is the newest
+    birth cohort — that freshness is the whole point of the feed — so depth
+    there buys less than it costs, while trending rewards a second page. All of
+    it shares the GT_MIN_INTERVAL_S budget with holder lookups.
     """
     global _gt_client
     sources = tuple(
-        s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending").split(",") if s.strip()
+        s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending,top_volume").split(",")
+        if s.strip()
     )
-    pages = max(1, int(os.getenv("GT_PAGES", "3") or 3))
+    source_pages = {
+        "new_pools": max(1, int(os.getenv("GT_PAGES_NEW", "1") or 1)),
+        "trending": max(1, int(os.getenv("GT_PAGES_TRENDING", "2") or 2)),
+        "top_volume": max(1, int(os.getenv("GT_PAGES_TOP", "1") or 1)),
+    }
     list_ttls = {
         "new_pools": float(os.getenv("GT_LIST_TTL_NEW", "30") or 30),
         "trending": float(os.getenv("GT_LIST_TTL_TRENDING", "60") or 60),
@@ -1256,15 +1292,17 @@ async def get_geckoterminal_pairs(session, network):
         # min_interval_s=0: gt_fetch_json already applies the shared budget, and
         # stacking a second 2.1s wait would halve throughput for no benefit.
         _gt_client = discovery.GeckoTerminal(
-            fetcher, min_interval_s=0.0, list_ttls=list_ttls, max_pages=pages,
+            fetcher, min_interval_s=0.0, list_ttls=list_ttls,
+            max_pages=1, source_pages=source_pages,
         )
     else:
         _gt_client.fetch = fetcher
         _gt_client.list_ttls = dict(list_ttls)
-        _gt_client.max_pages = max(1, pages)
+        _gt_client.source_pages = dict(source_pages)
     pairs = await _gt_client.candidates(network, kinds=sources)
     pairs.sort(key=lambda x: float((x.get("volume") or {}).get("m5", 0) or 0), reverse=True)
-    logger.info(f"{network}: {len(pairs)} GeckoTerminal candidates ({','.join(sources)}x{pages}p)")
+    depth_txt = ",".join(f"{k}:{source_pages.get(k, 1)}" for k in sources)
+    logger.info(f"{network}: {len(pairs)} GeckoTerminal candidates ({','.join(sources)}) [{depth_txt}p]")
     return pairs[:300]
 
 
@@ -2027,6 +2065,13 @@ async def evaluate_token(session, pair):
     min_liq = _chain_floor(chain, "MIN_LIQUIDITY_USD", default_liq)
     min_vol_5m = _chain_floor(chain, "MIN_VOL_5M_USD", MIN_VOL_5M_USD)
     min_mcap = _chain_floor(chain, "MIN_MARKET_CAP_USD", MIN_MARKET_CAP_USD)
+    # Alert ceiling — the "too late to be worth entering" cut. A floor alone
+    # let the scanner alert on $3M and $22M tokens that had already run; an
+    # early-entry bot needs the other bound too. 0 (the default) disables it,
+    # so behaviour is unchanged unless MAX_MARKET_CAP_USD is set explicitly.
+    max_mcap = _chain_floor(
+        chain, "MAX_MARKET_CAP_USD", float(os.getenv("MAX_MARKET_CAP_USD", "0") or 0)
+    )
 
     # ── Raw metrics are read *before* the floors ────────────────────────────
     # The floors below return early, and a return used to leave the row with
@@ -2089,10 +2134,17 @@ async def evaluate_token(session, pair):
         ),
     })
 
+    # Detection-latency probe: record and log the first time this token is ever
+    # seen, before any floor can reject it. See _first_sight_note.
+    _first_sight_note(chain, token, symbol, pair,
+                      liquidity=liquidity, market_cap=market_cap,
+                      age_minutes=age_minutes)
+
     # ── Floors (same order as before: first failure still wins the label) ────
     if liquidity < min_liq: return reject("liquidity")
     if price < MIN_PRICE: return reject("price_too_low")
     if market_cap < min_mcap: return reject("market_cap")
+    if max_mcap and market_cap > max_mcap: return reject("mcap_too_high")
     if vol_5m < min_vol_5m: return reject("vol_5m")
     if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
         return reject("robinhood_too_new")
@@ -3680,11 +3732,31 @@ async def bot_task():
                     )
                     last_heartbeat_time = time.time()
 
+                # ── Phase A: discovery for EVERY chain, before any evaluation ──
+                # This used to interleave discover→evaluate per chain, which
+                # made detection latency depend on chain order: the holder
+                # lookups for BSC/ETH/Base all draw on the same GeckoTerminal
+                # budget as discovery, so Robinhood — last in NETWORKS, and
+                # where the early runners are — did not even get *listed* until
+                # minutes into the cycle. Discovery is cheap (listing calls
+                # only); doing all of it first means every chain sees the
+                # current feed, then enrichment can spend the budget.
+                discovered: Dict[str, list] = {}
                 for network in NETWORKS:
-                    if shutdown_flag: break
+                    if shutdown_flag:
+                        break
                     pairs = await get_all_pairs(session, network)
+                    discovered[network] = pairs
                     total_pairs_scanned += len(pairs)
-                    logger.info(f"{network}: {len(pairs)} pairs to evaluate")
+                    logger.info(f"{network}: {len(pairs)} pairs discovered")
+
+                # ── Phase B: evaluate the discovered candidates ───────────────
+                for network in NETWORKS:
+                    if shutdown_flag:
+                        break
+                    pairs = discovered.get(network) or []
+                    if not pairs:
+                        continue
                     tasks = [evaluate_token(session, p) for p in pairs]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     cycle_alerts += await dispatch_alerts(results)

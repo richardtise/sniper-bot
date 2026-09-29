@@ -240,6 +240,7 @@ class GeckoTerminal:
         list_ttls: Optional[Dict[str, float]] = None,
         max_pages: int = 1,
         page_size: int = 20,
+        source_pages: Optional[Dict[str, int]] = None,
     ) -> None:
         self.fetch = fetch
         self.min_interval_s = min_interval_s
@@ -251,10 +252,24 @@ class GeckoTerminal:
         # Page 1 of new_pools only covers ~2-4 minutes of births, so 1 page
         # samples the firehose instead of scanning it.
         self.max_pages = max(1, int(max_pages))
+        # Per-source page overrides, e.g. {"new_pools": 1, "trending": 2}.
+        # Freshness matters far more on new_pools (page 1 is the newest
+        # cohort) than on trending/top_volume, so depth belongs per source
+        # rather than one number for everything — every extra page is a call
+        # against the shared ~30/min GeckoTerminal budget.
+        self.source_pages: Dict[str, int] = {
+            k: max(1, int(v)) for k, v in (source_pages or {}).items()
+        }
         self.page_size = max(1, int(page_size))
         self._last_call = 0.0
         self._lock = asyncio.Lock()
         self._cache: Dict[str, Tuple[Any, float]] = {}
+
+    def _pages_for(self, kind: Optional[str]) -> int:
+        """Pages to walk for one source: per-source override, else max_pages."""
+        if kind and kind in self.source_pages:
+            return self.source_pages[kind]
+        return self.max_pages
 
     def _ttl_for(self, kind: Optional[str]) -> float:
         if kind and kind in self.list_ttls:
@@ -321,13 +336,14 @@ class GeckoTerminal:
         """Fetch + dedupe candidates for one chain (one best pool per token).
 
         Walks up to ``pages`` (default: the ``max_pages`` configured on the
-        client) starting at ``page`` for every source kind, so a runner that
-        sits on page 2 of trending — or was born 6 minutes ago instead of 2 —
-        is still seen. Same-chain duplicates collapse to the deepest pool.
+        client, or the per-source ``source_pages`` override) starting at
+        ``page`` for every source kind, so a runner that sits on page 2 of
+        trending — or was born 6 minutes ago instead of 2 — is still seen.
+        Same-chain duplicates collapse to the deepest pool.
         """
-        depth = max(1, int(pages) if pages is not None else self.max_pages)
         gathered: List[dict] = []
         for kind in kinds:
+            depth = max(1, int(pages)) if pages is not None else self._pages_for(kind)
             for p in range(page, page + depth):
                 batch = await self.list_pools(chain, kind=kind, page=p)
                 if not batch:
