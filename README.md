@@ -56,16 +56,20 @@ The handful you are most likely to change:
 | `MORALIS_API_KEY` | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
 | `COINGECKO_API_KEY` | — | Enables CEX-listing scoring (never applies to Robinhood). |
 | `USE_GECKOTERMINAL` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list, so prefer `true`. |
-| `GT_SOURCES` | `new_pools,trending` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. |
+| `GT_SOURCES` | `new_pools,trending,top_volume` | `trending` = momentum (cleaner). `new_pools` = earliest, noisiest. `top_volume` = liquid universe between the two — catches runners neither brand-new nor page-1 trending. |
+| `GT_PAGES` | `3` | Pages walked per source per chain. Page 1 of `new_pools` covers ~2–4 min of births; 1 page samples the firehose. 3 is ~the free-tier max across 4 chains + holder lookups. |
+| `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
+| `NEAR_MISS_POINTS` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
+| `WATCHLIST_ENABLED` | `true` | Re-price pools that dropped out of the feeds (born quiet, runs days later — the CATTO shape). DexScreener lookups, no GT budget cost. |
 | `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
-| `SIGNAL_BONUS_WEIGHT` | `0.0` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. |
+| `SIGNAL_BONUS_WEIGHT` | `0.5` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `0.5` is the starting compromise — WALLET at ignition (hand ~45, signal +26/−8, bar 48.6) dies at `0.0` (37) and alerts at `1.0` (63); a clean distributed runner cannot clear the bar on hand score alone, so `0.0` misses exactly the legitimate runners this bot exists to catch. |
 | `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. |
 | `SIG_MAX_AGE_MINUTES` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
 | `SIGNAL_BONUS_WEIGHT` | `0.0` | How far the signal engine may *promote* a token (0–1). `0.0` = signals only veto. Raising it lets runner signals rescue a token the hand score under-rates — see [Catching re-ignited pools](#catching-re-ignited-pools). |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_REQUIRE_OPEN_SOURCE` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
-| `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — | Per-chain threshold override, same convention as the floors below. |
+| `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — (`55` for Robinhood in `.env.example`) | Per-chain threshold override, same convention as the floors below. Robinhood `55` because distributed-clean runners there earn 0 holder/CEX points. |
 | `BASE_MIN_LIQUIDITY_USD` etc. | — | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
 | `ALLOWED_USER_IDS` | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
 | `LOG_FEATURES` | `false` | Log a feature row for every token evaluation (see [Training data](#training-data)). |

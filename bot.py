@@ -97,6 +97,31 @@ ALLOWED_USER_IDS = {
     int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
 }
 
+# ── Ignition watchlist ───────────────────────────────────────────────────────
+# Discovery is event-based: GeckoTerminal's `new_pools` only carries pools from
+# roughly the last 20 minutes, and `trending` only lists pools that are already
+# hot. A pool that is born quiet, drops out of both feeds, and then runs hours
+# later is therefore never looked at again — which is exactly what happened to
+# boar on 2026-09-26: first evaluated at 13:53, while its $34k → $800k leg had
+# already happened at 09:00 with +2242% in the following hour.
+#
+# This lane remembers pools the bot has already seen and re-prices the promising
+# ones on a timer, so a pool that re-ignites after going quiet gets scored even
+# though no feed is listing it. Re-checks go through DexScreener's single-pair
+# endpoint, which is a *different* provider from GeckoTerminal and therefore does
+# not consume the shared GT budget that discovery and holder lookups compete for.
+#
+# Default OFF, like the other lanes. When enabling, watch the noise: a re-check
+# carries no unique-buyer data (DexScreener has none), so the AND-gates in
+# signals.py that depend on `buyers` are skipped for these candidates.
+WATCHLIST_ENABLED = os.getenv("WATCHLIST_ENABLED", "false").lower() == "true"
+WATCHLIST_MAX = max(0, int(os.getenv("WATCHLIST_MAX", "40")))            # re-checks per cycle
+WATCHLIST_TTL_HOURS = float(os.getenv("WATCHLIST_TTL_HOURS", "24"))
+WATCHLIST_RECHECK_MINUTES = float(os.getenv("WATCHLIST_RECHECK_MINUTES", "10"))
+# Only remember pools that showed some life, so the watchlist is not a junk
+# re-lookup engine. 0 = remember everything evaluated.
+WATCHLIST_MIN_BEST_SCORE = float(os.getenv("WATCHLIST_MIN_BEST_SCORE", "25"))
+
 # Feature logging for offline model training (see FeatureLogger below).
 # Default OFF so a long-running bot cannot silently fill the disk.
 LOG_FEATURES = os.getenv("LOG_FEATURES", "false").lower() == "true"
@@ -766,6 +791,21 @@ def init_db() -> sqlite3.Connection:
             chain TEXT, token_address TEXT, symbol TEXT, action TEXT,
             amount_native REAL, amount_tokens REAL, price_usd REAL, timestamp REAL
         );
+        CREATE TABLE IF NOT EXISTS watchlist (
+            chain TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            pair_address TEXT,
+            symbol TEXT,
+            source TEXT,
+            first_seen REAL,
+            last_seen REAL,
+            last_checked REAL,
+            evals INTEGER DEFAULT 0,
+            best_hand REAL,
+            last_hand REAL,
+            last_price REAL,
+            PRIMARY KEY (chain, token_address)
+        );
     """)
     conn.executescript(_feature_schema_sql())
     ensure_feature_columns(conn)  # migrate older feature tables
@@ -837,6 +877,95 @@ def db_record_alert(chain, token_address, symbol, score):
         db_conn.commit()
     except Exception as e:
         logger.warning(f"DB alert upsert failed: {e}")
+
+
+# ── watchlist persistence ────────────────────────────────────────────────────
+
+def db_watchlist_remember(chain, token_address, pair_address, symbol, source,
+                          hand_score, price):
+    """Remember a pool the scanner has seen, and how good it looked.
+
+    `hand_score` is None for candidates rejected before scoring; those are kept
+    (so a later re-check can still be compared) but they will not qualify for
+    re-checking on their own unless they turn out to be promoted by some other
+    path. The `best_hand` column is a high-water mark.
+    """
+    if not WATCHLIST_ENABLED:
+        return
+    try:
+        now = time.time()
+        db_conn.execute(
+            "INSERT INTO watchlist (chain, token_address, pair_address, symbol, source, "
+            "first_seen, last_seen, evals, best_hand, last_hand, last_price) "
+            "VALUES (?,?,?,?,?,?,?,1,?,?,?) "
+            "ON CONFLICT(chain, token_address) DO UPDATE SET "
+            "pair_address=excluded.pair_address, symbol=excluded.symbol, "
+            "source=excluded.source, last_seen=excluded.last_seen, "
+            "evals=watchlist.evals + 1, "
+            "best_hand=MAX(COALESCE(watchlist.best_hand, 0), COALESCE(excluded.best_hand, 0)), "
+            "last_hand=COALESCE(excluded.last_hand, watchlist.last_hand), "
+            "last_price=COALESCE(excluded.last_price, watchlist.last_price)",
+            (chain, token_address, pair_address, symbol, source, now, now,
+             hand_score, hand_score, price),
+        )
+        db_conn.commit()
+    except Exception as e:
+        logger.warning(f"DB watchlist upsert failed: {e}")
+
+
+def db_watchlist_due(now=None, limit=None):
+    """Pools worth re-pricing: alive, not checked recently, and once promising."""
+    now = time.time() if now is None else now
+    limit = WATCHLIST_MAX if limit is None else limit
+    if not WATCHLIST_ENABLED or limit <= 0:
+        return []
+    cutoff_checked = now - WATCHLIST_RECHECK_MINUTES * 60
+    cutoff_seen = now - WATCHLIST_TTL_HOURS * 3600
+    try:
+        cur = db_conn.execute(
+            "SELECT chain, token_address, pair_address, symbol, source, best_hand, last_price "
+            "FROM watchlist WHERE last_seen >= ? "
+            "AND (last_checked IS NULL OR last_checked <= ?) "
+            "AND COALESCE(best_hand, 0) >= ? "
+            "ORDER BY COALESCE(best_hand, 0) DESC, last_seen DESC LIMIT ?",
+            (cutoff_seen, cutoff_checked, WATCHLIST_MIN_BEST_SCORE, limit),
+        )
+        return [
+            {"chain": r[0], "token_address": r[1], "pair_address": r[2], "symbol": r[3],
+             "source": r[4], "best_hand": r[5], "last_price": r[6]}
+            for r in cur.fetchall()
+        ]
+    except Exception as e:
+        logger.warning(f"DB watchlist query failed: {e}")
+        return []
+
+
+def db_watchlist_mark_checked(chain, token_address, now=None):
+    now = time.time() if now is None else now
+    try:
+        db_conn.execute(
+            "UPDATE watchlist SET last_checked=? WHERE chain=? AND token_address=?",
+            (now, chain, token_address),
+        )
+        db_conn.commit()
+    except Exception as e:
+        logger.warning(f"DB watchlist mark failed: {e}")
+
+
+def db_watchlist_prune(now=None):
+    """Forget pools that have not been seen for a TTL, so the table cannot grow."""
+    if not WATCHLIST_ENABLED:
+        return 0
+    now = time.time() if now is None else now
+    try:
+        cur = db_conn.execute("DELETE FROM watchlist WHERE last_seen < ?",
+                              (now - WATCHLIST_TTL_HOURS * 3600,))
+        db_conn.commit()
+        return cur.rowcount
+    except Exception as e:
+        logger.warning(f"DB watchlist prune failed: {e}")
+        return 0
+
 
 def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, amount_native,
                     trailing_stop, tp_levels, tx_hash, paper=0):
@@ -923,6 +1052,83 @@ def prune_caches():
         del holder_cache[k]
     if PAIR_HISTORY is not None:
         PAIR_HISTORY.prune(now)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IGNITION WATCHLIST — re-price pools that dropped out of the discovery feeds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_watchlist_written_this_cycle: set = set()
+
+
+def watchlist_cycle_start():
+    """Clear the per-cycle write buffer. Called once at the top of each scan."""
+    _watchlist_written_this_cycle.clear()
+
+
+def _watchlist_note(chain, token, pair_address, symbol, source, hand_score, price):
+    """Record an evaluated pool, at most once per cycle per token.
+
+    Writing on every evaluation would mean one SQLite commit per candidate per
+    cycle for no extra information; one row per cycle is also a cleaner meaning
+    for the `evals` counter.
+    """
+    if not WATCHLIST_ENABLED:
+        return
+    key = (chain, token)
+    if key in _watchlist_written_this_cycle:
+        return
+    _watchlist_written_this_cycle.add(key)
+    db_watchlist_remember(chain, token, pair_address, symbol, source, hand_score, price)
+
+
+async def get_watchlist_pair(session, chain: str, pair_address: str):
+    """Re-price one watched pool via DexScreener's single-pair endpoint.
+
+    Deliberately not GeckoTerminal: that budget is shared with discovery and
+    holder lookups (~28 calls/min on the free tier), and spending it on
+    re-checks would slow the lane that finds new pools. DexScreener's
+    `latest/dex/pairs/{chain}/{pair}` returns the same pair shape
+    `evaluate_token` consumes.
+    """
+    if not pair_address:
+        return None
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
+    data = await fetch_json(session, url)
+    pairs = (data or {}).get("pairs") or []
+    for pair in pairs:
+        if pair.get("pairAddress", "").lower() == pair_address.lower():
+            pair["source"] = "watchlist:dexscreener"
+            return pair
+    return None
+
+
+async def collect_watchlist_pairs(session) -> list:
+    """Fetch the due watchlist entries, newest signal first.
+
+    Every entry is marked checked before its fetch so a provider outage cannot
+    make the same pool retry on every cycle.
+    """
+    due = db_watchlist_due()
+    if not due:
+        return []
+    logger.info(f"watchlist: {len(due)} pool(s) due for a re-check")
+    now = time.time()
+    for entry in due:
+        db_watchlist_mark_checked(entry["chain"], entry["token_address"], now)
+
+    async def one(entry):
+        try:
+            pair = await get_watchlist_pair(session, entry["chain"], entry["pair_address"])
+        except Exception as e:  # noqa: BLE001 - one bad pool must not stop the lane
+            logger.warning(f"watchlist fetch failed for {entry['symbol']}: {e}")
+            return None
+        if not pair:
+            return None
+        return pair
+
+    results = await asyncio.gather(*[one(e) for e in due], return_exceptions=True)
+    return [p for p in results if p and not isinstance(p, Exception)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API HELPERS
@@ -1028,21 +1234,37 @@ async def get_geckoterminal_pairs(session, network):
 
     Replaces the DexScreener `latest/dex/pairs/{chain}` call, which 404s and
     silently left the scanner with only paid boost/profile tokens.
+
+    Depth is tunable per deployment: GT_PAGES (default 3) walks that many
+    pages per source, GT_SOURCES may include top_volume (the liquid universe
+    between "just born" and "already trending"), and GT_LIST_TTL_* keep the
+    fast-churn new_pools feed fresh without re-fetching top_volume every
+    cycle. All of it shares the GT_MIN_INTERVAL_S budget with holder lookups.
     """
     global _gt_client
     sources = tuple(
         s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending").split(",") if s.strip()
     )
+    pages = max(1, int(os.getenv("GT_PAGES", "3") or 3))
+    list_ttls = {
+        "new_pools": float(os.getenv("GT_LIST_TTL_NEW", "30") or 30),
+        "trending": float(os.getenv("GT_LIST_TTL_TRENDING", "60") or 60),
+        "top_volume": float(os.getenv("GT_LIST_TTL_TOP", "180") or 180),
+    }
     fetcher = lambda url: gt_fetch_json(session, url)  # noqa: E731
     if _gt_client is None:
         # min_interval_s=0: gt_fetch_json already applies the shared budget, and
         # stacking a second 2.1s wait would halve throughput for no benefit.
-        _gt_client = discovery.GeckoTerminal(fetcher, min_interval_s=0.0)
+        _gt_client = discovery.GeckoTerminal(
+            fetcher, min_interval_s=0.0, list_ttls=list_ttls, max_pages=pages,
+        )
     else:
         _gt_client.fetch = fetcher
+        _gt_client.list_ttls = dict(list_ttls)
+        _gt_client.max_pages = max(1, pages)
     pairs = await _gt_client.candidates(network, kinds=sources)
     pairs.sort(key=lambda x: float((x.get("volume") or {}).get("m5", 0) or 0), reverse=True)
-    logger.info(f"{network}: {len(pairs)} GeckoTerminal candidates ({','.join(sources)})")
+    logger.info(f"{network}: {len(pairs)} GeckoTerminal candidates ({','.join(sources)}x{pages}p)")
     return pairs[:300]
 
 
@@ -1791,6 +2013,9 @@ async def evaluate_token(session, pair):
         feat["passed_threshold"] = 1 if result is not None else 0
         feat["alert_sent"] = 0  # the main loop marks this after a real send
         FEATURE_LOGGER.log_row(feat)
+        _watchlist_note(chain, token, pair_id, symbol,
+                        str(pair.get("source") or ""), feat.get("hand_score"),
+                        feat.get("price_usd"))
         return result
 
     def reject(reason: str):
@@ -1950,15 +2175,15 @@ async def evaluate_token(session, pair):
         feat["signal_penalty"] = verdict.penalty
         feat["signal_notes"] = ", ".join(verdict.notes)[:500]
         if verdict.rejected:
-            if VERBOSE_LOGGING:
-                logger.info(f"Signal reject {symbol}@{chain}: {','.join(verdict.reject_reasons)}")
+            # Routine with new_pools discovery (dozens per cycle) — DEBUG, not
+            # INFO. Near-misses that reach scoring still log at INFO.
+            logger.debug(f"Signal reject {symbol}@{chain}: {','.join(verdict.reject_reasons)}")
             return reject("signal:" + ",".join(verdict.reject_reasons))
 
     base_score = score - penalties
     feat["base_score"] = base_score
     if base_score < PHASE1_MIN_SCORE:
-        if VERBOSE_LOGGING:
-            logger.info(f"Phase gate skip {symbol}@{chain}: base_score={base_score:.1f}")
+        logger.debug(f"Phase gate skip {symbol}@{chain}: base_score={base_score:.1f}")
         return reject("phase1_gate")
     feat["phase1_pass"] = 1
 
@@ -2024,7 +2249,15 @@ async def evaluate_token(session, pair):
                 logger.info(f"Early-runner lane {symbol}@{chain} age={age_display}m score={total_score:.0f}")
     feat["early_runner"] = 1 if early_ok else 0
 
-    if VERBOSE_LOGGING:
+    # ── Scored-token logging: near-misses only ─────────────────────────────────
+    # With new_pools discovery, ~80 tokens per cycle reach scoring and all but a
+    # handful die at below_threshold. Logging every one at INFO is the "bullshit
+    # spam" — full score lines are emitted only for tokens that alerted, took the
+    # early lane, or came within NEAR_MISS_POINTS of the bar. Everything else is
+    # still a queryable row in the features table when LOG_FEATURES=true.
+    near_miss_gap = float(os.getenv("NEAR_MISS_POINTS", "15") or 15)
+    is_near_miss = (threshold - total_score) <= near_miss_gap
+    if VERBOSE_LOGGING and (early_ok or is_near_miss or total_score >= threshold):
         logger.info(
             f"{symbol}@{chain} score={total_score:.0f} (hand={legacy_total:.0f}/{threshold:.1f}) | "
             f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
@@ -3360,6 +3593,40 @@ async def send_alert(alert):
 # MAIN BOT LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def dispatch_alerts(results) -> int:
+    """Send alerts for evaluation results that cleared the gate.
+
+    Extracted from the scan loop so the watchlist lane shares exactly the same
+    de-duplication and failure handling as the discovery lane: an alert that
+    fails to build or send must never take down the cycle — that failure mode
+    looked exactly like "the bot found nothing" while it was in fact finding
+    candidates and dying on every send.
+    """
+    sent = 0
+    for result in results:
+        if not result or isinstance(result, Exception):
+            continue
+        try:
+            last_alert = db_get_last_alert(result["chain"], result["token_address"])
+            should_alert = True
+            if last_alert:
+                hours_since = (time.time() - last_alert["alert_time"]) / 3600
+                if hours_since < RE_ALERT_COOLDOWN_HOURS:
+                    if (result["total_score"] - last_alert["total_score"]) < SCORE_IMPROVEMENT_THRESHOLD:
+                        should_alert = False
+            if should_alert:
+                await send_alert(result)
+                db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
+                sent += 1
+                await asyncio.sleep(1)
+        except Exception:
+            logger.error(
+                f"Alert pipeline failed for {result.get('symbol')}@{result.get('chain')}",
+                exc_info=True,
+            )
+    return sent
+
+
 async def bot_task():
     global start_time, last_heartbeat_time, total_pairs_scanned, db_conn
     db_conn = init_db()
@@ -3394,6 +3661,9 @@ async def bot_task():
                 cycle_start = time.time()
                 cycle_alerts = 0
                 prune_caches()
+                watchlist_cycle_start()
+                if WATCHLIST_ENABLED and int(time.time()) % 600 < SCAN_INTERVAL:
+                    db_watchlist_prune()
 
                 if time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                     uptime = (time.time() - start_time) / 3600
@@ -3417,30 +3687,23 @@ async def bot_task():
                     logger.info(f"{network}: {len(pairs)} pairs to evaluate")
                     tasks = [evaluate_token(session, p) for p in pairs]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        if not result or isinstance(result, Exception): continue
-                        # An alert that fails to build or send must never take
-                        # down the scan cycle — that failure mode looked exactly
-                        # like "the bot found nothing" while it was in fact
-                        # finding candidates and dying on every send.
-                        try:
-                            last_alert = db_get_last_alert(result["chain"], result["token_address"])
-                            should_alert = True
-                            if last_alert:
-                                hours_since = (time.time() - last_alert["alert_time"]) / 3600
-                                if hours_since < RE_ALERT_COOLDOWN_HOURS:
-                                    if (result["total_score"] - last_alert["total_score"]) < SCORE_IMPROVEMENT_THRESHOLD:
-                                        should_alert = False
-                            if should_alert:
-                                await send_alert(result)
-                                db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
-                                cycle_alerts += 1
-                                await asyncio.sleep(1)
-                        except Exception:
-                            logger.error(
-                                f"Alert pipeline failed for {result.get('symbol')}@{result.get('chain')}",
-                                exc_info=True,
-                            )
+                    cycle_alerts += await dispatch_alerts(results)
+
+                # ── Ignition watchlist ──────────────────────────────────────
+                # Pools that dropped out of the feeds get re-priced here. See
+                # WATCHLIST_ENABLED: discovery is event-based, so without this
+                # a pool that is born quiet and runs hours later is never
+                # looked at again (the boar case).
+                if WATCHLIST_ENABLED and not shutdown_flag:
+                    watch_pairs = await collect_watchlist_pairs(session)
+                    total_pairs_scanned += len(watch_pairs)
+                    if watch_pairs:
+                        logger.info(f"watchlist: {len(watch_pairs)} pair(s) to re-evaluate")
+                        watch_results = await asyncio.gather(
+                            *[evaluate_token(session, p) for p in watch_pairs],
+                            return_exceptions=True,
+                        )
+                        cycle_alerts += await dispatch_alerts(watch_results)
 
                 cycle_duration = time.time() - cycle_start
                 logger.info(f"Cycle complete in {cycle_duration:.1f}s. Alerts: {cycle_alerts}. Sleeping {SCAN_INTERVAL}s...")

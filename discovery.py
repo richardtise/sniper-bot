@@ -26,8 +26,12 @@ Every function is dependency-injected with a ``fetch`` callable matching
 semaphore and retry logic — and so it can be unit-tested offline.
 
 GeckoTerminal's free tier is ~30 calls/min, so this module has its own throttle
-(``min_interval_s``) and short-lived cache. Two list calls per network per scan
-is ~16 calls/min for 4 chains.
+(``min_interval_s``) and short-lived cache. List endpoints cache per source —
+``new_pools`` churns a full cohort every few minutes (short TTL) while
+``top_volume`` barely moves (long TTL) — and ``candidates()`` walks multiple
+pages per source, because page 1 of ``new_pools`` only covers ~2-4 minutes of
+births. Discovery and holder lookups share one budget (see ``GT_MIN_INTERVAL_S``
+in .env.example), so depth (``max_pages``) trades directly against cycle time.
 """
 
 from __future__ import annotations
@@ -59,6 +63,18 @@ GT_ENDPOINTS: Dict[str, str] = {
     "new_pools": "new_pools",
     "trending": "trending_pools",
     "top_volume": "pools?sort=h24_volume_usd_desc",
+}
+
+# Default per-source list cache TTLs (seconds). `new_pools` churns a whole
+# birth-cohort every ~2-4 minutes, so the old 90s blanket TTL skipped entire
+# cohorts between cycles; `top_volume` barely moves, so caching it longer
+# saves budget for holder lookups on the shared ~30 calls/min free tier.
+# Override per source via the ``list_ttls`` constructor argument
+# (bot.py feeds GT_LIST_TTL_* env vars into it).
+DEFAULT_LIST_TTLS: Dict[str, float] = {
+    "new_pools": 30.0,
+    "trending": 60.0,
+    "top_volume": 180.0,
 }
 
 Fetch = Callable[[str], Awaitable[Optional[Any]]]
@@ -221,18 +237,37 @@ class GeckoTerminal:
         *,
         min_interval_s: float = 2.1,
         cache_ttl_s: float = 90.0,
+        list_ttls: Optional[Dict[str, float]] = None,
+        max_pages: int = 1,
+        page_size: int = 20,
     ) -> None:
         self.fetch = fetch
         self.min_interval_s = min_interval_s
         self.cache_ttl_s = cache_ttl_s
+        # Per-source TTL overrides for pool-list endpoints, e.g.
+        # {"new_pools": 30.0}. Sources not listed fall back to cache_ttl_s.
+        self.list_ttls: Dict[str, float] = dict(list_ttls or {})
+        # How many pages to walk per (chain, source) in candidates().
+        # Page 1 of new_pools only covers ~2-4 minutes of births, so 1 page
+        # samples the firehose instead of scanning it.
+        self.max_pages = max(1, int(max_pages))
+        self.page_size = max(1, int(page_size))
         self._last_call = 0.0
         self._lock = asyncio.Lock()
         self._cache: Dict[str, Tuple[Any, float]] = {}
 
-    async def _get(self, path: str) -> Optional[Any]:
+    def _ttl_for(self, kind: Optional[str]) -> float:
+        if kind and kind in self.list_ttls:
+            return self.list_ttls[kind]
+        if kind and kind in DEFAULT_LIST_TTLS:
+            return DEFAULT_LIST_TTLS[kind]
+        return self.cache_ttl_s
+
+    async def _get(self, path: str, *, kind: Optional[str] = None) -> Optional[Any]:
+        ttl = self._ttl_for(kind)
         now = time.time()
         cached = self._cache.get(path)
-        if cached and now - cached[1] < self.cache_ttl_s:
+        if cached and now - cached[1] < ttl:
             return cached[0]
         async with self._lock:
             wait = self.min_interval_s - (time.time() - self._last_call)
@@ -270,7 +305,7 @@ class GeckoTerminal:
         if not network or not token_address:
             return None
         path = f"networks/{network}/tokens/{token_address}/info"
-        payload = await self._get(path)
+        payload = await self._get(path, kind="token_info")
         if not isinstance(payload, dict):
             return None
         return ((payload.get("data") or {}).get("attributes")) or None
@@ -280,11 +315,27 @@ class GeckoTerminal:
         chain: str,
         kinds: Tuple[str, ...] = ("new_pools", "trending"),
         page: int = 1,
+        *,
+        pages: Optional[int] = None,
     ) -> List[dict]:
-        """Fetch + dedupe candidates for one chain (one best pool per token)."""
+        """Fetch + dedupe candidates for one chain (one best pool per token).
+
+        Walks up to ``pages`` (default: the ``max_pages`` configured on the
+        client) starting at ``page`` for every source kind, so a runner that
+        sits on page 2 of trending — or was born 6 minutes ago instead of 2 —
+        is still seen. Same-chain duplicates collapse to the deepest pool.
+        """
+        depth = max(1, int(pages) if pages is not None else self.max_pages)
         gathered: List[dict] = []
         for kind in kinds:
-            gathered.extend(await self.list_pools(chain, kind=kind, page=page))
+            for p in range(page, page + depth):
+                batch = await self.list_pools(chain, kind=kind, page=p)
+                if not batch:
+                    break
+                gathered.extend(batch)
+                # A short last page means we hit the end of the listing.
+                if len(batch) < self.page_size:
+                    break
         return dedupe_best_pool(gathered)
 
 

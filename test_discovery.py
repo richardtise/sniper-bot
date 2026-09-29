@@ -182,3 +182,74 @@ class TestDexScreenerSearch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPaginationAndSplitTTL(unittest.TestCase):
+    """2026-09-29 recall fix: page-1-only discovery never sees a runner on
+    page 2, and a blanket 90s TTL skips whole new_pools birth cohorts."""
+
+    def test_candidates_walk_multiple_pages(self):
+        fetch = FakeFetch({
+            "new_pools?page=1": payload([gt_pool(address="0xp1", token="0xt1")]),
+            "new_pools?page=2": payload([gt_pool(address="0xp2", token="0xt2",
+                                                 symbol="MOON")]),
+            "new_pools?page=3": {"data": [], "included": []},
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=60,
+                           max_pages=3, page_size=1)
+
+        async def run():
+            return await gt.candidates("bsc", kinds=("new_pools",))
+
+        cands = asyncio.run(run())
+        symbols = {p["baseToken"]["symbol"] for p in cands}
+        self.assertEqual(symbols, {"RUN", "MOON"})
+
+    def test_short_last_page_stops_early(self):
+        fetch = FakeFetch({
+            "new_pools?page=1": payload([gt_pool(address="0xp1", token="0xt1")]),
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=60,
+                           max_pages=5, page_size=20)
+
+        async def run():
+            return await gt.candidates("bsc", kinds=("new_pools",))
+
+        cands = asyncio.run(run())
+        self.assertEqual(len(cands), 1)
+        # Only page 1 fetched: page 2 would 404 -> FakeFetch returns None ->
+        # empty batch breaks the loop anyway. Assert no page=3 call happened.
+        self.assertFalse(any("page=3" in url for url in fetch.calls))
+
+    def test_new_pools_ttl_shorter_than_top_volume(self):
+        fetch = FakeFetch({
+            "new_pools": payload([gt_pool()]),
+            "sort=h24_volume_usd_desc": payload([gt_pool()]),
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=90,
+                           list_ttls={"new_pools": 30.0, "top_volume": 180.0})
+
+        async def run():
+            await gt.list_pools("bsc", kind="new_pools")
+            await gt.list_pools("bsc", kind="top_volume")
+            # Immediate re-fetch: both served from cache.
+            await gt.list_pools("bsc", kind="new_pools")
+            await gt.list_pools("bsc", kind="top_volume")
+
+        asyncio.run(run())
+        self.assertEqual(len(fetch.calls), 2)
+
+    def test_explicit_pages_kwarg_overrides_client_default(self):
+        fetch = FakeFetch({
+            "new_pools?page=1": payload([gt_pool(address="0xp1", token="0xt1")]),
+            "new_pools?page=2": payload([gt_pool(address="0xp2", token="0xt2",
+                                                 symbol="MOON")]),
+        })
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=0,
+                           max_pages=5)
+
+        async def run():
+            return await gt.candidates("bsc", kinds=("new_pools",), pages=1)
+
+        cands = asyncio.run(run())
+        self.assertEqual(len(cands), 1)
