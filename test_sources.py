@@ -558,3 +558,64 @@ class TestAlertFormatting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerChainGtSources(unittest.TestCase):
+    """new_pools pays on Robinhood and not on BSC, so sources are per chain.
+
+    Measured 2026-09-29: Robinhood new_pools page 1 carries pools 3.2-5.5 min
+    old at a median $6,663 mcap (15/20 under $50k) — the only feed that can
+    produce a sub-50k entry. BSC new_pools is dominated by template-liquidity
+    placeholders ($3,504 / $4,381 reserve, zero volume) and one $1.9M launch.
+    """
+
+    def setUp(self):
+        self._keys = ["GT_SOURCES", "GT_SOURCES_ROBINHOOD", "ROBINHOOD_GT_SOURCES",
+                      "GT_SOURCES_BSC", "GT_SOURCES_BASE"]
+        self._saved = {k: os.environ.get(k) for k in self._keys}
+        for k in self._keys:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_falls_back_to_the_global_default(self):
+        os.environ["GT_SOURCES"] = "trending,top_volume"
+        self.assertEqual(bot.get_gt_sources("bsc"), ("trending", "top_volume"))
+        self.assertEqual(bot.get_gt_sources("robinhood"), ("trending", "top_volume"))
+
+    def test_chain_suffix_override_wins_for_that_chain_only(self):
+        os.environ["GT_SOURCES"] = "trending,top_volume"
+        os.environ["GT_SOURCES_ROBINHOOD"] = "new_pools,trending,top_volume"
+        self.assertEqual(bot.get_gt_sources("robinhood"),
+                         ("new_pools", "trending", "top_volume"))
+        self.assertEqual(bot.get_gt_sources("bsc"), ("trending", "top_volume"))
+
+    def test_prefix_style_also_accepted(self):
+        os.environ["GT_SOURCES"] = "trending"
+        os.environ["ROBINHOOD_GT_SOURCES"] = "new_pools,trending"
+        self.assertEqual(bot.get_gt_sources("robinhood"), ("new_pools", "trending"))
+
+    def test_suffix_style_takes_precedence_over_prefix_style(self):
+        os.environ["GT_SOURCES_ROBINHOOD"] = "new_pools"
+        os.environ["ROBINHOOD_GT_SOURCES"] = "trending"
+        self.assertEqual(bot.get_gt_sources("robinhood"), ("new_pools",))
+
+    def test_no_env_at_all_uses_the_builtin_default(self):
+        self.assertEqual(bot.get_gt_sources("base"),
+                         ("new_pools", "trending", "top_volume"))
+
+    def test_whitespace_and_empty_entries_are_ignored(self):
+        os.environ["GT_SOURCES_ROBINHOOD"] = " new_pools , ,trending "
+        self.assertEqual(bot.get_gt_sources("robinhood"), ("new_pools", "trending"))
+
+    def test_per_chain_noise_from_new_pools_is_avoidable(self):
+        """The chosen config: BSC keeps the lagging-but-clean feeds."""
+        os.environ["GT_SOURCES"] = "trending,top_volume"
+        os.environ["GT_SOURCES_ROBINHOOD"] = "new_pools,trending,top_volume"
+        self.assertNotIn("new_pools", bot.get_gt_sources("bsc"))
+        self.assertIn("new_pools", bot.get_gt_sources("robinhood"))

@@ -260,6 +260,29 @@ def _chain_floor(chain: str, suffix: str, default: float) -> float:
             logger.warning(f"Ignoring invalid {_env_key(chain, suffix)}={raw!r}")
     return default
 
+
+def get_gt_sources(chain: str) -> tuple:
+    """GeckoTerminal discovery sources for one chain.
+
+    Precedence:
+      1. ``GT_SOURCES_<CHAIN>``  — recommended (e.g. GT_SOURCES_ROBINHOOD)
+      2. ``<CHAIN>_GT_SOURCES``  — the repo's existing per-chain prefix style
+      3. ``GT_SOURCES``          — global default
+
+    Per chain, because the feeds are not equally clean. Measured 2026-09-29:
+    Robinhood ``new_pools`` page 1 carries pools 3.2-5.5 min old at a median
+    $6,663 mcap (15/20 under $50k), while BSC ``new_pools`` is dominated by
+    template-liquidity placeholder pools ($3,504 / $4,381 reserve, zero volume)
+    plus the occasional already-$1.9M launch. Running ``new_pools`` only where
+    it pays keeps the early lane without importing that noise.
+    """
+    for key in (f"GT_SOURCES_{chain.upper()}", _env_key(chain, "GT_SOURCES")):
+        raw = os.getenv(key, "").strip()
+        if raw:
+            return tuple(s.strip() for s in raw.split(",") if s.strip())
+    raw = os.getenv("GT_SOURCES", "new_pools,trending,top_volume")
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
 # Runtime resolvers — env vars read fresh every time (fixes import-time caching)
 def get_router_v3(chain: str) -> str:
     env_key = _env_key(chain, "ROUTER_V3")
@@ -1273,10 +1296,7 @@ async def get_geckoterminal_pairs(session, network):
     it shares the GT_MIN_INTERVAL_S budget with holder lookups.
     """
     global _gt_client
-    sources = tuple(
-        s.strip() for s in os.getenv("GT_SOURCES", "new_pools,trending,top_volume").split(",")
-        if s.strip()
-    )
+    sources = get_gt_sources(network)
     source_pages = {
         "new_pools": max(1, int(os.getenv("GT_PAGES_NEW", "1") or 1)),
         "trending": max(1, int(os.getenv("GT_PAGES_TRENDING", "2") or 2)),
