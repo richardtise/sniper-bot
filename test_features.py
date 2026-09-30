@@ -422,6 +422,11 @@ class TestScoreBreakdownLogging(unittest.IsolatedAsyncioTestCase):
             "get_token_security": bot.get_token_security,
             "get_holder_concentration": bot.get_holder_concentration,
             "get_cex_listings": bot.get_cex_listings,
+            # Isolate the venue gate: this class tests score attribution, and its
+            # fixtures use a v4 pool. An operator who sets
+            # REQUIRE_TRADEABLE_VENUE=true would otherwise short-circuit scoring
+            # before any component is logged.
+            "REQUIRE_TRADEABLE_VENUE": bot.REQUIRE_TRADEABLE_VENUE,
         }
         self.recorder = _RecordingLogger()
         bot.FEATURE_LOGGER = self.recorder
@@ -430,6 +435,7 @@ class TestScoreBreakdownLogging(unittest.IsolatedAsyncioTestCase):
         bot.PAIR_HISTORY = signals_module.PairHistory()
         bot.SIGNAL_BONUS_WEIGHT = 0.0
         bot.PHASE1_MIN_SCORE = 0
+        bot.REQUIRE_TRADEABLE_VENUE = False
         bot.security_cache.clear()
 
     async def asyncTearDown(self):

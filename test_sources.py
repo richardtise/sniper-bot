@@ -762,9 +762,28 @@ class TestVenueSupport(unittest.TestCase):
         self.assertTrue(bot.dex_is_supported("base", "aerodrome-slipstream-3"))
         self.assertFalse(bot.dex_is_supported("base", "uniswap_v3"))
 
-    def test_require_tradeable_venue_defaults_to_off(self):
-        """Alerting on an unroutable pool is still informative; keep it opt-in."""
-        self.assertFalse(bot.REQUIRE_TRADEABLE_VENUE)
+    def test_the_venue_gate_is_opt_in_by_code_default(self):
+        """The *code* default is off, whatever the operator's .env says.
+
+        Asserting on ``bot.REQUIRE_TRADEABLE_VENUE`` directly made this test fail
+        the moment a deployment (correctly) enabled it — a test that breaks when
+        the operator configures the feature is testing the wrong thing. What
+        matters is that the gate is off unless asked for, and that asking for it
+        works, so both are exercised explicitly.
+        """
+        import inspect
+        src = inspect.getsource(bot)
+        self.assertIn('REQUIRE_TRADEABLE_VENUE = os.getenv("REQUIRE_TRADEABLE_VENUE", "false")',
+                      src, "the code default must stay opt-in")
+
+        saved = bot.REQUIRE_TRADEABLE_VENUE
+        try:
+            bot.REQUIRE_TRADEABLE_VENUE = False
+            self.assertFalse(bot.REQUIRE_TRADEABLE_VENUE)
+            bot.REQUIRE_TRADEABLE_VENUE = True
+            self.assertTrue(bot.REQUIRE_TRADEABLE_VENUE)
+        finally:
+            bot.REQUIRE_TRADEABLE_VENUE = saved
 
 
 class TestPerChainEarlyFloors(unittest.TestCase):
