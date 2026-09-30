@@ -482,6 +482,34 @@ Ranking is the part that needs fitting on labelled outcomes
 table is empty. Until then, treat the score as an explanation of why a token was
 picked, not as evidence that it will move.
 
+### Per-block weight audit
+
+Only ~35 of the 100 points are testable from candle data (the rest need
+transaction counts, holder bands and security lookups). Measured per block:
+
+| Block | Pts | AUC ≥10%/1h | AUC ≥25%/1h | AUC ≥25%/6h |
+|---|---|---|---|---|
+| `vol_5m / liquidity` | 10 | untestable | — | — |
+| `vol_5m / vol_1h` | 8 | **0.499** | **0.424** | **0.470** |
+| `vol_1h / vol_6h` | 7 | 0.545 | 0.444 | 0.473 |
+| `vol_6h / vol_24h` | 5 | 0.565 | 0.487 | 0.504 |
+| buy pressure 5m + 1h | 20 | untestable | — | — |
+| price 5m / 1h / 6h | 15 | **0.565** | **0.558** | **0.518** |
+| holders top10/50/100 | 20 | untestable | — | — |
+| security | 10 | non-discriminating — every survivor passes it | | |
+| CEX listings | 5 | late signal; unreachable on Robinhood | | |
+
+**The 15 price points alone rank as well as all 45 testable points combined**
+(0.565 vs 0.568 at ≥10%) and better on the moves that matter (0.558 vs 0.463 at
+≥25%/1h). The 30 volume-ratio points buy essentially nothing, and
+`vol_5m / vol_1h` (8 pts) is a literal coin flip.
+
+Note also what that implies about the *shape* the model rewards: each volume
+component is a ratio of a short window to a longer one, so it favours volume
+spread evenly and penalises volume concentrated into a single bar — which is what
+a pump looks like. See [`RECOMMENDED_ENV.md`](RECOMMENDED_ENV.md) for the
+settings profile and the ordered fix list.
+
 ### Notes on reachability
 
 The score is out of 100, but those 100 points are only meaningful if they are all
