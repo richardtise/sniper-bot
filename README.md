@@ -213,6 +213,66 @@ Until then the bot stays honest: alerts name the DEX and the exact missing
 integration (`Venue requirement` in the `features` table), and withhold buy
 buttons rather than offering ones that fail.
 
+#### Is Uniswap enough for ETH/Base/Robinhood, and PancakeSwap for BSC?
+
+No — that holds on Ethereum, roughly on Base, and fails on BSC and Robinhood.
+Measured with `diag/dex_coverage.py` over **480 births, 120 per chain, 6 pages
+each, zero failed pages** (2026-09-30). Coverage of `new_pools`, i.e. "can the
+bot buy this pool at birth":
+
+| Scenario | Ethereum | Base | BSC | Robinhood | Pooled |
+|---|---|---|---|---|---|
+| **A.** configured today (uni v2/v3; pancake v2/v3) | 25.8% | 18.3% | 36.7% | **1.7%** | 20.6% |
+| **B.** A + Uniswap V4 everywhere | **97.5%** | **81.7%** | 58.3% | 17.5% | **63.7%** |
+| **C.** "uniswap for eth/base/rh, pancake for bsc" | 97.5% | 81.7% | **41.7%** | **17.5%** | 59.6% |
+| **D.** C + Uniswap V4 on BSC | 97.5% | 81.7% | 63.3% | 17.5% | 65.0% |
+
+What the birth feed actually contains:
+
+| Chain | Top venues (share of births) |
+|---|---|
+| Ethereum | `uniswap-v4-ethereum` 71.7%, `uniswap_v2` 22.5%, `uniswap_v3` 3.3% |
+| Base | `uniswap-v4-base` 63.3%, `uniswap-v2-base` 18.3%, `o1-launchpad` 8.3%, `aerodrome-slipstream-3` 4.2%, `bankr` 3.3% |
+| BSC | `four-meme` **35.8%**, `pancakeswap_v2` 33.3%, `uniswap-v4-bsc` **21.7%**, `pancakeswap-infinity-clmm` 5.0%, `pancakeswap-v3-bsc` 3.3% |
+| Robinhood | `pons-v2` **80.0%**, `uniswap-v4-robinhood` 15.8%, `bankr-robinhood` 2.5% |
+
+Three corrections to the "99%" intuition:
+
+1. **It is right on Ethereum** (97.5% Uniswap-branded) — which is presumably
+   where the impression came from. It does not generalise.
+2. **On BSC, PancakeSwap is no longer where pools are made.** PancakeSwap-branded
+   venues are 41.7% of births; `four-meme` alone is 35.8%, and Uniswap V4 on BSC
+   is 21.7%. A PancakeSwap-only BSC config reaches 41.7%, not ~99%.
+   PancakeSwap *Infinity* (5.0%) is also a separate product needing its own
+   router, not something the existing V2/V3 code covers.
+3. **Robinhood is overwhelmingly not Uniswap.** `pons-v2` is 80% of births.
+   Neither V4 nor a Uniswap-only inventory helps much there: scenario B moves
+   Robinhood from 1.7% to 17.5%.
+
+Ranked by measured marginal value:
+
+| Addition | Gains |
+|---|---|
+| Uniswap V4 (Universal Router + Permit2) | pooled 20.6% → 63.7%; +71.7 pts on Ethereum, +63.3 on Base, +21.7 on BSC, +15.8 on Robinhood |
+| Pons router (Robinhood) | +80 pts on Robinhood (17.5% → ~97%) |
+| `four-meme` (BSC) | +35.8 pts on BSC |
+| Aerodrome (Base) | +4.2 pts on Base |
+| PancakeSwap Infinity (BSC) | +5.0 pts on BSC |
+
+**Caveat on what this measures.** These are venues where pools are *created*.
+Several are launchpads (`four-meme`, `bankr`, `o1-launchpad`): at birth their
+tokens trade on the launchpad's own venue, in a single pool — sampled
+`four-meme` tokens each had exactly one pool, on `four-meme`, with no PancakeSwap
+pool alongside it. So "covered" means *buyable at birth*, which is precisely what
+an early-entry bot needs, but it is not the same as "buyable ever": a token may
+graduate to an AMM later, by which point the early entry is gone.
+
+Reproduce any row:
+
+```bash
+bot-env/bin/python diag/dex_coverage.py --pages 6 --pause 2.8
+```
+
 ## Detection latency — "why do I only get pinged after the pump?"
 
 Being late is two different failures that look identical in a log full of reject
@@ -507,6 +567,7 @@ against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
 | `diag/repro_boar.py` | Reproduces the hard-reject decision for the boar fixtures. |
 | `diag/compare_decisions.py` | **Decision-neutrality check.** Runs 13 fixture cases through two revisions of `bot.py` and exits non-zero if any reject reason or alert decision changed — use it before shipping a refactor of `evaluate_token`. |
 | `diag/population_floors.py` | **Where the default floors come from.** Samples the cohort a lane actually receives and reports per-metric p50/p75/p90 with bootstrap CIs, then emits `.env`-ready floors at a declared quantile. Outcome-blind: it never reads price or performance, which is what keeps it free of survivorship bias. Change the policy with `--quantile`, never by picking tokens. |
+| `diag/dex_coverage.py` | **Where pools are born vs what the bot can trade.** Samples `new_pools` across chains and pages, reports each venue's share, and scores coverage under a declared router inventory (configured / +V4 / a hypothetical). Prints per-chain page depth and flags under-sampled chains so an incomplete fetch cannot masquerade as a chain-level difference. |
 | `diag/fit_thresholds.py` | **Outcome-fitted thresholds, or a refusal.** Fits on realised forward returns with a time split *and* a token-grouped split, reports the base rate beside every precision, and **refuses to emit anything** below 30 positives across 30 tokens. Run against an empty `features` table it refuses — the honest answer until labelled data exists. |
 
 ```bash
@@ -514,6 +575,7 @@ bot-env/bin/python diag/component_audit.py --pages 3 --csv diag/.cache/audit.csv
 bot-env/bin/python diag/holders_from_logs.py 0xTokenAddress
 bot-env/bin/python diag/compare_decisions.py            # HEAD vs working tree
 bot-env/bin/python diag/population_floors.py --chains robinhood --quantile 0.90
+bot-env/bin/python diag/dex_coverage.py --pages 6 --pause 2.8
 bot-env/bin/python diag/fit_thresholds.py               # refuses until data exists
 python -m unittest -v test_audit_tools
 ```

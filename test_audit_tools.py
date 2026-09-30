@@ -11,6 +11,7 @@ These pin the mechanics that decide whether an audit number is trustworthy:
 Run with: python -m unittest -v test_audit_tools
 """
 
+import collections
 import math
 import os
 import unittest
@@ -310,3 +311,81 @@ class TestThresholdFitting(unittest.TestCase):
             [{"chain": "base", "token_address": "0xA"}]))
         self.assertIn("not every pool", text)
         self.assertIn("not", text.lower())
+
+
+class TestDexCoverage(unittest.TestCase):
+    """Router inventory vs where pools are actually born.
+
+    The claim under test was "Uniswap is enough for ETH/Base/Robinhood and
+    PancakeSwap for BSC — that's where 99% of pools are made". Measured
+    2026-09-30 over 480 births (120 per chain, 6 pages each, zero failed pages)
+    it holds on Ethereum (97.5%) and roughly on Base (81.7%) but fails on BSC
+    (41.7%) and badly on Robinhood (17.5%). These tests pin the *mechanics* of
+    that measurement, not the numbers, which will drift.
+    """
+
+    def setUp(self):
+        from diag import dex_coverage as dc
+        self.dc = dc
+
+    def _pool(self, dex, addr):
+        return {"attributes": {"address": addr},
+                "relationships": {"dex": {"data": {"id": dex}}}}
+
+    def test_aggregate_counts_dex_per_chain(self):
+        pools = [self._pool("uniswap-v4-base", "0xa"), self._pool("uniswap-v4-base", "0xb"),
+                 self._pool("aerodrome-slipstream-3", "0xc")]
+        agg = self.dc.aggregate(pools, {"0xa": "base", "0xb": "base", "0xc": "base"})
+        self.assertEqual(agg["base"]["uniswap-v4-base"], 2)
+        self.assertEqual(agg["base"]["aerodrome-slipstream-3"], 1)
+
+    def test_missing_dex_id_becomes_unknown_not_dropped(self):
+        """A pool with no dex relationship must still be counted, or shares lie."""
+        pools = [{"attributes": {"address": "0xa"}, "relationships": {}}]
+        agg = self.dc.aggregate(pools, {"0xa": "base"})
+        self.assertEqual(agg["base"]["unknown"], 1)
+
+    def test_v4_is_not_covered_by_v2_v3_patterns(self):
+        """The regression that matters: 'a V3 router exists' does not reach V4."""
+        pats = self.dc.INVENTORY_CONFIGURED["base"]
+        self.assertFalse(self.dc.is_covered("uniswap-v4-base", pats))
+        self.assertTrue(self.dc.is_covered("uniswap_v3", pats))
+
+    def test_uniswap_brand_pattern_does_cover_v4(self):
+        """r'uniswap' matches uniswap-v4, which is why the scenarios are distinct."""
+        self.assertTrue(self.dc.is_covered("uniswap-v4-base", (r"uniswap",)))
+
+    def test_coverage_is_case_insensitive(self):
+        self.assertTrue(self.dc.is_covered("UNISWAP-V4-BASE", (r"uniswap[-_]?v4",)))
+
+    def test_coverage_report_lists_the_uncovered_venues(self):
+        agg = {"base": collections.Counter({
+            "uniswap_v3": 7, "uniswap-v4-base": 2, "aerodrome-slipstream-3": 1})}
+        rep = self.dc.coverage_report(agg, self.dc.INVENTORY_CONFIGURED)["base"]
+        self.assertEqual(rep["total"], 10)
+        self.assertEqual(rep["covered"], 7)
+        self.assertAlmostEqual(rep["share"], 0.7)
+        self.assertEqual([d for d, _ in rep["missing"]],
+                         ["uniswap-v4-base", "aerodrome-slipstream-3"])
+
+    def test_hypothesis_inventory_fails_on_robinhood_and_bsc(self):
+        """The actual finding: the plan is not chain-general."""
+        agg = {"robinhood": collections.Counter({"pons-v2": 96, "uniswap-v4-robinhood": 19}),
+               "bsc": collections.Counter({"four-meme": 43, "pancakeswap_v2": 40})}
+        rep = self.dc.coverage_report(agg, self.dc.INVENTORY_HYPOTHESIS)
+        self.assertLess(rep["robinhood"]["share"], 0.2)
+        self.assertAlmostEqual(rep["bsc"]["share"], 40 / 83)
+
+    def test_adding_v4_raises_coverage_but_not_on_robinhood(self):
+        agg = {"robinhood": collections.Counter({"pons-v2": 96, "uniswap-v4-robinhood": 19}),
+               "base": collections.Counter({"uniswap-v4-base": 76, "uniswap-v2-base": 22})}
+        before = self.dc.coverage_report(agg, self.dc.INVENTORY_CONFIGURED)
+        after = self.dc.coverage_report(agg, self.dc.INVENTORY_PLUS_V4)
+        self.assertGreater(after["base"]["share"], before["base"]["share"])
+        # Robinhood barely moves: pons-v2 dominates regardless of V4.
+        self.assertLess(after["robinhood"]["share"], 0.25)
+
+    def test_empty_chain_does_not_divide_by_zero(self):
+        rep = self.dc.coverage_report({"base": collections.Counter()},
+                                      self.dc.INVENTORY_CONFIGURED)
+        self.assertEqual(rep["base"]["share"], 0.0)
