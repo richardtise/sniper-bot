@@ -43,40 +43,41 @@ Everything else has a sane default. `.env.example` documents every variable.
 
 ## Configuration
 
-The handful you are most likely to change:
+The handful you are most likely to change. Two values matter per knob:
+**code default** (what runs if `.env` omits it) vs **`.env.example` recommends**
+(what the measured rollout uses). Your live `.env` predates most flags, so an
+omitted key means the code default — currently the conservative/off side.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PAPER_TRADING` | `true` | Simulate trades. Set to `false` only with a funded hot wallet. |
-| `MIN_SCORE` | `65` | Alert threshold (0–100), scaled per chain — see [Alert gate](#alert-gate). |
-| `SCORE_NORMALIZE` | `true` | Scale the alert bar to the points actually reachable on a chain/age. `false` gates on raw `MIN_SCORE`. |
-| `MIN_EFFECTIVE_SCORE` | `35` | Floor for the scaled threshold, so scaling can't become a rubber stamp. |
-| `MAX_ALLOWED_TAX` | `10` | Reject tokens above this buy/sell tax %. |
-| `ETHERSCAN_API_KEY` | — | Contract verification on all four chains, including Robinhood (chainid 4663). `SCANNER_API_KEY` is accepted as an alias. |
-| `MORALIS_API_KEY` | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
-| `COINGECKO_API_KEY` | — | Enables CEX-listing scoring (never applies to Robinhood). |
-| `USE_GECKOTERMINAL` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list, so prefer `true`. |
-| `GT_SOURCES` | `trending,top_volume` | Global default. `new_pools` = earliest (only feed carrying a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` everywhere makes a sub-50k entry mathematically impossible. |
-| `GT_SOURCES_<CHAIN>` | `new_pools,trending,top_volume` for Robinhood | Per-chain source override (also accepts the prefix style `<CHAIN>_GT_SOURCES`). `new_pools` is not equally clean per chain: Robinhood births alert at $19.8k/$33.5k mcap 3.2 min old, while BSC `new_pools` is template-liquidity placeholders plus $1.9M launches. Enable it where it pays. |
-| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort (page 2 is 5–7m, page 3 is 7–9m), so depth there buys little; `trending` rewards a second page. Each page is one call against the shared GT budget. |
-| `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
-| `MAX_MARKET_CAP_USD` (+ per-chain) | `200000` | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. |
-| `MIN_EFFECTIVE_SCORE` | `45` | Floor under the normalized bar. At age ~3m the reachable ceiling is ~53, so `MIN_SCORE=55` scales to 29 and this floor is what actually gates young pools. `35` admitted a token at hand=35.0 exactly; `45` makes the early lane's AND-gates the way in instead. |
-| `NEAR_MISS_POINTS` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
-| `WATCHLIST_ENABLED` | `true` | Re-price pools that dropped out of the feeds (born quiet, runs days later — the CATTO shape). DexScreener lookups, no GT budget cost. |
-| `USE_SIGNALS` | `false` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
-| `SIGNAL_BONUS_WEIGHT` | `0.5` | Weight on the signal bonus. `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `0.5` is the starting compromise — WALLET at ignition (hand ~45, signal +26/−8, bar 48.6) dies at `0.0` (37) and alerts at `1.0` (63); a clean distributed runner cannot clear the bar on hand score alone, so `0.0` misses exactly the legitimate runners this bot exists to catch. |
-| `EARLY_RUNNER_MODE` | `false` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. |
-| `SIG_MAX_AGE_MINUTES` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
-| `SIGNAL_BONUS_WEIGHT` | `0.0` | How far the signal engine may *promote* a token (0–1). `0.0` = signals only veto. Raising it lets runner signals rescue a token the hand score under-rates — see [Catching re-ignited pools](#catching-re-ignited-pools). |
-| `ALLOW_SECURITY_FALLBACK` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
-| `SIG_REQUIRE_OPEN_SOURCE` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
-| `SIG_HOLDER_STANCE` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
-| `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — (`55` for Robinhood in `.env.example`) | Per-chain threshold override, same convention as the floors below. Robinhood `55` because distributed-clean runners there earn 0 holder/CEX points. |
-| `BASE_MIN_LIQUIDITY_USD` etc. | — | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
-| `ALLOWED_USER_IDS` | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
-| `LOG_FEATURES` | `false` | Log a feature row for every token evaluation (see [Training data](#training-data)). |
-| `TRY_BLOCKSCOUT_HOLDERS` | `false` | Retry Blockscout for Robinhood holders. Off because that host answers with a Cloudflare challenge. |
+| Variable | Code default | `.env.example` recommends | Purpose |
+|---|---|---|---|
+| `PAPER_TRADING` | `true` | `true` | Simulate trades. Set to `false` only with a funded hot wallet. |
+| `MIN_SCORE` | `65` | `65` | Alert threshold (0–100), scaled per chain — see [Alert gate](#alert-gate). |
+| `SCORE_NORMALIZE` | `true` | `true` | Scale the alert bar to the points actually reachable on a chain/age. `false` gates on raw `MIN_SCORE`. |
+| `MIN_EFFECTIVE_SCORE` | `35` | `45` | Floor for the scaled threshold, so scaling can't become a rubber stamp. At age ~3m the reachable ceiling is ~53, so `MIN_SCORE=55` scales to 29 and the floor is what actually gates young pools. `35` admitted a token at hand=35.0 exactly; `45` makes the early lane's AND-gates the way in instead. |
+| `MAX_ALLOWED_TAX` | `0` | `10` | Reject tokens above this buy/sell tax %. |
+| `ETHERSCAN_API_KEY` | — | — | Contract verification on all four chains, including Robinhood (chainid 4663). `SCANNER_API_KEY` is accepted as an alias. |
+| `MORALIS_API_KEY` | — | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
+| `COINGECKO_API_KEY` | — | — | Enables CEX-listing scoring (never applies to Robinhood). |
+| `USE_GECKOTERMINAL` | `false` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list (`/latest/dex/pairs/{chain}` 404s), so prefer `true`. Code default is `false` (unchanged behaviour until you opt in). |
+| `GT_SOURCES` | `new_pools,trending,top_volume` | `trending,top_volume` | Global default. `new_pools` = earliest (only feed carrying a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` everywhere makes a sub-50k entry mathematically impossible. |
+| `GT_SOURCES_<CHAIN>` | — (falls back to `GT_SOURCES`) | `new_pools,trending,top_volume` for Robinhood (`GT_SOURCES_ROBINHOOD`) | Per-chain source override (also accepts the prefix style `<CHAIN>_GT_SOURCES`). `new_pools` is not equally clean per chain: Robinhood births alert at $19.8k/$33.5k mcap 3.2 min old, while BSC `new_pools` is template-liquidity placeholders plus $1.9M launches. Enable it where it pays. |
+| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | `1` / `2` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort (page 2 is 5–7m, page 3 is 7–9m), so depth there buys little; `trending` rewards a second page. Each page is one call against the shared GT budget. |
+| `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
+| `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (= disabled) | `200000` | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. Code default leaves behaviour unchanged until you set it. |
+| `NEAR_MISS_POINTS` | `15` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
+| `WATCHLIST_ENABLED` | `false` | `true` | Re-price pools that dropped out of the feeds (born quiet, runs days later — the CATTO shape). DexScreener lookups, no GT budget cost. Code default is `false`. |
+| `USE_SIGNALS` | `false` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | `0.5` | Weight on the signal bonus. Code default `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `.env.example` `0.5` is the starting compromise — WALLET at ignition (hand ~45, signal +26/−8, bar 48.6) dies at `0.0` (37) and alerts at `1.0` (63); a clean distributed runner cannot clear the bar on hand score alone, so `0.0` misses exactly the legitimate runners this bot exists to catch. Raising it re-opens the pass-2 flood vector — see [Catching re-ignited pools](#catching-re-ignited-pools). |
+| `EARLY_RUNNER_MODE` | `false` | `true` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. Code default is `false`; without it a sub-50k pool structurally cannot alert. |
+| `SIG_MAX_AGE_MINUTES` | `0` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
+| `ALLOW_SECURITY_FALLBACK` | `false` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
+| `SIG_REQUIRE_OPEN_SOURCE` | `false` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
+| `SIG_HOLDER_STANCE` | `pump` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
+| `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — (falls back to `MIN_SCORE`) | `55` for Robinhood in `.env.example` | Per-chain threshold override, same convention as the floors below. Robinhood `55` because distributed-clean runners there earn 0 holder/CEX points. |
+| `BASE_MIN_LIQUIDITY_USD` etc. | — | — (examples commented out) | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
+| `ALLOWED_USER_IDS` | — | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
+| `LOG_FEATURES` | `false` | `true` | Log a feature row for every token evaluation (see [Training data](#training-data)). Code default is `false`; example turns it on because the table is the tuning signal. |
+| `TRY_BLOCKSCOUT_HOLDERS` | `false` | `false` | Retry Blockscout for Robinhood holders. Off because that host answers with a Cloudflare challenge. |
 
 Per-chain routing addresses (`ETH_QUOTER_V2`, `BSC_ROUTER_V3`, …) can be
 overridden in `.env`, but working defaults are compiled in for all four chains.
@@ -359,14 +360,18 @@ token at different times) — split by token, not by row, when validating.
   does not — those gates (`SIG_MIN_UNIQUE_BUYER_RATIO`, `SIG_MIN_VOL_LIQ`) are
   what stop a rug from scoring high on volume alone.
 - **Filtering.** The hand-tuned score (`MIN_SCORE`) is the gate, as in the
-  original bot. Signals only veto and penalise (`SIGNAL_BONUS_WEIGHT=0.0` by
-  default). Tighten a noisy chain directly with `BASE_MIN_LIQUIDITY_USD`,
+  original bot. Signals only veto and penalise at the code default
+  (`SIGNAL_BONUS_WEIGHT=0.0`); `.env.example` recommends `0.5` so runner
+  signals can promote. Tighten a noisy chain directly with `BASE_MIN_LIQUIDITY_USD`,
   `BASE_MIN_VOL_5M_USD`, `BASE_MIN_MARKET_CAP_USD`.
 - **Early runners.** `EARLY_RUNNER_MODE=true` + `USE_GECKOTERMINAL=true` gives a
   young pool a chance to alert even though it can't reach `MIN_SCORE`. It is
   AND-gated, so it will not fire on a dead, illiquid or wash-traded pool.
-- Default discovery uses DexScreener's boost/profile lists because the DexScreener
-  "all pairs" endpoint is dead (404).
+  Both default to `false` in code; `.env.example` turns them on.
+- Discovery defaults to DexScreener's boost/profile lists (`USE_GECKOTERMINAL=false`
+  in code) because the DexScreener "all pairs" endpoint is dead (404) — but that
+  path only ever sees paid shills, so set `USE_GECKOTERMINAL=true` for real
+  discovery.
 - Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Liquidity on
   Aerodrome (Base) or V4 venues may not be tradeable.
 - See [`REVIEW.md`](REVIEW.md) for the detailed code review, known issues and

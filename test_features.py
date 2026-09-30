@@ -200,6 +200,18 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
             "get_cex_listings": bot.get_cex_listings,
             "fetch_json": bot.fetch_json,
         }
+        # Isolate from the operator's .env: a global/per-chain mcap ceiling or
+        # per-chain MIN_SCORE override would otherwise decide these gate tests
+        # before the code under test runs.
+        self._saved_env = {
+            k: os.environ.get(k) for k in (
+                "MAX_MARKET_CAP_USD", "BASE_MAX_MARKET_CAP_USD",
+                "ROBINHOOD_MAX_MARKET_CAP_USD", "BASE_MIN_SCORE",
+                "ROBINHOOD_MIN_SCORE",
+            )
+        }
+        for k in self._saved_env:
+            os.environ.pop(k, None)
         bot.security_cache.clear()
         bot.USE_SIGNALS = True
         bot.SIGNAL_FILTERS = signals_module.Filters()
@@ -219,6 +231,11 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for key, value in self._saved.items():
             setattr(bot, key, value)
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         bot.security_cache.clear()
 
     def _pair(self):
@@ -606,6 +623,17 @@ class TestMarketCapCeiling(unittest.IsolatedAsyncioTestCase):
             "get_cex_listings": bot.get_cex_listings,
         }
         self._saved_env = os.environ.get("MAX_MARKET_CAP_USD")
+        # Isolate the gate from the operator's .env: a global/per-chain ceiling
+        # or per-chain MIN_SCORE would otherwise decide these ceiling tests.
+        self._saved_gate_env = {
+            k: os.environ.get(k) for k in (
+                "BASE_MAX_MARKET_CAP_USD", "ROBINHOOD_MAX_MARKET_CAP_USD",
+                "MIN_SCORE", "BASE_MIN_SCORE", "ROBINHOOD_MIN_SCORE",
+                "SCORE_NORMALIZE", "MIN_EFFECTIVE_SCORE",
+            )
+        }
+        for k in self._saved_gate_env:
+            os.environ.pop(k, None)
         self.recorder = _RecordingLogger()
         bot.FEATURE_LOGGER = self.recorder
         bot.USE_SIGNALS = False
@@ -635,6 +663,11 @@ class TestMarketCapCeiling(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("MAX_MARKET_CAP_USD", None)
         else:
             os.environ["MAX_MARKET_CAP_USD"] = self._saved_env
+        for key, value in self._saved_gate_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def _pair(self, market_cap):
         now_ms = time.time() * 1000

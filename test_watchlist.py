@@ -263,6 +263,17 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
         bot.get_cex_listings = fake_cex
         bot.ALERT_THRESHOLD = 0  # the lane's job is coverage; the gate is separate
         bot.USE_SIGNALS = False
+        # Isolate from the operator's .env: a global/per-chain mcap ceiling
+        # (e.g. MAX_MARKET_CAP_USD=200000) would reject this $500k fixture
+        # before the lane is even exercised.
+        saved_gate_env = {
+            k: os.environ.get(k) for k in (
+                "MAX_MARKET_CAP_USD", "BASE_MAX_MARKET_CAP_USD",
+                "ROBINHOOD_MAX_MARKET_CAP_USD",
+            )
+        }
+        for k in saved_gate_env:
+            os.environ.pop(k, None)
         try:
             pairs = asyncio.run(bot.collect_watchlist_pairs(None))
             self.assertEqual(len(pairs), 1)
@@ -271,6 +282,11 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
             (bot.fetch_json, bot.get_token_security,
              bot.get_holder_concentration, bot.get_cex_listings,
              bot.ALERT_THRESHOLD, bot.USE_SIGNALS) = saved
+            for key, value in saved_gate_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         self.assertIsNotNone(result, "the re-ignited pool should clear a zero bar")
         self.assertEqual(result["chain"], "base")
