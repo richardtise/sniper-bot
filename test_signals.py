@@ -1,6 +1,7 @@
 """Unit tests for signals.py — run with: python -m unittest -v test_signals"""
 
 import time
+import os
 import unittest
 
 import signals
@@ -325,3 +326,114 @@ class TestPairHistory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVolumeSurgeLane(unittest.TestCase):
+    """Abnormal volume relative to the pool's OWN baseline, AND-gated.
+
+    For a "screen the top coins by volume every scan" strategy the signal is a
+    step change, not a size: a $10M pool doing its normal $200k per 5 minutes is
+    not a surge, and a quiet $40k pool suddenly doing $12k is. It also needs
+    history — without a baseline there is nothing to call abnormal, which is what
+    stops it firing on first sighting.
+    """
+
+    def setUp(self):
+        self.f = signals.Filters()
+        self.h = signals.PairHistory()
+        self.sec = {"is_honeypot": False, "buy_tax": 0, "sell_tax": 0,
+                    "open_source": True, "lp_locked": True}
+
+    def _pair(self, vol_5m, liq, buys=60, sells=40, chg=10.0, age_min=600):
+        return {
+            "chainId": "base", "dexId": "uniswap_v3",
+            "baseToken": {"address": "0x" + "ab" * 20, "symbol": "T"},
+            "quoteToken": {"address": "0x" + "cd" * 20, "symbol": "WETH"},
+            "liquidity": {"usd": liq}, "marketCap": liq * 30,
+            "volume": {"m5": vol_5m, "h1": vol_5m * 6, "h6": vol_5m * 12, "h24": vol_5m * 24},
+            "txns": {"m5": {"buys": buys, "sells": sells, "buyers": buys, "sellers": sells}},
+            "priceChange": {"m5": chg, "h1": 20.0, "h6": 30.0, "h24": 40.0},
+            "pairCreatedAt": (time.time() - age_min * 60) * 1000,
+            "source": "test",
+        }
+
+    def _build_history(self, pair, baseline_vol, n=4):
+        """Feed n quiet scans, then the current (surge) reading."""
+        for _ in range(n):
+            quiet = dict(pair)
+            quiet["volume"] = dict(pair["volume"])
+            quiet["volume"]["m5"] = baseline_vol
+            self.h.observe(quiet, security=self.sec)
+        self.h.observe(pair, security=self.sec)
+
+    def test_no_baseline_cannot_surge(self):
+        """First sighting must not qualify: nothing to compare against."""
+        pair = self._pair(50_000, 20_000)
+        self.h.observe(pair, security=self.sec)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertTrue(any("no_baseline" in r for r in reasons))
+
+    def test_a_step_change_against_its_own_baseline_qualifies(self):
+        pair = self._pair(60_000, 20_000)          # 3x liquidity in 5m
+        self._build_history(pair, baseline_vol=8_000)   # was doing 8k
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertEqual(reasons, [], f"expected a surge, got {reasons}")
+
+    def test_a_big_pool_trading_normally_does_not_qualify(self):
+        """Size alone is not a surge — this is the whole point of the lane."""
+        pair = self._pair(200_000, 10_000_000)     # huge pool, 2% turnover
+        self._build_history(pair, baseline_vol=200_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertTrue(any("accel" in r for r in reasons))
+
+    def test_wash_turnover_is_rejected_even_when_accelerating(self):
+        """A 100x-liquidity 5m print is a wash, not a runner."""
+        pair = self._pair(2_000_000, 20_000)       # 100x liquidity
+        self._build_history(pair, baseline_vol=1_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertIn("wash_turnover", reasons)
+
+    def test_thin_liquidity_is_rejected(self):
+        pair = self._pair(30_000, 1_000)
+        self._build_history(pair, baseline_vol=1_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertIn("surge_liq", reasons)
+
+    def test_sell_dominated_surge_is_rejected(self):
+        pair = self._pair(60_000, 20_000, buys=20, sells=80)
+        self._build_history(pair, baseline_vol=8_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertIn("surge_buy_ratio", reasons)
+
+    def test_already_vertical_is_rejected(self):
+        pair = self._pair(60_000, 20_000, chg=400.0)
+        self._build_history(pair, baseline_vol=8_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertIn("surge_already_vertical", reasons)
+
+    def test_a_honeypot_is_never_a_surge(self):
+        pair = self._pair(60_000, 20_000)
+        self._build_history(pair, baseline_vol=8_000)
+        bad = dict(self.sec); bad["is_honeypot"] = True
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=bad, filters=self.f)
+        self.assertIn("honeypot", reasons)
+
+    def test_majors_are_excluded(self):
+        pair = self._pair(60_000, 20_000)
+        pair["baseToken"] = dict(pair["baseToken"]); pair["baseToken"]["symbol"] = "WETH"
+        self._build_history(pair, baseline_vol=8_000)
+        reasons = signals.volume_surge_reasons(pair, history=self.h, security=self.sec, filters=self.f)
+        self.assertIn("major_asset", reasons)
+
+    def test_metrics_are_reported_for_logging(self):
+        pair = self._pair(60_000, 20_000)
+        self._build_history(pair, baseline_vol=8_000)
+        m = signals.surge_metrics(pair, history=self.h)
+        self.assertGreater(m["vol_accel"], 4.0)
+        self.assertGreaterEqual(m["observations"], 3)
+        self.assertAlmostEqual(m["vol_liq"], 3.0)
+
+    def test_env_knobs_are_configurable(self):
+        os.environ["SIG_SURGE_MIN_ACCEL"] = "9.5"
+        self.addCleanup(lambda: os.environ.pop("SIG_SURGE_MIN_ACCEL", None))
+        self.assertEqual(signals.Filters.from_env().surge_min_accel, 9.5)

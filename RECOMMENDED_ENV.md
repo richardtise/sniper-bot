@@ -54,9 +54,19 @@ MIN_EFFECTIVE_SCORE=30
 ROBINHOOD_MIN_SCORE=50          # must be set, or it silently overrides MIN_SCORE
 PAPER_TRADING=true              # until you have watched a full day of alerts
 
+# ── Strategy: volume surge over a volume-ranked universe ────────────────────
+# (If you ARE sniping launches instead, use GT_SOURCES=new_pools,... and
+#  EARLY_RUNNER_MODE=true, and expect mostly Uniswap V4 that cannot be bought.)
+VOLUME_SURGE_MODE=true
+SIG_SURGE_MIN_ACCEL=4.0
+SIG_SURGE_MIN_OBSERVATIONS=3
+SIG_SURGE_MIN_LIQUIDITY_USD=8000
+SIG_SURGE_MIN_TXNS_5M=15
+SIG_SURGE_MIN_BUY_RATIO=0.55
+
 # ── Discovery: BOTH sources (union, not either/or) ───────────────────────────
 USE_GECKOTERMINAL=true
-GT_SOURCES=new_pools,trending,top_volume
+GT_SOURCES=top_volume,trending      # volume universe, re-scanned each cycle
 GT_PAGES_NEW=1
 GT_PAGES_TRENDING=1
 SIG_MAX_AGE_MINUTES=0           # age is not a quality signal

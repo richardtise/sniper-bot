@@ -80,6 +80,11 @@ omitted key means the code default — currently the conservative/off side.
 | `ALLOWED_USER_IDS` | — | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
 | `LOG_FEATURES` | `false` | `true` | Log a feature row for every token evaluation (see [Training data](#training-data)). Code default is `false`; example turns it on because the table is the tuning signal. |
 | `TRY_BLOCKSCOUT_HOLDERS` | `false` | `false` | Retry Blockscout for Robinhood holders. Off because that host answers with a Cloudflare challenge. |
+| `VOLUME_SURGE_MODE` | `false` | `true` | Alerts on **abnormal volume relative to the pool's own trailing baseline** (AND-gated), instead of on a launch. The strategy is: screen the top coins by volume every scan, catch a step change fast. Needs `USE_SIGNALS` and repeated scans to build a baseline, which a volume-ranked feed provides. |
+| `SIG_SURGE_MIN_ACCEL` | `4.0` | `4.0` | How many times its own median 5m volume the pool must be doing. `2.0` is noise on a quiet pool. |
+| `SIG_SURGE_MIN_OBSERVATIONS` | `3` | `3` | Scans of history before the lane can fire. Without a baseline nothing is abnormal, which is what stops it firing on a first sighting. |
+| `SIG_SURGE_MIN_LIQUIDITY_USD` / `SIG_SURGE_MIN_VOL_LIQ` / `SIG_SURGE_MIN_TXNS_5M` / `SIG_SURGE_MIN_BUY_RATIO` | `8000` / `0.05` / `15` / `0.55` | same | Depth and participation sanity: a surge must be tradeable and buyer-led, not one whale. |
+| `SIG_SURGE_MAX_CHG_5M` | `200` | `200` | Already vertical by the time we see it is late, not early. |
 | `REQUIRE_TRADEABLE_VENUE` | `false` | `false` | Reject a pool whose DEX the configured routers cannot reach (Uniswap V4, V3 forks, Pons, Aerodrome) before spending enrichment budget. `false` still alerts but names the DEX and withholds buy buttons. See [Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4). |
 | `TRADEABLE_DEXES` / `<CHAIN>_TRADEABLE_DEXES` | — (built-in per-chain patterns) | — | Regex patterns (matched against the feed's `dexId`) for venues you have added routers for. Overrides the built-in uniswap v2/v3 (eth/base/robinhood) and pancakeswap v2/v3 (bsc) defaults. |
 
@@ -385,6 +390,41 @@ Reproduce any row:
 bot-env/bin/python diag/dex_coverage.py --pages 6 --pause 2.8
 bot-env/bin/python diag/alert_tradeability.py --pages 6
 ```
+
+## Two strategies: launch sniping vs volume surge
+
+The bot supports two different games, and they want different configs. Pick one
+deliberately; running neither leaves the gate as the hand-tuned score alone, which
+the audit measures at AUC 0.46–0.57 (a coin flip). `config_warnings()` says so.
+
+| | **Launch sniping** | **Volume surge** (recommended if you are not sniping launches) |
+|---|---|---|
+| Universe | `new_pools` (3–5 min old) | `top_volume,trending` (established pools) |
+| Signal | youth + participation AND-gates | **step change against the pool's own volume baseline** |
+| Lane | `EARLY_RUNNER_MODE=true` | `VOLUME_SURGE_MODE=true` |
+| Needs | `USE_GECKOTERMINAL` | `USE_SIGNALS` + repeated scans for a baseline |
+| Weakness | mostly Uniswap V4 → unbuyable | resolves in ~1–2 min, not instant (rolling 5m window) |
+
+### The volume-surge lane
+
+For "screen the top coins by volume every scan and catch abnormal volume fast",
+size is not the signal — a change in size is. A $10M pool doing its normal $200k
+per 5 minutes is not a surge; a quiet $40k pool suddenly doing $12k is. The lane
+compares each pool's 5m volume against the **median of its own previous scans**
+(`signals.PairHistory.vol_accel`) and ANDs that with depth, turnover,
+participation, buy-side control and a "not already vertical" guard, plus the same
+honeypot/tax/flag non-negotiables as every other lane.
+
+Because it is AND-gated, one strong number cannot carry a bad pool through the
+way it can in the additive score. And because it needs `surge_min_observations`
+scans before it can fire, it cannot trigger on a pool it has never seen — the
+baseline *is* the signal.
+
+**Honest latency limit:** `volume.m5` is a rolling 5-minute window sampled once
+per scan, so consecutive scans share most of their window. A step change resolves
+over **~1–2 minutes**, not instantly, and the measured acceleration understates
+the instantaneous spike. This is "fast" in the sense of catching the first
+minutes of a volume event, not sub-second sniping.
 
 ## "Why did it ping me at $3M instead of $300k?"
 

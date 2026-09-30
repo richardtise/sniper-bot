@@ -53,6 +53,9 @@ __all__ = [
     "evaluate",
     "hard_reject_reasons",
     "early_runner_reasons",
+    "volume_surge_reasons",
+    "surge_metrics",
+    "qualifies_as_volume_surge",
     "qualifies_as_early_runner",
     "runner_signals",
     "normalize_security",
@@ -173,6 +176,14 @@ _GLOBAL_ENV_MAPPING = {
     "SIG_EARLY_MIN_UNIQUE_BUYERS": ("early_min_unique_buyers", int),
     "SIG_EARLY_MAX_CHG_5M": ("early_max_chg_5m", float),
     "SIG_EARLY_REQUIRE_UNIQUE_BUYERS": ("early_require_unique_buyers", _truthy),
+    "SIG_SURGE_MIN_ACCEL": ("surge_min_accel", float),
+    "SIG_SURGE_MIN_OBSERVATIONS": ("surge_min_observations", int),
+    "SIG_SURGE_MIN_LIQUIDITY_USD": ("surge_min_liquidity_usd", float),
+    "SIG_SURGE_MIN_VOL_LIQ": ("surge_min_vol_liq", float),
+    "SIG_SURGE_MIN_TXNS_5M": ("surge_min_txns_5m", int),
+    "SIG_SURGE_MIN_BUY_RATIO": ("surge_min_buy_ratio", float),
+    "SIG_SURGE_MAX_CHG_5M": ("surge_max_chg_5m", float),
+    "SIG_SURGE_MAX_AGE_MINUTES": ("surge_max_age_minutes", float),
 }
 
 # Per-chain overrides, using the repo's <CHAIN>_ prefix convention, e.g.
@@ -260,6 +271,31 @@ class Filters:
     early_min_unique_buyers: int = 6
     early_max_chg_5m: float = 150.0          # already vertical = late
     early_require_unique_buyers: bool = True
+
+    # --- volume-surge lane (VOLUME_SURGE_MODE) --------------------------------
+    # For a "top coins by volume, re-scanned every cycle" strategy: the universe
+    # is established pools, and the signal is a STEP CHANGE in a pool's own
+    # volume rather than a fixed dollar threshold. Every condition is ANDed, so a
+    # single strong number cannot carry a bad pool through (the additive score
+    # allows exactly that; see the audit in RECOMMENDED_ENV.md).
+    #
+    # `surge_min_accel` is measured against the median of this pool's previous
+    # 5-minute volumes, from PairHistory — so it needs `surge_min_observations`
+    # scans before the lane can fire at all. That is deliberate: without a
+    # baseline there is nothing to call abnormal.
+    #
+    # Honest limitation: `volume.m5` is a ROLLING 5-minute window, sampled once
+    # per scan. Two consecutive scans therefore share most of their window, so a
+    # true step change resolves over ~1-2 minutes rather than instantly, and the
+    # observed accel understates the instantaneous spike.
+    surge_min_accel: float = 4.0             # 5m volume vs its own trailing median
+    surge_min_observations: int = 3           # scans of history required
+    surge_min_liquidity_usd: float = 8_000.0  # tradeable depth
+    surge_min_vol_liq: float = 0.05           # real turnover, not dust
+    surge_min_txns_5m: int = 15               # participation, not one whale
+    surge_min_buy_ratio: float = 0.55         # buyers in control
+    surge_max_chg_5m: float = 200.0           # already vertical = late
+    surge_max_age_minutes: float = 0.0        # 0 = no age cap (established pools)
 
     # --- holder stance --------------------------------------------------------
     # "pump" (default) = early-runner mode. Early runners are usually dominated
@@ -612,6 +648,101 @@ def early_runner_reasons(
         if sec[key]:
             reasons.append(key)
     return reasons
+
+
+def volume_surge_reasons(
+    pair: dict,
+    *,
+    history: Optional["PairHistory"] = None,
+    security: Optional[dict] = None,
+    gt: Optional[dict] = None,
+    filters: Optional[Filters] = None,
+) -> List[str]:
+    """AND-gated abnormal-volume lane: empty list means it qualifies.
+
+    Built for the "screen the top coins by volume every scan, catch abnormal
+    volume fast" strategy rather than for launch sniping. The signal is a step
+    change relative to the pool's OWN trailing baseline (``vol_accel`` from
+    ``PairHistory``), so it does not reward a pool merely for being large — a
+    $10M pool doing its normal $200k per 5 minutes is not a surge, and a quiet
+    $40k pool suddenly doing $12k is.
+
+    Returns the list of failing conditions (mirroring ``early_runner_reasons``),
+    so a caller can log exactly why a near-miss did not qualify.
+    """
+    f = filters or Filters()
+    sec = normalize_security(security, gt)
+    reasons: List[str] = []
+
+    chain = str(pair.get("chainId") or "")
+    if is_major_asset(pair, chain):
+        reasons.append("major_asset")
+
+    liquidity = _num(_dig(pair, "liquidity", "usd"))
+    vol_5m = _num(_dig(pair, "volume", "m5"))
+    buys = int(_dig(pair, "txns", "m5", "buys"))
+    sells = int(_dig(pair, "txns", "m5", "sells"))
+    txns = buys + sells
+    chg_5m = _num(_dig(pair, "priceChange", "m5"))
+    created = pair.get("pairCreatedAt")
+    age = (time.time() - _num(created) / 1000.0) / 60.0 if created else None
+
+    # Without a baseline there is nothing to call abnormal. This is the gate that
+    # keeps the lane from firing on the very first sighting of a pool.
+    accel = 0.0
+    observations = 0
+    if history is not None:
+        tr = history.trend(chain, str((pair.get("baseToken") or {}).get("address") or ""))
+        accel = tr.get("vol_accel") or 0.0
+        observations = int(tr.get("observations") or 0)
+    if observations < f.surge_min_observations:
+        reasons.append(f"no_baseline({observations}<{f.surge_min_observations})")
+    if accel < f.surge_min_accel:
+        reasons.append(f"accel x{accel:.1f}<x{f.surge_min_accel:g}")
+    if liquidity < f.surge_min_liquidity_usd:
+        reasons.append("surge_liq")
+    vol_liq = _ratio(vol_5m, liquidity)
+    if vol_liq < f.surge_min_vol_liq:
+        reasons.append("surge_turnover")
+    if vol_liq > f.max_vol_liq_ratio:
+        reasons.append("wash_turnover")
+    if txns < f.surge_min_txns_5m:
+        reasons.append("surge_txns")
+    if _ratio(buys, txns) < f.surge_min_buy_ratio:
+        reasons.append("surge_buy_ratio")
+    if chg_5m > f.surge_max_chg_5m:
+        reasons.append("surge_already_vertical")
+    if f.surge_max_age_minutes and age is not None and age > f.surge_max_age_minutes:
+        reasons.append("surge_too_old")
+
+    # Same non-negotiables as every other lane.
+    if sec["honeypot"]:
+        reasons.append("honeypot")
+    if sec["buy_tax"] > f.max_tax_pct or sec["sell_tax"] > f.max_tax_pct:
+        reasons.append("tax")
+    for key in ("hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
+                "owner_change_balance", "transfer_pausable", "slippage_modifiable",
+                "take_back_ownership", "blacklist"):
+        if sec[key]:
+            reasons.append(key)
+    return reasons
+
+
+def surge_metrics(pair: dict, *, history: Optional["PairHistory"] = None) -> Dict[str, float]:
+    """The numbers behind the lane, for logging/alerting without recomputing."""
+    chain = str(pair.get("chainId") or "")
+    token = str((pair.get("baseToken") or {}).get("address") or "")
+    tr = history.trend(chain, token) if history is not None else {}
+    return {
+        "vol_accel": tr.get("vol_accel") or 0.0,
+        "observations": tr.get("observations") or 0,
+        "vol_liq": _ratio(_num(_dig(pair, "volume", "m5")),
+                          _num(_dig(pair, "liquidity", "usd"))),
+    }
+
+
+def qualifies_as_volume_surge(pair: dict, **kwargs) -> bool:
+    return not volume_surge_reasons(pair, **kwargs)
 
 
 def qualifies_as_early_runner(

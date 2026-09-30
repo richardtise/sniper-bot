@@ -106,6 +106,14 @@ DEXSCREENER_ENDPOINTS = {
 # signals.early_runner_reasons() to hold. Default OFF.
 EARLY_RUNNER_MODE = os.getenv("EARLY_RUNNER_MODE", "false").lower() == "true" and SIGNALS_AVAILABLE
 
+# Abnormal-volume lane: alerts when a pool's 5m volume is a multiple of its OWN
+# trailing baseline, AND-gated. This is the "screen the top coins by volume every
+# scan and catch abnormal volume fast" strategy, as opposed to launch sniping: no
+# age cap by default, and the signal is a step change rather than a size.
+# Needs USE_SIGNALS (it lives in signals.py) and history from repeated scans of
+# the same universe, which a volume-ranked feed provides.
+VOLUME_SURGE_MODE = os.getenv("VOLUME_SURGE_MODE", "false").lower() == "true" and SIGNALS_AVAILABLE
+
 # Optional Telegram allowlist. Empty -> only CHAT_ID is accepted. Set this when
 # CHAT_ID is a group so other members cannot run /sell, /risk, /setamounts.
 ALLOWED_USER_IDS = {
@@ -201,6 +209,12 @@ def config_warnings() -> list:
     if not EARLY_RUNNER_MODE:
         warns.append(
             "EARLY_RUNNER_MODE=false -> a young sub-50k-mcap pool can never alert."
+        )
+    if not VOLUME_SURGE_MODE and not EARLY_RUNNER_MODE:
+        warns.append(
+            "VOLUME_SURGE_MODE=false and EARLY_RUNNER_MODE=false -> the alert gate "
+            "is the hand-tuned score alone, which the audit measures at AUC 0.46-0.57 "
+            "(a coin flip). One of the AND-gated lanes should be on."
         )
     if not LOG_FEATURES:
         warns.append(
@@ -816,6 +830,7 @@ FEATURE_FIELDS = [
     # column that makes that measurable instead of anecdotal.
     "dex_id", "venue_tradeable", "venue_requirement",
     "first_sight_mcap", "first_sight_age_minutes", "first_sight_ts",
+    "volume_surge", "vol_accel", "vol_observations",
     "signal_bonus", "signal_penalty", "signal_notes",
     # Per-component score breakdown. The total alone cannot answer "which part of
     # the model withheld the points", which is the question every miss raises.
@@ -842,7 +857,7 @@ _FEATURE_INT_FIELDS = {
     "owner_change_balance", "transfer_pausable", "slippage_modifiable",
     "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
     "is_blacklisted", "is_whitelisted", "lp_locked", "security_known",
-    "venue_tradeable",
+    "venue_tradeable", "volume_surge", "vol_observations",
     "rejected", "passed_threshold", "alert_sent", "paper_mode", "early_runner",
 }
 _FEATURE_TEXT_FIELDS = {
@@ -2624,6 +2639,33 @@ async def evaluate_token(session, pair):
                 logger.info(f"Early-runner lane {symbol}@{chain} age={age_display}m score={total_score:.0f}")
     feat["early_runner"] = 1 if early_ok else 0
 
+    # Abnormal-volume lane. Same AND-gated shape as the early lane, but the
+    # qualifying signal is a step change against the pool's own baseline rather
+    # than youth, so it can fire on an established pool having an unusual hour.
+    surge_ok = False
+    if VOLUME_SURGE_MODE and total_score < threshold and not early_ok and USE_SIGNALS:
+        surge_filters = _filters_for_chain(chain)
+        surge_reasons = signals.volume_surge_reasons(
+            pair, history=PAIR_HISTORY, security=security, filters=surge_filters,
+        )
+        metrics = signals.surge_metrics(pair, history=PAIR_HISTORY)
+        feat["vol_accel"] = metrics["vol_accel"]
+        feat["vol_observations"] = metrics["observations"]
+        if not surge_reasons:
+            surge_ok = True
+            logger.info(
+                f"Volume surge {symbol}@{chain} "
+                f"accel=x{metrics['vol_accel']:.1f} vol/liq={metrics['vol_liq']:.3f} "
+                f"txns={buys_5m + sells_5m} score={total_score:.0f}"
+            )
+        elif VERBOSE_LOGGING and metrics["vol_accel"] >= surge_filters.surge_min_accel:
+            # Near-miss: the volume moved but something else withheld the pass.
+            logger.info(
+                f"Volume surge near-miss {symbol}@{chain} "
+                f"accel=x{metrics['vol_accel']:.1f}: {','.join(surge_reasons)}"
+            )
+    feat["volume_surge"] = 1 if surge_ok else 0
+
     # ── Scored-token logging: near-misses only ─────────────────────────────────
     # With new_pools discovery, ~80 tokens per cycle reach scoring and all but a
     # handful die at below_threshold. Logging every one at INFO is the "bullshit
@@ -2652,7 +2694,7 @@ async def evaluate_token(session, pair):
     # total_score = legacy_total - signal_penalty + bonus*weight, and the weight
     # defaults to 0.0, gating on total_score alone is *identical* to the old
     # two-gate form at the default while letting the knob actually work above it.
-    if total_score < threshold and not early_ok:
+    if total_score < threshold and not early_ok and not surge_ok:
         return reject("below_threshold")
 
     return finish(None, {
@@ -2668,6 +2710,8 @@ async def evaluate_token(session, pair):
         "dex_id": dex_id,
         "venue_tradeable": venue_tradeable,
         "venue_requirement": venue_needs,
+        "volume_surge": surge_ok,
+        "vol_accel": feat.get("vol_accel"),
         "first_sight_mcap": (first_sight or {}).get("mcap"),
         "first_sight_age_minutes": (first_sight or {}).get("age_minutes"),
         "first_sight_ts": (first_sight or {}).get("ts"),
@@ -3967,6 +4011,11 @@ async def send_alert(alert):
     # How early were we? Either discovery saw this small and the gate held it
     # back, or discovery never saw it small — opposite fixes, and previously only
     # distinguishable by grepping FIRST SIGHT out of the log.
+    surge_text = ""
+    if alert.get("volume_surge"):
+        accel = alert.get("vol_accel") or 0.0
+        surge_text = (f"⚡ <b>Abnormal volume:</b> {accel:.1f}x its own 5m baseline\n\n")
+
     fs_mcap = alert.get("first_sight_mcap")
     fs_ts = alert.get("first_sight_ts")
     first_text = ""
@@ -3983,6 +4032,7 @@ async def send_alert(alert):
         f"<b>{esc(alert['name'])}</b> ({esc(alert['symbol'])})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
         f"🕒 Age: <b>{age_display} min</b>\n\n"
+        f"{surge_text}"
         f"{first_text}"
         f"{route_text}"
         f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}\n"
