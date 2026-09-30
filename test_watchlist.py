@@ -208,8 +208,11 @@ class TestWatchlistFetching(WatchlistTestBase):
         self.note(token="0xabc", hand=30.0)
 
         async def fake_fetch(session, url, headers=None, **kw):
-            return {"pairs": [{"pairAddress": "0xpairabc", "chainId": "base",
-                               "baseToken": {"symbol": "T"}}]}
+            # Batched /tokens/v1 shape: a list, with the token address present so
+            # the deepest-pool-per-token collapse can key on it.
+            return [{"pairAddress": "0xpairabc", "chainId": "base",
+                     "baseToken": {"address": "0xabc", "symbol": "T"},
+                     "liquidity": {"usd": 1234.0}}]
 
         saved = bot.fetch_json
         bot.fetch_json = fake_fetch
@@ -229,7 +232,8 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
 
         async def fake_fetch(session, url, headers=None, **kw):
             # The re-ignition: heavy 5m volume, buys dominant, price up.
-            return {"pairs": [{
+            # The batched lane calls DexScreener /tokens/v1, which returns a LIST.
+            return [{
                 "pairAddress": "0xpairoar", "chainId": "base", "dexId": "uniswap",
                 "baseToken": {"address": "0xboar", "symbol": "boar", "name": "boar"},
                 "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
@@ -241,7 +245,7 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
                          "h1": {"buys": 200, "sells": 60}},
                 "priceChange": {"m5": 40.0, "h1": 150.0, "h6": 200.0, "h24": 300.0},
                 "pairCreatedAt": (time.time() - 6 * 3600) * 1000,
-            }]}
+            }]
 
         async def fake_security(session, chain, token):
             sec = bot._security_placeholder("test")
@@ -295,3 +299,88 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStandingUniverse(WatchlistTestBase):
+    """Batching is what makes a standing universe affordable.
+
+    Measured 2026-09-30: 0 of 20 pools on ANY GeckoTerminal ranking
+    (top_volume, trending, trending?duration=5m, h24_tx_count, and deep pages)
+    had concentrated 10% of their daily volume into the last 5 minutes. There is
+    no short-window ranking to subscribe to (sort=h1_volume_usd_desc returns 400,
+    a network trades feed 404s), so a pool mid-pump is not on any list. The only
+    way to see the spike is to already be watching the pool — which is why the
+    watchlist fetches are batched (30 token addresses per call) instead of one
+    call per pool.
+    """
+
+    def test_batches_respect_the_30_address_cap(self):
+        self.assertEqual([len(b) for b in bot.batches(list(range(65)), 30)], [30, 30, 5])
+        self.assertEqual(bot.batches([], 30), [])
+
+    def test_one_call_per_30_pools(self):
+        import asyncio
+        for i in range(65):
+            self.note(token=f"0xt{i}", symbol=f"T{i}")
+        calls = []
+
+        async def fake_fetch(session, url, headers=None, **kw):
+            calls.append(url)
+            return [{"pairAddress": f"0xp{i}", "chainId": "base",
+                     "baseToken": {"address": "0xt0", "symbol": "T"},
+                     "liquidity": {"usd": 1000.0}}]
+
+        saved = bot.fetch_json
+        bot.fetch_json = fake_fetch
+        try:
+            asyncio.run(bot.collect_watchlist_pairs(None))
+        finally:
+            bot.fetch_json = saved
+        # 65 pools must cost 3 calls, not 65.
+        self.assertLessEqual(len(calls), 3)
+        self.assertTrue(all("/tokens/v1/" in u for u in calls), calls[:2])
+
+    def test_deepest_pool_wins_for_a_multi_pool_token(self):
+        import asyncio
+        self.note(token="0xmulti", symbol="M")
+
+        async def fake_fetch(session, url, headers=None, **kw):
+            return [
+                {"pairAddress": "0xshallow", "chainId": "base",
+                 "baseToken": {"address": "0xmulti", "symbol": "M"},
+                 "liquidity": {"usd": 100.0}},
+                {"pairAddress": "0xdeep", "chainId": "base",
+                 "baseToken": {"address": "0xmulti", "symbol": "M"},
+                 "liquidity": {"usd": 90_000.0}},
+            ]
+
+        saved = bot.fetch_json
+        bot.fetch_json = fake_fetch
+        try:
+            pairs = asyncio.run(bot.collect_watchlist_pairs(None))
+        finally:
+            bot.fetch_json = saved
+        self.assertEqual([p["pairAddress"] for p in pairs], ["0xdeep"])
+
+    def test_other_chains_in_a_batch_are_ignored(self):
+        import asyncio
+        self.note(token="0xc", symbol="C")
+
+        async def fake_fetch(session, url, headers=None, **kw):
+            return [{"pairAddress": "0xwrong", "chainId": "ethereum",
+                     "baseToken": {"address": "0xc"}, "liquidity": {"usd": 5.0}}]
+
+        saved = bot.fetch_json
+        bot.fetch_json = fake_fetch
+        try:
+            pairs = asyncio.run(bot.collect_watchlist_pairs(None))
+        finally:
+            bot.fetch_json = saved
+        self.assertEqual(pairs, [])
+
+    def test_code_defaults_remember_everything(self):
+        """A pool scoring 0 today is the one that can surge tomorrow."""
+        import inspect
+        src = inspect.getsource(bot)
+        self.assertIn('WATCHLIST_MIN_BEST_SCORE", "0"', src)
+        self.assertIn('WATCHLIST_MAX", "300"', src)

@@ -65,6 +65,17 @@ GT_ENDPOINTS: Dict[str, str] = {
     "new_pools": "new_pools",
     "trending": "trending_pools",
     "top_volume": "pools?sort=h24_volume_usd_desc",
+    # More responsive rankings, measured 2026-09-30 on the share of a pool's 24h
+    # volume that sits in the last 5 minutes (uniform trading = 0.35%, so higher
+    # means the list skews toward pools whose activity is *recent*):
+    #   trending?duration=5m   0.22% (base) 0.31% (bsc)   <- most responsive
+    #   pools?sort=h24_volume  0.09% (base) 0.00% (bsc)
+    #   pools?sort=h24_tx_count 0.06% (base)
+    # NOTE: `sort=h1_volume_usd_desc` and other short-window sorts return HTTP 400
+    # and there is no network trades feed (404), so these are the best available —
+    # and none of them surface a pool *during* a spike. See collect_watchlist_pairs.
+    "trending_5m": "trending_pools?duration=5m",
+    "top_txns": "pools?sort=h24_tx_count_desc",
 }
 
 # Default per-source list cache TTLs (seconds). `new_pools` churns a whole
@@ -76,6 +87,8 @@ GT_ENDPOINTS: Dict[str, str] = {
 DEFAULT_LIST_TTLS: Dict[str, float] = {
     "new_pools": 30.0,
     "trending": 60.0,
+    "trending_5m": 45.0,
+    "top_txns": 90.0,
     "top_volume": 180.0,
 }
 

@@ -405,6 +405,42 @@ the audit measures at AUC 0.46–0.57 (a coin flip). `config_warnings()` says so
 | Needs | `USE_GECKOTERMINAL` | `USE_SIGNALS` + repeated scans for a baseline |
 | Weakness | mostly Uniswap V4 → unbuyable | resolves in ~1–2 min, not instant (rolling 5m window) |
 
+### The universe problem — and why the watchlist is now the main lane
+
+**Measured 2026-09-30: no GeckoTerminal ranking surfaces a pool while it is
+surging.** Share of pools with ≥10% of their 24h volume inside the last 5 minutes
+(`0/20` everywhere; uniform trading would be ~0.35%):
+
+| Ranking | median 5m/24h | surge-like |
+|---|---|---|
+| `pools?sort=h24_volume_usd_desc` (`top_volume`) | 0.09% | 0/20 |
+| `pools?sort=h24_tx_count_desc` (`top_txns`) | 0.06% | 0/20 |
+| `trending_pools` | 0.02% | 0/20 |
+| `trending_pools?duration=5m` (`trending_5m`) | **0.22%** | 0/20 |
+| `top_volume` page 10 | 0.00% | 0/20 |
+| `trending?duration=5m` page 10 | 0.02% | 1/20 |
+
+There is also no better endpoint to subscribe to: `sort=h1_volume_usd_desc` and
+other short-window sorts return **HTTP 400**, and a network-wide trades feed
+**404s**. So the ranking is not the detection mechanism — it can only seed one.
+
+That is what the watchlist is for, and why it is now a **standing universe**
+rather than a re-ignition side lane:
+
+* it remembers **every** pool it has evaluated (`WATCHLIST_MIN_BEST_SCORE=0`), not
+  just ones that already scored well — a pool scoring 0 today is exactly the one
+  that can surge tomorrow;
+* re-pricing is **batched**: DexScreener `/tokens/v1` accepts 30 token addresses
+  per call, so a 300-pool universe costs ~10 calls per cycle instead of 300. That
+  is what makes watching broadly affordable;
+* with a baseline on a pool, `VOLUME_SURGE_MODE` can fire on a step change even
+  though the pool is on no list at that moment.
+
+So the honest answer to "will this catch the pump early": **the surge lane is
+correct, but it can only fire on pools already being watched.** `trending_5m` is
+the most responsive seed ranking (2–3× the others), and the seeded universe plus
+baselines is what turns detection into something that can happen early.
+
 ### The volume-surge lane
 
 For "screen the top coins by volume every scan and catch abnormal volume fast",

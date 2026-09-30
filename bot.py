@@ -138,12 +138,14 @@ ALLOWED_USER_IDS = {
 # carries no unique-buyer data (DexScreener has none), so the AND-gates in
 # signals.py that depend on `buyers` are skipped for these candidates.
 WATCHLIST_ENABLED = os.getenv("WATCHLIST_ENABLED", "false").lower() == "true"
-WATCHLIST_MAX = max(0, int(os.getenv("WATCHLIST_MAX", "40")))            # re-checks per cycle
+WATCHLIST_MAX = max(0, int(os.getenv("WATCHLIST_MAX", "300")))           # re-checks per cycle
 WATCHLIST_TTL_HOURS = float(os.getenv("WATCHLIST_TTL_HOURS", "24"))
 WATCHLIST_RECHECK_MINUTES = float(os.getenv("WATCHLIST_RECHECK_MINUTES", "10"))
-# Only remember pools that showed some life, so the watchlist is not a junk
-# re-lookup engine. 0 = remember everything evaluated.
-WATCHLIST_MIN_BEST_SCORE = float(os.getenv("WATCHLIST_MIN_BEST_SCORE", "25"))
+# Minimum best hand score for a pool to be *remembered*. 0 = remember
+# everything evaluated, which is what a standing universe needs: the whole
+# point is to be watching a pool BEFORE its volume spikes, and a pool that
+# scores 0 today is exactly the one that can surge tomorrow.
+WATCHLIST_MIN_BEST_SCORE = float(os.getenv("WATCHLIST_MIN_BEST_SCORE", "0"))
 
 # Feature logging for offline model training (see FeatureLogger below).
 # Default OFF so a long-running bot cannot silently fill the disk.
@@ -1400,10 +1402,27 @@ async def get_watchlist_pair(session, chain: str, pair_address: str):
     return None
 
 
-async def collect_watchlist_pairs(session) -> list:
-    """Fetch the due watchlist entries, newest signal first.
+def batches(seq, size):
+    """Split a list into chunks of at most ``size`` (DexScreener /tokens/v1 cap 30)."""
+    size = max(1, int(size))
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
-    Every entry is marked checked before its fetch so a provider outage cannot
+
+async def collect_watchlist_pairs(session) -> list:
+    """Re-price the standing universe, batched, newest signal first.
+
+    This is the lane that makes an abnormal-volume strategy possible at all.
+    Measured 2026-09-30: GeckoTerminal's list endpoints are 24h rankings, and
+    **0 of 20 pools on any of them** (`top_volume`, `trending`, `trending?duration=5m`,
+    `h24_tx_count`, deep pages included) had concentrated 10% of their daily volume
+    into the last 5 minutes. There is no short-window ranking to subscribe to —
+    `sort=h1_volume_usd_desc` returns HTTP 400 and a network trades feed 404s — so a
+    pool mid-pump is simply not on any list. The only way to see the spike is to be
+    already watching the pool and comparing it to its own baseline.
+
+    Batching is what makes that affordable: ``/tokens/v1/{chain}/{a,b,c...}`` takes
+    30 token addresses per call, so a 300-pool universe costs ~10 calls instead of
+    300. Every entry is marked checked before its fetch so a provider outage cannot
     make the same pool retry on every cycle.
     """
     due = db_watchlist_due()
@@ -1414,18 +1433,55 @@ async def collect_watchlist_pairs(session) -> list:
     for entry in due:
         db_watchlist_mark_checked(entry["chain"], entry["token_address"], now)
 
-    async def one(entry):
-        try:
-            pair = await get_watchlist_pair(session, entry["chain"], entry["pair_address"])
-        except Exception as e:  # noqa: BLE001 - one bad pool must not stop the lane
-            logger.warning(f"watchlist fetch failed for {entry['symbol']}: {e}")
-            return None
-        if not pair:
-            return None
-        return pair
+    by_chain: Dict[str, list] = {}
+    for entry in due:
+        by_chain.setdefault(entry["chain"], []).append(entry)
 
-    results = await asyncio.gather(*[one(e) for e in due], return_exceptions=True)
-    return [p for p in results if p and not isinstance(p, Exception)]
+    async def one_chain(chain: str, entries: list):
+        out = []
+        for batch in batches(entries, 30):
+            addresses = [e["token_address"] for e in batch if e.get("token_address")]
+            if not addresses:
+                continue
+            url = f"https://api.dexscreener.com/tokens/v1/{chain}/{','.join(addresses)}"
+            try:
+                data = await fetch_json(session, url)
+            except Exception as e:  # noqa: BLE001 - one bad batch must not stop the lane
+                logger.warning(f"watchlist batch failed for {chain}: {e}")
+                continue
+            pairs = data if isinstance(data, list) else []
+            # One pair per token: the deepest pool, matching dedupe_best_pool, so a
+            # token with several pools is judged on the one that is tradeable.
+            best: Dict[str, dict] = {}
+            for pair in pairs:
+                if pair.get("chainId") != chain:
+                    continue
+                # Key by token so several pools for one token collapse to the
+                # deepest. Fall back to the pair address when the feed omits it,
+                # rather than silently dropping the row.
+                token = str((pair.get("baseToken") or {}).get("address") or "").lower()
+                if not token:
+                    token = str(pair.get("pairAddress") or "").lower()
+                if not token:
+                    continue
+                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                cur = best.get(token)
+                if cur is None or liq > float((cur.get("liquidity") or {}).get("usd") or 0):
+                    pair = dict(pair)
+                    pair["source"] = "watchlist:dexscreener"
+                    best[token] = pair
+            out.extend(best.values())
+        return out
+
+    results = await asyncio.gather(
+        *[one_chain(ch, entries) for ch, entries in by_chain.items()],
+        return_exceptions=True,
+    )
+    flat = []
+    for res in results:
+        if isinstance(res, list):
+            flat.extend(res)
+    return flat
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API HELPERS
