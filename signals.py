@@ -43,7 +43,7 @@ import os
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 __all__ = [
@@ -145,6 +145,53 @@ _GOOD_DEXES = {
 # ─────────────────────────────────────────────────────────────────────────────
 # configuration
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Global SIG_* overrides, read once by Filters.from_env().
+_GLOBAL_ENV_MAPPING = {
+    "SIG_MIN_LIQUIDITY_USD": ("min_liquidity_usd", float),
+    "SIG_MIN_VOL_5M_USD": ("min_vol_5m_usd", float),
+    "SIG_MAX_AGE_MINUTES": ("max_age_minutes", float),
+    "SIG_MIN_AGE_MINUTES": ("min_age_minutes", float),
+    "SIG_MIN_TXNS_5M": ("min_txns_5m", int),
+    "SIG_MAX_AVG_TRADE_LIQ": ("max_avg_trade_liq_ratio", float),
+    "SIG_HOLDER_STANCE": ("holder_stance", lambda v: str(v).strip().lower()),
+    "SIG_MAX_TAX_PCT": ("max_tax_pct", float),
+    "SIG_MAX_TOP10_PCT": ("max_top10_pct", float),
+    "SIG_MAX_CREATOR_PCT": ("max_creator_pct", float),
+    "SIG_MIN_HOLDERS": ("min_holders", int),
+    "SIG_REQUIRE_LP_LOCKED": ("require_lp_locked", _truthy),
+    "SIG_REQUIRE_OPEN_SOURCE": ("require_open_source", _truthy),
+    "SIG_MAX_BONUS": ("max_bonus", float),
+    "SIG_MAX_PENALTY": ("max_penalty", float),
+    "SIG_MIN_VOL_LIQ": ("min_vol_liq_ratio", float),
+    "SIG_MIN_UNIQUE_BUYER_RATIO": ("min_unique_buyer_ratio", float),
+    "SIG_EARLY_MAX_AGE_MINUTES": ("early_max_age_minutes", float),
+    "SIG_EARLY_MIN_LIQUIDITY_USD": ("early_min_liquidity_usd", float),
+    "SIG_EARLY_MIN_VOL_LIQ": ("early_min_vol_liq_ratio", float),
+    "SIG_EARLY_MIN_TXNS_5M": ("early_min_txns_5m", int),
+    "SIG_EARLY_MIN_BUY_RATIO": ("early_min_buy_ratio", float),
+    "SIG_EARLY_MIN_UNIQUE_BUYERS": ("early_min_unique_buyers", int),
+    "SIG_EARLY_MAX_CHG_5M": ("early_max_chg_5m", float),
+    "SIG_EARLY_REQUIRE_UNIQUE_BUYERS": ("early_require_unique_buyers", _truthy),
+}
+
+# Per-chain overrides, using the repo's <CHAIN>_ prefix convention, e.g.
+#   BSC_SIG_EARLY_MIN_LIQUIDITY_USD=14600
+# Applied by Filters.with_chain_overrides on top of the global values.
+_CHAIN_EARLY_OVERRIDES = {
+    "SIG_EARLY_MAX_AGE_MINUTES": ("early_max_age_minutes", float),
+    "SIG_EARLY_MIN_LIQUIDITY_USD": ("early_min_liquidity_usd", float),
+    "SIG_EARLY_MIN_VOL_LIQ": ("early_min_vol_liq_ratio", float),
+    "SIG_EARLY_MIN_TXNS_5M": ("early_min_txns_5m", int),
+    "SIG_EARLY_MIN_BUY_RATIO": ("early_min_buy_ratio", float),
+    "SIG_EARLY_MIN_UNIQUE_BUYERS": ("early_min_unique_buyers", int),
+    "SIG_EARLY_MAX_CHG_5M": ("early_max_chg_5m", float),
+    "SIG_EARLY_REQUIRE_UNIQUE_BUYERS": ("early_require_unique_buyers", _truthy),
+}
+
+_CHAIN_ENV_PREFIX = {
+    "ethereum": "ETH", "bsc": "BSC", "base": "BASE", "robinhood": "ROBINHOOD",
+}
 
 
 @dataclass
@@ -250,40 +297,36 @@ class Filters:
     def from_env(cls) -> "Filters":
         """Read ``SIG_*`` env overrides; anything unset keeps its default."""
         f = cls()
-        mapping = {
-            "SIG_MIN_LIQUIDITY_USD": ("min_liquidity_usd", float),
-            "SIG_MIN_VOL_5M_USD": ("min_vol_5m_usd", float),
-            "SIG_MAX_AGE_MINUTES": ("max_age_minutes", float),
-            "SIG_MIN_AGE_MINUTES": ("min_age_minutes", float),
-            "SIG_MIN_TXNS_5M": ("min_txns_5m", int),
-            "SIG_MAX_AVG_TRADE_LIQ": ("max_avg_trade_liq_ratio", float),
-            "SIG_HOLDER_STANCE": ("holder_stance", lambda v: str(v).strip().lower()),
-            "SIG_MAX_TAX_PCT": ("max_tax_pct", float),
-            "SIG_MAX_TOP10_PCT": ("max_top10_pct", float),
-            "SIG_MAX_CREATOR_PCT": ("max_creator_pct", float),
-            "SIG_MIN_HOLDERS": ("min_holders", int),
-            "SIG_REQUIRE_LP_LOCKED": ("require_lp_locked", _truthy),
-            "SIG_REQUIRE_OPEN_SOURCE": ("require_open_source", _truthy),
-            "SIG_MAX_BONUS": ("max_bonus", float),
-            "SIG_MAX_PENALTY": ("max_penalty", float),
-            "SIG_MIN_VOL_LIQ": ("min_vol_liq_ratio", float),
-            "SIG_MIN_UNIQUE_BUYER_RATIO": ("min_unique_buyer_ratio", float),
-            "SIG_EARLY_MAX_AGE_MINUTES": ("early_max_age_minutes", float),
-            "SIG_EARLY_MIN_LIQUIDITY_USD": ("early_min_liquidity_usd", float),
-            "SIG_EARLY_MIN_VOL_LIQ": ("early_min_vol_liq_ratio", float),
-            "SIG_EARLY_MIN_TXNS_5M": ("early_min_txns_5m", int),
-            "SIG_EARLY_MIN_BUY_RATIO": ("early_min_buy_ratio", float),
-            "SIG_EARLY_MIN_UNIQUE_BUYERS": ("early_min_unique_buyers", int),
-            "SIG_EARLY_MAX_CHG_5M": ("early_max_chg_5m", float),
-            "SIG_EARLY_REQUIRE_UNIQUE_BUYERS": ("early_require_unique_buyers", _truthy),
-        }
-        for env_key, (attr, caster) in mapping.items():
+        for env_key, (attr, caster) in _GLOBAL_ENV_MAPPING.items():
             raw = os.getenv(env_key)
             if raw not in (None, ""):
                 try:
                     setattr(f, attr, caster(raw))
                 except (TypeError, ValueError):
                     pass
+        return f
+
+    @classmethod
+    def with_chain_overrides(cls, base: "Filters", chain: str) -> "Filters":
+        """Copy ``base`` and apply ``<CHAIN>_SIG_EARLY_*`` overrides on top.
+
+        Per-chain because the early-lane population differs by chain by an order
+        of magnitude: measured 2026-09-30 on new_pools page 1-2, the p90
+        liquidity of a birth is ~$5.4k on Robinhood and ~$14.6k on BSC. One
+        global floor is therefore either spam on one chain or blindness on the
+        other. Overrides are read at call time (not import time) so a test or a
+        config reload is respected, and ``base`` is never mutated.
+        """
+        f = replace(base)
+        prefix = _CHAIN_ENV_PREFIX.get(chain, str(chain).upper())
+        for env_suffix, (attr, caster) in _CHAIN_EARLY_OVERRIDES.items():
+            raw = os.getenv(f"{prefix}_{env_suffix}")
+            if raw in (None, ""):
+                continue
+            try:
+                setattr(f, attr, caster(raw))
+            except (TypeError, ValueError):
+                pass
         return f
 
 

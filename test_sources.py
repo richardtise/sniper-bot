@@ -764,3 +764,107 @@ class TestVenueSupport(unittest.TestCase):
     def test_require_tradeable_venue_defaults_to_off(self):
         """Alerting on an unroutable pool is still informative; keep it opt-in."""
         self.assertFalse(bot.REQUIRE_TRADEABLE_VENUE)
+
+
+class TestPerChainEarlyFloors(unittest.TestCase):
+    """BSC must be stricter without the early feed being switched off.
+
+    The early-lane population differs by an order of magnitude per chain —
+    measured 2026-09-30 on new_pools page 1-2 at p90, birth liquidity is ~$5.4k
+    on Robinhood and ~$14.6k on BSC. A single global floor is therefore spam on
+    one chain or blindness on the other, and switching new_pools *off* per chain
+    (the previous approach) trades a filter problem for a discovery problem.
+    """
+
+    KEYS = (
+        "BSC_SIG_EARLY_MIN_LIQUIDITY_USD", "BSC_SIG_EARLY_MIN_TXNS_5M",
+        "BSC_SIG_EARLY_MIN_VOL_LIQ", "BSC_SIG_EARLY_MIN_BUY_RATIO",
+        "BSC_SIG_EARLY_MIN_UNIQUE_BUYERS", "BASE_SIG_EARLY_MIN_LIQUIDITY_USD",
+    )
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.KEYS}
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+        self.base = signals.Filters()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_override_applies_only_to_its_own_chain(self):
+        os.environ["BSC_SIG_EARLY_MIN_LIQUIDITY_USD"] = "14600"
+        bsc = signals.Filters.with_chain_overrides(self.base, "bsc")
+        robinhood = signals.Filters.with_chain_overrides(self.base, "robinhood")
+        self.assertEqual(bsc.early_min_liquidity_usd, 14600.0)
+        self.assertEqual(robinhood.early_min_liquidity_usd,
+                         self.base.early_min_liquidity_usd)
+
+    def test_base_filters_object_is_never_mutated(self):
+        """A per-chain copy must not leak into other chains' evaluations."""
+        before = self.base.early_min_liquidity_usd
+        os.environ["BSC_SIG_EARLY_MIN_LIQUIDITY_USD"] = "99999"
+        signals.Filters.with_chain_overrides(self.base, "bsc")
+        self.assertEqual(self.base.early_min_liquidity_usd, before)
+
+    def test_chain_without_a_sample_falls_back_to_the_global_value(self):
+        """Base (n=15) and Ethereum (n=2) must not get fabricated overrides."""
+        os.environ["BSC_SIG_EARLY_MIN_LIQUIDITY_USD"] = "14600"
+        for chain in ("base", "ethereum"):
+            with self.subTest(chain=chain):
+                f = signals.Filters.with_chain_overrides(self.base, chain)
+                self.assertEqual(f.early_min_liquidity_usd,
+                                 self.base.early_min_liquidity_usd)
+
+    def test_several_overrides_apply_together(self):
+        os.environ["BSC_SIG_EARLY_MIN_TXNS_5M"] = "23"
+        os.environ["BSC_SIG_EARLY_MIN_VOL_LIQ"] = "0.26"
+        os.environ["BSC_SIG_EARLY_MIN_UNIQUE_BUYERS"] = "11"
+        f = signals.Filters.with_chain_overrides(self.base, "bsc")
+        self.assertEqual((f.early_min_txns_5m, f.early_min_vol_liq_ratio,
+                          f.early_min_unique_buyers), (23, 0.26, 11))
+
+    def test_invalid_override_is_ignored_not_fatal(self):
+        os.environ["BSC_SIG_EARLY_MIN_TXNS_5M"] = "not-a-number"
+        f = signals.Filters.with_chain_overrides(self.base, "bsc")
+        self.assertEqual(f.early_min_txns_5m, self.base.early_min_txns_5m)
+
+    def test_unknown_chain_falls_back_cleanly(self):
+        f = signals.Filters.with_chain_overrides(self.base, "solana")
+        self.assertEqual(f.early_min_liquidity_usd, self.base.early_min_liquidity_usd)
+
+
+class TestNewPoolsOnEveryChain(unittest.TestCase):
+    """new_pools is the only early feed, so it must not be chain-restricted."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("GT_SOURCES", "GT_SOURCES_BSC", "BSC_GT_SOURCES")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_a_single_global_setting_reaches_every_chain(self):
+        os.environ["GT_SOURCES"] = "new_pools,trending,top_volume"
+        for chain in ("bsc", "ethereum", "base", "robinhood"):
+            with self.subTest(chain=chain):
+                self.assertIn("new_pools", bot.get_gt_sources(chain))
+
+    def test_per_chain_override_can_still_drop_a_feed(self):
+        """The escape hatch is per chain, not a global blinding of the lane."""
+        os.environ["GT_SOURCES"] = "new_pools,trending"
+        os.environ["GT_SOURCES_BSC"] = "trending,top_volume"
+        self.assertNotIn("new_pools", bot.get_gt_sources("bsc"))
+        self.assertIn("new_pools", bot.get_gt_sources("robinhood"))
+
+    def test_code_default_already_includes_new_pools(self):
+        self.assertIn("new_pools", bot.get_gt_sources("base"))

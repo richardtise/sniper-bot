@@ -504,6 +504,20 @@ def _spawn_handler(coro):
 
 # Signal engine state (only populated when USE_SIGNALS=true).
 SIGNAL_FILTERS = signals.Filters.from_env() if SIGNALS_AVAILABLE else None
+
+
+def _filters_for_chain(chain: str):
+    """SIGNAL_FILTERS plus any ``<CHAIN>_SIG_EARLY_*`` overrides for this chain.
+
+    The early-lane population differs by chain by an order of magnitude (p90
+    birth liquidity ~$5.4k on Robinhood vs ~$14.6k on BSC, measured 2026-09-30),
+    so one global floor is either spam on one chain or blindness on the other.
+    Resolved per call, on top of the mutable ``SIGNAL_FILTERS``, so tests and
+    env reloads keep working.
+    """
+    if SIGNAL_FILTERS is None or not SIGNALS_AVAILABLE:
+        return SIGNAL_FILTERS
+    return signals.Filters.with_chain_overrides(SIGNAL_FILTERS, chain)
 PAIR_HISTORY = signals.PairHistory() if SIGNALS_AVAILABLE else None
 
 
@@ -2358,7 +2372,8 @@ async def evaluate_token(session, pair):
     # score had already deducted (sell pressure, low tx counts, unverified).
     feat["penalties_total"] = penalties
     if USE_SIGNALS:
-        verdict = signals.evaluate(pair, security=security, filters=SIGNAL_FILTERS)
+        verdict = signals.evaluate(pair, security=security,
+                                   filters=_filters_for_chain(chain))
         PAIR_HISTORY.observe(pair, security=security, score=score - penalties)
         feat["signal_bonus"] = verdict.bonus
         feat["signal_penalty"] = verdict.penalty
@@ -2431,7 +2446,8 @@ async def evaluate_token(session, pair):
     # makes USE_GECKOTERMINAL=new_pools useful rather than just noisy.
     early_ok = False
     if EARLY_RUNNER_MODE and total_score < threshold:
-        early_reasons = signals.early_runner_reasons(pair, security=security, filters=SIGNAL_FILTERS)
+        early_reasons = signals.early_runner_reasons(pair, security=security,
+                                                     filters=_filters_for_chain(chain))
         if not early_reasons:
             early_ok = True
             if VERBOSE_LOGGING:

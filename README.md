@@ -59,9 +59,9 @@ omitted key means the code default — currently the conservative/off side.
 | `MORALIS_API_KEY` | — | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
 | `COINGECKO_API_KEY` | — | — | Enables CEX-listing scoring (never applies to Robinhood). |
 | `USE_GECKOTERMINAL` | `false` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list (`/latest/dex/pairs/{chain}` 404s), so prefer `true`. Code default is `false` (unchanged behaviour until you opt in). |
-| `GT_SOURCES` | `new_pools,trending,top_volume` | `trending,top_volume` | Global default. `new_pools` = earliest (only feed carrying a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` everywhere makes a sub-50k entry mathematically impossible. |
-| `GT_SOURCES_<CHAIN>` | — (falls back to `GT_SOURCES`) | `new_pools,trending,top_volume` for Robinhood (`GT_SOURCES_ROBINHOOD`) | Per-chain source override (also accepts the prefix style `<CHAIN>_GT_SOURCES`). `new_pools` is not equally clean per chain: Robinhood births alert at $19.8k/$33.5k mcap 3.2 min old, while BSC `new_pools` is template-liquidity placeholders plus $1.9M launches. Enable it where it pays. |
-| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | `1` / `2` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort (page 2 is 5–7m, page 3 is 7–9m), so depth there buys little; `trending` rewards a second page. Each page is one call against the shared GT budget. |
+| `GT_SOURCES` | `new_pools,trending,top_volume` | `new_pools,trending,top_volume` | Sources for **every** chain. `new_pools` = the only early feed (carries a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` makes a sub-50k entry mathematically impossible — no threshold tuning can recover a pool the scanner never listed. |
+| `GT_SOURCES_<CHAIN>` | — (falls back to `GT_SOURCES`) | — | Per-chain override (also accepts `<CHAIN>_GT_SOURCES`). Use it to drop a feed on one chain, never to blind the early lane globally. `new_pools` was Robinhood-only until 2026-09-30, switched off on BSC after an **n=20** alert preview showed template-liquidity placeholders — the same error as tuning a floor on two tokens. It is now on every chain and the *filters* do the work, per chain. |
+| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | `1` / `1` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort, so depth there buys little. `trending` is one page in `.env.example` because the second page buys lagging $3.5M-median pools that the mcap ceiling rejects anyway, and that budget is better spent on births now that `new_pools` runs everywhere. |
 | `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
 | `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (= disabled) | `200000` | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. Code default leaves behaviour unchanged until you set it. |
 | `NEAR_MISS_POINTS` | `15` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
@@ -73,6 +73,7 @@ omitted key means the code default — currently the conservative/off side.
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_REQUIRE_OPEN_SOURCE` | `false` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
+| `<CHAIN>_SIG_EARLY_*` | — (falls back to the global `SIG_EARLY_*`) | BSC overrides only | Per-chain early-lane floors, so one chain can be objectively stricter without the early feed being disabled. The global values are the **Robinhood** cohort; BSC's p90 birth liquidity is ~$14.6k vs ~$5.4k, so BSC gets its own floors. Base (n=15) and Ethereum (n=2) deliberately get none — see [per-chain floors](#per-chain-early-floors). |
 | `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — (falls back to `MIN_SCORE`) | `55` for Robinhood in `.env.example` | Per-chain threshold override, same convention as the floors below. Robinhood `55` because distributed-clean runners there earn 0 holder/CEX points. |
 | `BASE_MIN_LIQUIDITY_USD` etc. | — | — (examples commented out) | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
 | `ALLOWED_USER_IDS` | — | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
@@ -202,9 +203,27 @@ Two structural guarantees now protect latency:
    same GeckoTerminal budget as discovery, the last chain in `NETWORKS`
    (`robinhood`) was not even *listed* until minutes into the cycle. Discovery is
    now Phase A for all chains; enrichment is Phase B.
-2. **Page depth is per source.** Page 1 of `new_pools` *is* the newest cohort, so
-   depth there buys little, while `trending` rewards a second page
-   (`GT_PAGES_NEW=1`, `GT_PAGES_TRENDING=2`, `GT_PAGES_TOP=1`).
+2. **Page depth is per source, and the early feed is global.** `new_pools` runs on
+   every chain (`GT_PAGES_NEW=1`: page 1 *is* the newest cohort, so depth there
+   buys little). `trending` is one page in `.env.example`, down from two — the
+   second page bought lagging $3.5M-median pools that the mcap ceiling rejects,
+   and that budget is better spent on births now that the early feed covers all
+   four chains (`GT_PAGES_NEW=1`, `GT_PAGES_TRENDING=1`, `GT_PAGES_TOP=1`).
+
+**Budget, since four chains now pay for `new_pools`.** The limiter is shared at
+`GT_MIN_INTERVAL_S=2.1` (~28/min), so this is the constraint that decides whether
+"earlier everywhere" is real or just a longer cycle:
+
+| Config | Calls / 30s cycle | Paced time |
+|---|---|---|
+| `new_pools` on Robinhood only, `trending` 2 pages (old default) | ~5.7 | ~12s |
+| **`new_pools` on all chains, `trending` 1 page (current)** | **~6.7** | **~14s** |
+| `new_pools` all chains, `trending` 2 pages | ~8.7 | ~18s |
+
+All three fit inside the 30s interval, so enabling the early feed everywhere
+costs about 2s of paced calls per cycle rather than pushing the cycle over.
+Raising `GT_PAGES_TRENDING` back to 2 leaves ~12s of headroom for holder lookups.
+
 
 **Read the latency straight off the log.** Every token is logged once, before any
 floor can reject it:
@@ -358,6 +377,33 @@ state of affairs, not a missing feature.
 To get there: `LOG_FEATURES=true`, let the bot run, then
 `python label_outcomes.py --fetch-current` and re-run the fitter. Until then treat
 the shipped floors as a declared policy with stated uncertainty, not calibration.
+
+#### Per-chain early floors
+
+The lane now runs on every chain (`new_pools` is global), so the floors are
+per-chain wherever a chain's own cohort is big enough to support one. Measured
+2026-09-30, `new_pools` page 1–2, p90:
+
+| Chain | n | liq p90 | vol/liq p90 | txns p90 | buy ratio p90 | buyers p90 | Override set? |
+|---|---|---|---|---|---|---|---|
+| Robinhood | 40 | $5,402 | 0.112 | 20.3 | 0.574 | 12.2 | no — these **are** the globals |
+| BSC | 40 | $14,600 | 0.260 | 23 | 0.564 | 11 | **yes** |
+| Base | 15 | $204,100 | 0.502 | 44 | 0.908 | 14 | **no** — 95% CI $14.5k–$544k |
+| Ethereum | 2 | — | — | — | — | — | **no** — not a sample |
+
+Only BSC gets an override, because only BSC's sample justifies one. Base's n=15
+p90 carries a $14.5k–$544k interval, so quoting a $204k floor from it would be
+the two-token error with extra steps; Ethereum's n=2 is not a sample at all. Both
+fall back to the global values — correct behaviour, not a gap. Re-derive per
+chain as rows accumulate:
+
+```bash
+bot-env/bin/python diag/population_floors.py --chains bsc --sources new_pools --pages 2 --quantile 0.90
+```
+
+This is the mechanism that answers "early on every chain, but no BSC spam"
+without switching the early feed off: an objective, per-chain-derived floor
+instead of a blinded discovery layer.
 
 
 
