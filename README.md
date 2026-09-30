@@ -405,6 +405,27 @@ the audit measures at AUC 0.46–0.57 (a coin flip). `config_warnings()` says so
 | Needs | `USE_GECKOTERMINAL` | `USE_SIGNALS` + repeated scans for a baseline |
 | Weakness | mostly Uniswap V4 → unbuyable | resolves in ~1–2 min, not instant (rolling 5m window) |
 
+### Seeding the universe so a new pool is never "never seen"
+
+A per-pool surge baseline needs ~3 sightings, and no GeckoTerminal ranking shows a
+pool while it is spiking (measured `0/20` on every ranking, deep pages included).
+So a pool the bot has literally never evaluated cannot trip the surge lane the
+first time it appears. The fix is to make sure that never happens:
+
+```dotenv
+GT_SOURCES=new_pools,trending_5m,top_volume,top_txns
+SEED_ONLY_SOURCES=new_pools
+```
+
+`new_pools` carries pools **3–5 minutes old**. As a *seed* it is not scored and
+never alerts — it only writes the pool into the baseline history and the standing
+universe. By the time that pool's volume moves, the bot already knows what normal
+looked like for it. This is how you get the firehose's coverage without its spam:
+seeding and alerting are separate decisions.
+
+Every discovered pool is also recorded before the floors run, so a pool that is
+too thin today still has a baseline if it grows tomorrow.
+
 ### The universe problem — and why the watchlist is now the main lane
 
 **Measured 2026-09-30: no GeckoTerminal ranking surfaces a pool while it is

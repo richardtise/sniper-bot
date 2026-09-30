@@ -830,3 +830,176 @@ class TestFirstSightContext(unittest.TestCase):
         bot.prune_caches()
         self.assertNotIn("bsc:0xold", bot._first_sight)
         self.assertIn("bsc:0xnew", bot._first_sight)
+
+
+class TestSeedOnlySources(unittest.TestCase):
+    """Seed-only pools build baselines but never alert.
+
+    This closes the real gap: a per-pool surge baseline needs ~3 sightings, and no
+    GeckoTerminal ranking shows a pool while it is spiking (measured 0/20 on every
+    one, deep pages included). So a pool the bot has never seen cannot trip the
+    surge lane on its first appearance. Feeding `new_pools` in as a seed means
+    every new pool is already being watched, with a baseline, by the time its
+    volume moves — without re-introducing the alert spam that feed causes when it
+    is scored directly.
+    """
+
+    def setUp(self):
+        import signals as signals_module
+
+        self._saved = {
+            k: getattr(bot, k) for k in
+            ("SEED_ONLY_SOURCES", "USE_SIGNALS", "PAIR_HISTORY", "VOLUME_SURGE_MODE",
+             "ALERT_THRESHOLD", "USE_GECKOTERMINAL")
+        }
+        self._saved_fns = {
+            "get_geckoterminal_pairs": bot.get_geckoterminal_pairs,
+            "get_token_security": bot.get_token_security,
+            "get_holder_concentration": bot.get_holder_concentration,
+            "get_cex_listings": bot.get_cex_listings,
+            "FEATURE_LOGGER": bot.FEATURE_LOGGER,
+        }
+        self.recorder = _RecordingLogger()
+        bot.FEATURE_LOGGER = self.recorder
+        bot.USE_SIGNALS = True
+        bot.VOLUME_SURGE_MODE = True
+        bot.PAIR_HISTORY = signals_module.PairHistory()
+        bot.security_cache.clear()
+        bot.SEED_ONLY_SOURCES = ("new_pools",)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(bot, k, v)
+        for k, v in self._saved_fns.items():
+            setattr(bot, k, v)
+        bot.security_cache.clear()
+
+    def _pair(self, source, **over):
+        now_ms = time.time() * 1000
+        pair = {
+            "chainId": "base", "dexId": "uniswap_v3", "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "NEW", "name": "New"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.001", "priceNative": "0.000001",
+            "liquidity": {"usd": 40_000.0}, "marketCap": 90_000.0,
+            "volume": {"m5": 12_000.0, "h1": 20_000.0, "h6": 40_000.0, "h24": 80_000.0},
+            "txns": {"m5": {"buys": 90, "sells": 40, "buyers": 80, "sellers": 30},
+                     "h1": {"buys": 300, "sells": 100}},
+            "priceChange": {"m5": 30.0, "h1": 60.0, "h6": 90.0, "h24": 120.0},
+            "pairCreatedAt": now_ms - 4 * 60 * 1000,
+            "source": source,
+        }
+        pair.update(over)
+        return pair
+
+    def test_new_pools_candidates_are_tagged_seed_only(self):
+        import asyncio
+
+        async def fake_gt(session, network):
+            return [self._pair("geckoterminal:new_pools"),
+                    self._pair("geckoterminal:top_volume")]
+
+        bot.get_geckoterminal_pairs = fake_gt
+        bot.USE_GECKOTERMINAL = True
+
+        async def fake_ds(session, network):
+            return []
+
+        saved_ds = bot.get_dexscreener_pairs
+        bot.get_dexscreener_pairs = fake_ds
+        bot.DEXSCREENER_SOURCES = ()
+        try:
+            pairs = asyncio.run(bot.get_all_pairs(None, "base"))
+        finally:
+            bot.get_dexscreener_pairs = saved_ds
+
+        flags = {p["source"]: p.get("seed_only") for p in pairs}
+        self.assertTrue(flags["geckoterminal:new_pools"])
+        self.assertFalse(flags.get("geckoterminal:top_volume", False))
+
+    def test_a_seed_only_pool_records_history_but_never_alerts(self):
+        """Even one that would clearly alert if it were scored."""
+        import asyncio
+        pair = self._pair("geckoterminal:new_pools", seed_only=True)
+        result = asyncio.run(bot.evaluate_token(None, pair))
+        self.assertIsNone(result, "seed-only must never alert")
+        # ...but it is in the baseline history for the surge lane.
+        tr = bot.PAIR_HISTORY.trend("base", "0x" + "cd" * 20)
+        self.assertGreaterEqual(tr["observations"], 1)
+        row = self.recorder.rows[-1]
+        self.assertEqual(row["reject_reasons"], "seed_only")
+
+    def test_a_non_seed_pool_on_the_same_metrics_does_alert(self):
+        """The seed flag is the only difference; scoring still works normally."""
+        import asyncio
+
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("test")
+            sec.update({"is_open_source": True, "lp_locked": True})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return bot.HolderData(top10=70.0, top50=80.0, top100=None, source="test")
+
+        async def fake_cex(session, chain, token):
+            return (0, False, 0)
+
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+        bot.ALERT_THRESHOLD = 20
+        pair = self._pair("geckoterminal:top_volume")   # no seed_only flag
+        result = asyncio.run(bot.evaluate_token(None, pair))
+        self.assertIsNotNone(result, "a scored pool must still be able to alert")
+
+    def test_the_pair_level_flag_is_what_governs(self):
+        """Tagging happens once at discovery; the flag on the pair is the contract.
+
+        Clearing SEED_ONLY_SOURCES stops *future* tagging (covered above); it does
+        not retroactively un-tag a pair already marked. That is deliberate — the
+        decision belongs to discovery, and evaluate_token should not have to
+        re-derive it from a source string.
+        """
+        import asyncio
+
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("test")
+            sec.update({"is_open_source": True, "lp_locked": True})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return bot.HolderData()
+
+        async def fake_cex(session, chain, token):
+            return (0, False, 0)
+
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+        bot.SEED_ONLY_SOURCES = ()                    # config cleared...
+        pair = self._pair("geckoterminal:new_pools", seed_only=True)
+        asyncio.run(bot.evaluate_token(None, pair))    # ...but the pair is tagged
+        self.assertEqual(self.recorder.rows[-1]["reject_reasons"], "seed_only")
+
+    def test_an_untagged_pair_is_scored_normally(self):
+        """The mirror case: no flag means it goes through scoring as before."""
+        import asyncio
+
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("test")
+            sec.update({"is_open_source": True, "lp_locked": True})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return bot.HolderData()
+
+        async def fake_cex(session, chain, token):
+            return (0, False, 0)
+
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+        bot.SEED_ONLY_SOURCES = ()
+        pair = self._pair("geckoterminal:new_pools")   # not tagged
+        asyncio.run(bot.evaluate_token(None, pair))
+        self.assertNotEqual(self.recorder.rows[-1]["reject_reasons"], "seed_only")

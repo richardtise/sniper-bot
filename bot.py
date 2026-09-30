@@ -114,6 +114,20 @@ EARLY_RUNNER_MODE = os.getenv("EARLY_RUNNER_MODE", "false").lower() == "true" an
 # the same universe, which a volume-ranked feed provides.
 VOLUME_SURGE_MODE = os.getenv("VOLUME_SURGE_MODE", "false").lower() == "true" and SIGNALS_AVAILABLE
 
+# Seed-only sources: pools discovered here are recorded into the volume baseline
+# history and the standing universe, but are NEVER scored and NEVER alert.
+#
+# This exists because a per-pool surge baseline needs ~3 sightings, and no list
+# endpoint shows a pool while it is spiking (measured: 0/20 on every GT ranking).
+# A pool the bot has never seen therefore cannot trigger the surge lane on its
+# first appearance. Seeding the universe from a firehose like `new_pools` — which
+# carries pools 3-5 minutes old — means every new pool is already being watched
+# with a baseline by the time its volume moves, WITHOUT re-introducing the alert
+# spam that feed causes when it is scored directly.
+SEED_ONLY_SOURCES = tuple(
+    x.strip().lower() for x in os.getenv("SEED_ONLY_SOURCES", "").split(",") if x.strip()
+)
+
 # Optional Telegram allowlist. Empty -> only CHAT_ID is accepted. Set this when
 # CHAT_ID is a group so other members cannot run /sell, /risk, /setamounts.
 ALLOWED_USER_IDS = {
@@ -832,7 +846,7 @@ FEATURE_FIELDS = [
     # column that makes that measurable instead of anecdotal.
     "dex_id", "venue_tradeable", "venue_requirement",
     "first_sight_mcap", "first_sight_age_minutes", "first_sight_ts",
-    "volume_surge", "vol_accel", "vol_observations",
+    "volume_surge", "vol_accel", "vol_observations", "seed_only",
     "signal_bonus", "signal_penalty", "signal_notes",
     # Per-component score breakdown. The total alone cannot answer "which part of
     # the model withheld the points", which is the question every miss raises.
@@ -859,7 +873,7 @@ _FEATURE_INT_FIELDS = {
     "owner_change_balance", "transfer_pausable", "slippage_modifiable",
     "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
     "is_blacklisted", "is_whitelisted", "lp_locked", "security_known",
-    "venue_tradeable", "volume_surge", "vol_observations",
+    "venue_tradeable", "volume_surge", "vol_observations", "seed_only",
     "rejected", "passed_threshold", "alert_sent", "paper_mode", "early_runner",
 }
 _FEATURE_TEXT_FIELDS = {
@@ -1661,6 +1675,11 @@ async def get_all_pairs(session, network):
 
     if USE_GECKOTERMINAL:
         for pair in await get_geckoterminal_pairs(session, network):
+            if SEED_ONLY_SOURCES:
+                kind = str(pair.get("source") or "").split(":", 1)[-1]
+                if kind in SEED_ONLY_SOURCES:
+                    pair = dict(pair)
+                    pair["seed_only"] = True
             await add_pair(pair)
 
     if DEXSCREENER_SOURCES:
@@ -2517,6 +2536,17 @@ async def evaluate_token(session, pair):
         "first_sight_age_minutes": (first_sight or {}).get("age_minutes"),
         "first_sight_ts": (first_sight or {}).get("ts"),
     })
+
+    # ── Seed-only: record a baseline, never score, never alert ───────────────
+    # Placed before the floors so the baseline exists even for a pool that would
+    # be rejected today: the whole point is to be watching it before its volume
+    # moves, and a pool that fails a floor now may pass it later.
+    if pair.get("seed_only"):
+        if USE_SIGNALS and PAIR_HISTORY is not None:
+            PAIR_HISTORY.observe(pair, security=None, score=0.0)
+        feat["seed_only"] = 1
+        logger.debug(f"seed-only {symbol}@{chain}: baseline recorded, not scored")
+        return finish("seed_only")
 
     # ── Floors (same order as before: first failure still wins the label) ────
     if liquidity < min_liq: return reject("liquidity")
