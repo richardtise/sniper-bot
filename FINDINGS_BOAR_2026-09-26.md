@@ -1,5 +1,19 @@
 # Findings — why boar (`0x0cbf291Ba052174879d90bf781dF1A5F2BC5Bb07`, Base) never alerted
 
+> **Point-in-time record (2026-09-27, code at `9458812`).** This document explains
+> one incident and the fixes it motivated. It is *history*, not current
+> configuration: where it disagrees with [`README.md`](README.md) or `bot.py`,
+> those are authoritative. In particular, threshold values quoted here (bars,
+> floors, weights) have since been retuned, and the "still open" list at §8 is
+> partly closed — see the README's [Tradeable venues](README.md#tradeable-venues--do-you-need-uniswap-v4)
+> and [security](README.md#how-the-security-check-works-and-why-new-pairs-are-dropped)
+> sections for the current state.
+>
+> The thresholds it discusses were calibrated on single cases like boar. That is
+> a falsification test (a setting must admit a known runner without admitting a
+> known rug), not calibration — see
+> [Where these numbers come from](README.md#where-these-numbers-come-from).
+
 Date of incident: **2026-09-26**. Written 2026-09-27 from code at `9458812`.
 
 **Verdict: the bot was seeing this token and scoring it. The miss is the scoring

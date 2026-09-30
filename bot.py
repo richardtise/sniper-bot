@@ -303,6 +303,89 @@ def get_v2_router(chain: str) -> str:
     env_key = _env_key(chain, "ROUTER_V2")
     return os.getenv(env_key, "").strip() or _HARD_V2_ROUTERS.get(chain, "")
 
+
+# ── Tradeable venues ─────────────────────────────────────────────────────────
+# A router only routes through pools created by its *own* factory, so the bot
+# can execute on a DEX only if it holds that DEX's router. Two consequences
+# that otherwise show up as alerts with buy buttons that silently fail:
+#
+#   * a Uniswap V3 router cannot route Aerodrome, Pons, up-v3, Ramses,
+#     PancakeSwap-Infinity or any other V3 fork — each needs its own router;
+#   * Uniswap V4 pools are not reachable through a V3 router at all. V4 needs
+#     the Universal Router + Permit2, which this bot does not implement yet.
+#
+# Measured on GeckoTerminal page 1, 20 pools per feed, 2026-09-30 — the share of
+# pools the configured routers can actually reach:
+#
+#   chain      feed        router-reachable
+#   robinhood  new_pools    0%   (pons-v2 14/20, uniswap-v4 6/20)
+#   base       new_pools   25%   (uniswap-v4 8/20, bankr 4, aerodrome 2, o1 1)
+#   bsc        new_pools   10%   (uniswap-v4 14/20, four-meme 4)
+#   eth        new_pools   10%   (uniswap-v4 18/20)
+#
+# The earliest feed on every chain is therefore mostly unroutable *today*. The
+# default is to keep alerting (the information still has value) but to say so in
+# the alert and withhold buy buttons. Set REQUIRE_TRADEABLE_VENUE=true to drop
+# these candidates before any enrichment budget is spent on them.
+#
+# Patterns are matched against the feed's ``dexId`` with ``re.search``, so both
+# GeckoTerminal (``uniswap-v3-robinhood``) and DexScreener (``uniswap``) spellings
+# work. Deliberately no ``v4`` pattern: matching it would claim a route that
+# does not exist.
+_TRADEABLE_DEX_PATTERNS = {
+    "ethereum": ((r"^uniswap$", r"uniswap[-_]?v?3"), (r"uniswap[-_]?v?2",)),
+    "base": ((r"^uniswap$", r"uniswap[-_]?v?3"), (r"uniswap[-_]?v?2",)),
+    "bsc": ((r"^pancakeswap$", r"pancakeswap[-_]?v?3"), (r"pancakeswap[-_]?v?2",)),
+    "robinhood": ((r"^uniswap$", r"uniswap[-_]?v?3"), (r"uniswap[-_]?v?2",)),
+}
+
+# When true, a pool whose DEX the configured routers cannot reach is rejected
+# before scoring/enrichment instead of alerting with buy buttons hidden.
+REQUIRE_TRADEABLE_VENUE = os.getenv("REQUIRE_TRADEABLE_VENUE", "false").lower() == "true"
+
+
+def get_tradeable_dex_patterns(chain: str):
+    """Override patterns for one chain, via TRADEABLE_DEXES_<CHAIN> or global."""
+    raw = (
+        os.getenv(_env_key(chain, "TRADEABLE_DEXES"), "").strip()
+        or os.getenv("TRADEABLE_DEXES", "").strip()
+    )
+    if not raw:
+        return None
+    return tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def dex_is_supported(chain: str, dex_id) -> Optional[bool]:
+    """Whether the configured routers can actually execute on this pool's DEX.
+
+    Returns ``True`` / ``False`` for a known venue and ``None`` when the feed
+    supplied no ``dexId`` — "unknown metadata" must stay distinguishable from
+    "known-bad venue", exactly as holder/security provenance is.
+    """
+    dex = str(dex_id or "").strip().lower()
+    if not dex:
+        return None
+
+    override = get_tradeable_dex_patterns(chain)
+    if override is not None:
+        if not any(re.search(p, dex) for p in override):
+            return False
+        # A user-supplied list does not say which router, so accept it if either
+        # is configured (execute_buy tries V3 first, then the V2 fallback).
+        return bool(get_router_v3(chain) or get_v2_router(chain))
+
+    v3_patterns, v2_patterns = _TRADEABLE_DEX_PATTERNS.get(chain, ((), ()))
+    if any(re.search(p, dex) for p in v3_patterns):
+        # V3-patterned pools are reached through the V3 router; the V2 router is
+        # accepted as a fallback exactly as execute_buy does.
+        return bool(get_router_v3(chain) or get_v2_router(chain))
+    if any(re.search(p, dex) for p in v2_patterns):
+        # A V2-patterned pool needs a V2 router specifically. Robinhood has
+        # none, so pons-v2 there is correctly reported unroutable.
+        return bool(get_v2_router(chain))
+    return False
+
+
 NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
 NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
 
@@ -567,6 +650,11 @@ else:
 total_pairs_scanned = 0
 tokens_evaluated = 0
 alerts_sent = 0
+# Reasons a candidate never reached the user, counted so "the bot is quiet" is
+# diagnosable from /health instead of inferred from a log file.
+security_unknown_rejects = 0
+unsupported_venue_rejects = 0
+untradeable_alerts = 0
 start_time = 0.0
 last_heartbeat_time = 0.0
 shutdown_flag = False
@@ -597,6 +685,11 @@ FEATURE_FIELDS = [
     "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
     "is_blacklisted", "is_whitelisted", "lp_locked",
     "security_source", "security_known",
+    # Venue: which DEX the pool is on, and whether the configured routers can
+    # actually reach it. Alerting on an unroutable pool (Uniswap V4, a V3 fork,
+    # Pons/Aerodrome/...) produced buy buttons that could only fail; this is the
+    # column that makes that measurable instead of anecdotal.
+    "dex_id", "venue_tradeable",
     "signal_bonus", "signal_penalty", "signal_notes",
     # Per-component score breakdown. The total alone cannot answer "which part of
     # the model withheld the points", which is the question every miss raises.
@@ -623,11 +716,13 @@ _FEATURE_INT_FIELDS = {
     "owner_change_balance", "transfer_pausable", "slippage_modifiable",
     "hidden_owner", "cannot_sell_all", "selfdestruct", "trading_cooldown",
     "is_blacklisted", "is_whitelisted", "lp_locked", "security_known",
+    "venue_tradeable",
     "rejected", "passed_threshold", "alert_sent", "paper_mode", "early_runner",
 }
 _FEATURE_TEXT_FIELDS = {
     "ts_utc", "chain", "token_address", "pair_address", "symbol", "source",
     "security_source", "signal_notes", "reject_reasons", "holder_source",
+    "dex_id",
 }
 
 
@@ -2039,7 +2134,7 @@ def _apply_security_to_feature(feat: dict, security: Optional[dict]):
 
 
 async def evaluate_token(session, pair):
-    global tokens_evaluated
+    global tokens_evaluated, security_unknown_rejects, unsupported_venue_rejects
     chain = pair.get("chainId")
     base_token = pair.get("baseToken", {}) or {}
     token = base_token.get("address")
@@ -2123,10 +2218,18 @@ async def evaluate_token(session, pair):
     pair_created = pair.get("pairCreatedAt")
     age_minutes = (time.time() - pair_created / 1000) / 60 if pair_created else None
 
+    # Which DEX this pool is on, and whether our routers can reach it. Recorded
+    # for every evaluation (including rejects) so "how many of the pools we see
+    # are actually tradeable" is a query, not a guess.
+    dex_id = str(pair.get("dexId") or "").strip().lower()
+    venue_tradeable = dex_is_supported(chain, dex_id)
+
     feat.update({
         "liquidity_usd": liquidity,
         "market_cap_usd": market_cap,
         "age_minutes": age_minutes,
+        "dex_id": dex_id,
+        "venue_tradeable": None if venue_tradeable is None else int(venue_tradeable),
         "vol_5m": vol_5m, "vol_15m": vol_15m, "vol_1h": vol_1h,
         "vol_6h": vol_6h, "vol_24h": vol_24h,
         "vol_liq_ratio": (vol_5m / liquidity) if liquidity else 0.0,
@@ -2168,6 +2271,16 @@ async def evaluate_token(session, pair):
     if vol_5m < min_vol_5m: return reject("vol_5m")
     if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
         return reject("robinhood_too_new")
+
+    # ── Venue gate (opt-in) ──────────────────────────────────────────────────
+    # An unroutable pool cannot be bought, so scoring it to completion burns the
+    # shared GeckoTerminal/GoPlus budget on a guaranteed failure. Default is to
+    # keep evaluating and let the alert say so (see send_alert); this gate is for
+    # once you have confirmed the venue split on your chains.
+    if REQUIRE_TRADEABLE_VENUE and venue_tradeable is False:
+        unsupported_venue_rejects += 1
+        logger.debug(f"Unsupported venue {symbol}@{chain}: dex={dex_id or '?'}")
+        return reject("unsupported_venue")
 
     score = 0; penalties = 0
     s_vol_liq = score_volume_liquidity(vol_5m, liquidity)
@@ -2233,6 +2346,10 @@ async def evaluate_token(session, pair):
         score += SECURITY_PTS
         feat["score_security"] = SECURITY_PTS
     else:
+        # GoPlus has no record yet (the common case for a pool minutes old) and
+        # ALLOW_SECURITY_FALLBACK did not produce a simulated honeypot.is record.
+        # Counted so the GoPlus indexing lag is measurable from /health.
+        security_unknown_rejects += 1
         return reject("security_unknown")
 
     # ── Optional signal engine (signals.py): reject rugs before enrichment ──
@@ -2362,6 +2479,8 @@ async def evaluate_token(session, pair):
         "security": security, "holder_pct": (top10, top50, top100),
         "cex_count": cex_count, "has_perps": has_perps, "tier1": tier1,
         "age_minutes": age_minutes,
+        "dex_id": dex_id,
+        "venue_tradeable": venue_tradeable,
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}",
         "price_usd": price,
         "price_native": float(pair.get("priceNative") or 0),
@@ -3106,6 +3225,20 @@ def build_buy_keyboard(chain, token_address, symbol, price_native=None, price_us
     ])
     return InlineKeyboardMarkup(keyboard)
 
+def build_no_route_keyboard(chain, token_address):
+    """Buttons for an alert whose pool the configured routers cannot reach.
+
+    Deliberately no buy buttons: every one of them would fail at quote time.
+    The point of the alert is still to inform, not to offer an action that
+    cannot work.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 DexScreener",
+                              url=f"https://dexscreener.com/{chain}/{token_address}")],
+        [InlineKeyboardButton("🚫 Skip", callback_data="noop")],
+    ])
+
+
 def build_alert_keyboard(chain, token_address, symbol, price_usd=None, price_native=None):
     """Build inline keyboard for scan alerts."""
     return build_buy_keyboard(chain, token_address, symbol, price_usd, price_native)
@@ -3585,7 +3718,7 @@ def _fmt_pct(value) -> str:
 
 
 async def send_alert(alert):
-    global alerts_sent
+    global alerts_sent, untradeable_alerts
     sec = alert.get("security") or {}
     pct10, pct50, pct100 = alert.get("holder_pct", (0, 0, 0))
     buy_pct_5m = (alert['buys_5m'] / (alert['buys_5m'] + alert['sells_5m']) * 100) if (alert['buys_5m'] + alert['sells_5m']) > 0 else 0
@@ -3620,11 +3753,31 @@ async def send_alert(alert):
         )
 
     age_display = f"{alert['age_minutes']:.0f}" if alert.get("age_minutes") is not None else "?"
+
+    # ── Route honesty ────────────────────────────────────────────────────────
+    # A pool on a DEX we hold no router for (Uniswap V4, a V3 fork, Pons,
+    # Aerodrome, ...) cannot be bought. Saying so, and withholding the buy
+    # buttons, is strictly better than offering buttons that fail at quote time.
+    venue_ok = alert.get("venue_tradeable")
+    dex_display = esc(alert.get("dex_id") or "unknown")
+    if venue_ok is False:
+        untradeable_alerts += 1
+        route_text = (
+            f"⚠️ <b>No route — not tradeable by this bot.</b>\n"
+            f"  DEX: <code>{dex_display}</code>\n"
+            f"  The configured routers cannot reach this pool (Uniswap V4 and\n"
+            f"  non-Uniswap/Pancake V3 forks each need their own router).\n"
+            f"  <i>Buy buttons withheld so they cannot silently fail.</i>\n\n"
+        )
+    else:
+        suffix = "" if venue_ok else " (tradeability unknown)"
+        route_text = f"🏦 Venue: <code>{dex_display}</code>{suffix}\n\n"
     text = (
         f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']:.0f}/100</b>\n\n"
         f"<b>{esc(alert['name'])}</b> ({esc(alert['symbol'])})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
         f"🕒 Age: <b>{age_display} min</b>\n\n"
+        f"{route_text}"
         f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}\n"
         f"<b>Market Cap:</b> ${alert['market_cap']:,.0f}\n"
         f"<b>Volume (5m):</b> ${alert['vol_5m']:,.0f}\n"
@@ -3644,10 +3797,13 @@ async def send_alert(alert):
         + f"📝 <b>Contract:</b> <code>{esc(alert['token_address'])}</code>"
     )
 
-    keyboard = build_alert_keyboard(
-        alert['chain'], alert['token_address'], alert['symbol'],
-        price_usd=alert.get("price_usd"), price_native=alert.get("price_native"),
-    )
+    if venue_ok is False:
+        keyboard = build_no_route_keyboard(alert['chain'], alert['token_address'])
+    else:
+        keyboard = build_alert_keyboard(
+            alert['chain'], alert['token_address'], alert['symbol'],
+            price_usd=alert.get("price_usd"), price_native=alert.get("price_native"),
+        )
     try:
         await tg_send(
             text, parse_mode=ParseMode.HTML,
@@ -3856,6 +4012,13 @@ async def health_check():
         "open_positions": len(positions),
         "threshold": ALERT_THRESHOLD,
         "paper_trading": PAPER_TRADING,
+        # Why the bot was quiet, as numbers rather than a log grep:
+        # security_unknown = GoPlus had no record yet (common minutes after a
+        # pool is born); unsupported_venue = no router for that DEX (V4 etc.);
+        # untradeable_alerts = alerts sent with buy buttons withheld.
+        "security_unknown_rejects": security_unknown_rejects,
+        "unsupported_venue_rejects": unsupported_venue_rejects,
+        "untradeable_alerts": untradeable_alerts,
         "features": FEATURE_LOGGER.stats(),
     }
 

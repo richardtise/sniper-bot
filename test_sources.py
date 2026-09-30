@@ -453,8 +453,8 @@ class TestAlertFormatting(unittest.TestCase):
         self.assertEqual(bot._fmt_pct(0), "0.0%")
         self.assertEqual(bot._fmt_pct("bad"), "n/a")
 
-    def _alert(self, top100):
-        return {
+    def _alert(self, top100, **extra):
+        alert = {
             "chain": "robinhood", "token_address": "0x" + "ab" * 20, "symbol": "X",
             "name": "X", "pair_address": "0x" + "cd" * 20, "total_score": 61.0,
             "vol_5m": 1.0, "liquidity": 1.0, "market_cap": 1.0,
@@ -467,6 +467,8 @@ class TestAlertFormatting(unittest.TestCase):
             "dex_url": "", "price_usd": 1.0, "price_native": 0.0,
             "signal_bonus": 0.0, "signal_penalty": 0.0, "signal_notes": [],
         }
+        alert.update(extra)
+        return alert
 
     def test_send_alert_survives_unmeasured_top100_and_null_age(self):
         import asyncio
@@ -509,6 +511,77 @@ class TestAlertFormatting(unittest.TestCase):
             bot.build_alert_keyboard = saved_kb
 
         self.assertIn("Top 100: 85.0%", sent[0])
+
+    def test_unroutable_alert_withholds_buy_buttons(self):
+        """A V4/pons pool cannot be bought, so it must not offer buy buttons.
+
+        Before this, every alert carried a full buy keyboard regardless of
+        venue, so the buttons failed at quote time with no explanation.
+        """
+        import asyncio
+
+        sent = []
+        calls = {"buy": 0, "no_route": 0}
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved = (bot.tg_send, bot.build_alert_keyboard, bot.build_no_route_keyboard)
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: calls.__setitem__("buy", calls["buy"] + 1)
+        bot.build_no_route_keyboard = lambda *a, **k: calls.__setitem__("no_route", calls["no_route"] + 1)
+        try:
+            asyncio.run(bot.send_alert(self._alert(
+                None, dex_id="uniswap-v4-robinhood", venue_tradeable=False,
+            )))
+        finally:
+            (bot.tg_send, bot.build_alert_keyboard, bot.build_no_route_keyboard) = saved
+
+        self.assertEqual(calls["no_route"], 1, "must use the no-route keyboard")
+        self.assertEqual(calls["buy"], 0, "must not offer buy buttons that cannot work")
+        self.assertIn("No route", sent[0])
+        self.assertIn("uniswap-v4-robinhood", sent[0])
+
+    def test_tradeable_alert_keeps_buy_buttons_and_names_the_venue(self):
+        import asyncio
+
+        sent = []
+        calls = {"buy": 0}
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved = (bot.tg_send, bot.build_alert_keyboard)
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: calls.__setitem__("buy", calls["buy"] + 1)
+        try:
+            asyncio.run(bot.send_alert(self._alert(
+                None, dex_id="uniswap-v3-robinhood", venue_tradeable=True,
+            )))
+        finally:
+            (bot.tg_send, bot.build_alert_keyboard) = saved
+
+        self.assertEqual(calls["buy"], 1)
+        self.assertIn("uniswap-v3-robinhood", sent[0])
+
+    def test_alert_without_venue_metadata_says_unknown_not_routable(self):
+        """An older pair payload has no dexId; absence must not read as safe."""
+        import asyncio
+
+        sent = []
+
+        async def fake_tg(text, **kwargs):
+            sent.append(text)
+
+        saved = (bot.tg_send, bot.build_alert_keyboard)
+        bot.tg_send = fake_tg
+        bot.build_alert_keyboard = lambda *a, **k: None
+        try:
+            asyncio.run(bot.send_alert(self._alert(None)))
+        finally:
+            (bot.tg_send, bot.build_alert_keyboard) = saved
+
+        self.assertIn("tradeability unknown", sent[0])
 
     def test_alert_build_failure_does_not_propagate(self):
         """A send failure is logged, not raised, so the cycle continues."""
@@ -619,3 +692,75 @@ class TestPerChainGtSources(unittest.TestCase):
         os.environ["GT_SOURCES_ROBINHOOD"] = "new_pools,trending,top_volume"
         self.assertNotIn("new_pools", bot.get_gt_sources("bsc"))
         self.assertIn("new_pools", bot.get_gt_sources("robinhood"))
+
+
+class TestVenueSupport(unittest.TestCase):
+    """Can the configured routers actually reach a pool's DEX?
+
+    Measured 2026-09-30 on GeckoTerminal page 1 (20 pools per feed), the share
+    of pools the configured routers can execute on:
+
+        robinhood new_pools   0%   (pons-v2 14/20, uniswap-v4 6/20)
+        base      new_pools  25%   (uniswap-v4 8/20, bankr 4, aerodrome 2, o1 1)
+        bsc       new_pools  10%   (uniswap-v4 14/20, four-meme 4)
+        eth       new_pools  10%   (uniswap-v4 18/20)
+
+    Before this, those were scored to completion and alerted with buy buttons
+    that could only fail at quote time.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("REQUIRE_TRADEABLE_VENUE", "TRADEABLE_DEXES")
+        }
+        for key in self._saved:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_v4_is_not_tradeable_on_any_chain(self):
+        """V4 needs the Universal Router + Permit2, which is not implemented."""
+        for chain in ("ethereum", "base", "bsc", "robinhood"):
+            with self.subTest(chain=chain):
+                self.assertFalse(bot.dex_is_supported(chain, f"uniswap-v4-{chain}"))
+
+    def test_the_matching_v3_dex_is_tradeable(self):
+        self.assertTrue(bot.dex_is_supported("robinhood", "uniswap-v3-robinhood"))
+        self.assertTrue(bot.dex_is_supported("base", "uniswap_v3"))
+        self.assertTrue(bot.dex_is_supported("bsc", "pancakeswap-v3-bsc"))
+
+    def test_v2_pools_need_a_v2_router(self):
+        """Robinhood has no V2 router, so pons-v2 there cannot be routed."""
+        self.assertTrue(bot.dex_is_supported("bsc", "pancakeswap_v2"))
+        self.assertTrue(bot.dex_is_supported("base", "uniswap-v2-base"))
+        self.assertFalse(bot.dex_is_supported("robinhood", "pons-v2"))
+
+    def test_v3_forks_and_other_dexes_are_not_tradeable(self):
+        """A router only routes pools from its own factory."""
+        self.assertFalse(bot.dex_is_supported("robinhood", "up-v3"))
+        self.assertFalse(bot.dex_is_supported("robinhood", "ramses-v3-robinhood"))
+        self.assertFalse(bot.dex_is_supported("base", "aerodrome-slipstream-3"))
+        self.assertFalse(bot.dex_is_supported("bsc", "pancakeswap-infinity-clmm"))
+
+    def test_missing_dex_id_is_unknown_not_unsupported(self):
+        """Unknown metadata must stay distinct from a known-bad venue."""
+        self.assertIsNone(bot.dex_is_supported("base", ""))
+        self.assertIsNone(bot.dex_is_supported("base", None))
+
+    def test_case_and_whitespace_are_normalised(self):
+        self.assertTrue(bot.dex_is_supported("base", "  UNISWAP_V3 "))
+
+    def test_env_override_replaces_the_builtin_patterns(self):
+        os.environ["TRADEABLE_DEXES"] = "aerodrome"
+        self.assertTrue(bot.dex_is_supported("base", "aerodrome-slipstream-3"))
+        self.assertFalse(bot.dex_is_supported("base", "uniswap_v3"))
+
+    def test_require_tradeable_venue_defaults_to_off(self):
+        """Alerting on an unroutable pool is still informative; keep it opt-in."""
+        self.assertFalse(bot.REQUIRE_TRADEABLE_VENUE)

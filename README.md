@@ -78,6 +78,8 @@ omitted key means the code default — currently the conservative/off side.
 | `ALLOWED_USER_IDS` | — | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
 | `LOG_FEATURES` | `false` | `true` | Log a feature row for every token evaluation (see [Training data](#training-data)). Code default is `false`; example turns it on because the table is the tuning signal. |
 | `TRY_BLOCKSCOUT_HOLDERS` | `false` | `false` | Retry Blockscout for Robinhood holders. Off because that host answers with a Cloudflare challenge. |
+| `REQUIRE_TRADEABLE_VENUE` | `false` | `false` | Reject a pool whose DEX the configured routers cannot reach (Uniswap V4, V3 forks, Pons, Aerodrome) before spending enrichment budget. `false` still alerts but names the DEX and withholds buy buttons. See [Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4). |
+| `TRADEABLE_DEXES` / `<CHAIN>_TRADEABLE_DEXES` | — (built-in per-chain patterns) | — | Regex patterns (matched against the feed's `dexId`) for venues you have added routers for. Overrides the built-in uniswap v2/v3 (eth/base/robinhood) and pancakeswap v2/v3 (bsc) defaults. |
 
 Per-chain routing addresses (`ETH_QUOTER_V2`, `BSC_ROUTER_V3`, …) can be
 overridden in `.env`, but working defaults are compiled in for all four chains.
@@ -117,6 +119,55 @@ noise trade-off, not a free win** — pass 2 of this repo had to be reverted bec
 an additive bonus flooded Base with junk. Raise `SIGNAL_BONUS_WEIGHT` in small
 steps and watch what arrives. `VERBOSE_LOGGING=true` prints
 `score (hand=X/threshold)` on every evaluation so you can see the margin.
+
+That block is the **aggressive profile** (lower bar *and* full promotion). The
+`.env.example` default is the moderate one — `ROBINHOOD_MIN_SCORE=55` with
+`SIGNAL_BONUS_WEIGHT=0.5` — which keeps the bar honest while still letting a
+clean distributed runner through. The two are not in conflict; one is a
+haircut, the other is a rewrite, and the table under
+[Configuration](#configuration) always lists both the code default and what
+`.env.example` recommends.
+
+## Tradeable venues — do you need Uniswap V4?
+
+**Yes, if you want to trade what the early feeds actually list.** The bot holds a
+Uniswap V3 router + V2 router on Ethereum/Base, a PancakeSwap V3 + V2 router on
+BSC, and only a V3 router on Robinhood. A router can only route pools created by
+its *own* factory, so:
+
+* **Uniswap V4 is not reachable at all.** V4 swaps go through the Universal
+  Router + Permit2, which this bot does not implement. No fee-tier setting makes
+  a V4 pool quotable through a V3 router.
+* **Every V3 fork needs its own router.** Aerodrome (Base), Pons, `up-v3`,
+  Ramses and PancakeSwap-Infinity pools are not routable through a Uniswap or
+  PancakeSwap router.
+
+Measured 2026-09-30 on GeckoTerminal page 1 (20 pools per feed) — the share of
+pools the configured routers can execute on:
+
+| Chain | Feed | Routable | What the rest is |
+|---|---|---|---|
+| Robinhood | `new_pools` | **0%** | `pons-v2` 14/20, `uniswap-v4-robinhood` 6/20 |
+| Base | `new_pools` | **25%** | `uniswap-v4-base` 8/20, bankr 4, aerodrome 2, o1 1 |
+| BSC | `new_pools` | **10%** | `uniswap-v4-bsc` 14/20, four-meme 4 |
+| Ethereum | `new_pools` | **10%** | `uniswap-v4-ethereum` 18/20 |
+
+The earliest feed on every chain is therefore mostly unroutable today. That is
+why the bot now reports venue honestly instead of offering buttons that fail:
+
+* every evaluation records `dex_id` and `venue_tradeable` in the `features` table;
+* an alert on an unroutable pool **names the DEX, says there is no route, and
+  withholds the buy buttons** (there is nothing to tap that could work);
+* `REQUIRE_TRADEABLE_VENUE=true` rejects such pools before any enrichment budget
+  is spent — note this silences Robinhood's early lane entirely at 0% routable;
+* `TRADEABLE_DEXES` / `<CHAIN>_TRADEABLE_DEXES` override the recognised patterns
+  when you add a router for another venue.
+
+Ranked by value if you want to widen coverage: **(1) Uniswap V4 via the Universal
+Router** (the single biggest gap — 30–90% of early pools per chain), **(2) a
+Robinhood V2 router** (unlocks `pons-v2`, the dominant Robinhood `new_pools`
+venue), **(3) Aerodrome on Base**. Item 2 is only a config change *if* you have a
+verified Pons router address — do not guess one.
 
 ## Detection latency — "why do I only get pinged after the pump?"
 
@@ -221,6 +272,55 @@ otherwise zero the score on every chain.
 GeckoTerminal's free tier is ~30 calls/min, so discovery and holder lookups share
 one limiter (`GT_MIN_INTERVAL_S`, default 2.1s ≈ 28/min). A burst gets HTTP 429.
 
+### How the security check works (and why new pairs are dropped)
+
+GoPlus does not index a pool the moment it is born, and the bot treats "not
+indexed" as **unknown, not safe**. Per chain:
+
+| Chain | Provider | What happens when there is no record |
+|---|---|---|
+| BSC / Ethereum / Base | GoPlus `token_security` | `None` → token **dropped** as `security_unknown`. With `ALLOW_SECURITY_FALLBACK=true`, honeypot.is v2 is tried, and accepted **only** if it actually simulated (`simulationSuccess` + `honeypotResult`); otherwise still dropped. |
+| Robinhood | Etherscan v2 `getsourcecode` (Blockscout fallback) | No GoPlus and no honeypot.is chain id exist, so **no honeypot/tax check runs at all**. An unverified contract is a −8 penalty, not a reject. |
+
+Two consequences worth knowing before you tune anything:
+
+1. **GoPlus lag is a silent recall ceiling on BSC/ETH/Base.** A pool minutes old
+   can clear the floors, the signal gates and the score, then die at
+   `security_unknown`. `/health` now reports `security_unknown_rejects` so you
+   can see how often, and the failed-lookup cache is 120s (vs 1800s for a good
+   record), so a token becomes eligible as soon as GoPlus catches up rather than
+   staying hidden for half an hour.
+2. **Robinhood's early lane has no honeypot protection.** Security there means
+   "Etherscan says whether the source is verified". That is why the early lane's
+   AND-gates (unique buyers, txns, buy ratio, liquidity) carry the rug-filtering
+   weight on that chain — they are the only protection present.
+
+`ALLOW_SECURITY_FALLBACK=true` is the lever for trading unindexed BSC/ETH/Base
+pairs. It is off by default because accepting an unanalysable token as "safe" is
+what flooded Base with noise in pass 2.
+
+### Where these numbers come from
+
+Thresholds in this repo are of two kinds, and the docs label them so you can tell
+which is which:
+
+* **Measured distributions** — feed ages/mcaps (`n=20` per chain/feed), the
+  ~30 calls/min GeckoTerminal budget, holder bands, the venue split above, and
+  `diag/component_audit.py`'s rank correlations over 5,148 bars. These generalise
+  within their sample.
+* **Single-case calibration** — the bar/floor/bonus values replayed against one
+  pool that ran (and one that was missed). These are *falsification cases*: they
+  prove a setting admits a known runner without admitting a known rug. They do
+  not estimate a probability, and they are marked as illustrative wherever they
+  appear.
+
+Neither is a fitted model. `n=20` on one day is a small sample, and a case study
+is one observation. The intended path is to re-derive the knobs from your own
+labelled data: `LOG_FEATURES=true` → `label_outcomes.py --export training.csv`,
+then split **by token, not by row**, and compare precision/recall against the
+hand score **at the same alert volume**. Until then, treat the shipped numbers as
+defensible starting points rather than calibration.
+
 
 
 ## Usage
@@ -246,7 +346,9 @@ sell 25/50/100%, buy more, and set trailing stop.
 
 `bot.py` is a FastAPI app; `python bot.py` starts it on `PORT` (default `10000`)
 and the bot runs from the app lifespan. `GET /health` returns status, counters and
-open positions. Works on Render or any host that injects `PORT`. SQLite
+open positions, including the three "why was it quiet" counters
+(`security_unknown_rejects`, `unsupported_venue_rejects`, `untradeable_alerts`).
+Works on Render or any host that injects `PORT`. SQLite
 (`pump_bot_v5.db`) and logs are local, so attach a disk if state must survive
 redeploys.
 
@@ -372,7 +474,17 @@ token at different times) — split by token, not by row, when validating.
   in code) because the DexScreener "all pairs" endpoint is dead (404) — but that
   path only ever sees paid shills, so set `USE_GECKOTERMINAL=true` for real
   discovery.
-- Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Liquidity on
-  Aerodrome (Base) or V4 venues may not be tradeable.
+- Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Uniswap V4,
+  Aerodrome (Base), Pons and other V3 forks are **not** routable — the alert says
+  so and withholds the buy buttons. See
+  [Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4) for the measured
+  coverage and what to add first.
+- `/health` reports why the bot was quiet as counters, not just a log:
+  `security_unknown_rejects` (GoPlus lag), `unsupported_venue_rejects`
+  (`REQUIRE_TRADEABLE_VENUE=true` dropping V4/forks) and `untradeable_alerts`
+  (alerts sent with buy buttons withheld).
+- `REVIEW.md` and `FINDINGS_BOAR_2026-09-26.md` are **point-in-time records** of
+  specific review passes and one incident. Where they disagree with this README,
+  the README and the code are current and those documents are history.
 - See [`REVIEW.md`](REVIEW.md) for the detailed code review, known issues and
   roadmap.

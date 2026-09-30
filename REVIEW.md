@@ -1,5 +1,15 @@
 # Code review — my-sniper-bot
 
+> **Point-in-time record.** This review was written across several passes
+> (2026-09-17 → 2026-09-25) and its "Verdict in one line" describes the code as it
+> was at that time. Several recommendations were implemented afterwards, so a
+> reader comparing it to the current tree will find apparent contradictions.
+> Resolve them in favour of [`README.md`](README.md) and `bot.py`; this document is
+> kept for the reasoning and the evidence, not as a description of current
+> behaviour. Notably, discovery/venue handling and the security pipeline have
+> changed since — see the README's
+> [Tradeable venues](README.md#tradeable-venues--do-you-need-uniswap-v4) section.
+
 Reviewed: `bot.py` (~3,000 lines after pass 2), `signals.py`, `discovery.py`,
 `label_outcomes.py`, `requirements.txt`, `start.sh`, `test_telegram.py`,
 `.env` (names only), `crime_pump.log`.
