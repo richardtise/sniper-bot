@@ -868,3 +868,50 @@ class TestNewPoolsOnEveryChain(unittest.TestCase):
 
     def test_code_default_already_includes_new_pools(self):
         self.assertIn("new_pools", bot.get_gt_sources("base"))
+
+
+class TestVenueRequirements(unittest.TestCase):
+    """Alerts must name the missing integration, not just say "no route".
+
+    The unit of trading coverage is the DEX, not the router version. Measured
+    2026-09-30 on Base: for a token actively trading on Aerodrome, the Uniswap V3
+    factory returned address(0) for every fee tier (100/500/3000/10000) and both
+    quotes (WETH, USDC). So "a V3 router exists on this chain" says nothing about
+    whether any other DEX's pools can be reached.
+    """
+
+    def test_universal_router_is_named_for_v4(self):
+        self.assertIn("V4", bot.venue_requirement("base", "uniswap-v4-base"))
+        self.assertIn("Permit2", bot.venue_requirement("robinhood", "uniswap-v4-robinhood"))
+
+    def test_uniswap_v3_is_not_described_as_v4(self):
+        label = bot.venue_requirement("base", "uniswap-v3-base")
+        self.assertIn("V3", label)
+        self.assertNotIn("V4", label)
+
+    def test_v3_forks_name_their_own_protocol(self):
+        for dex, expect in (("aerodrome-slipstream-3", "Aerodrome"),
+                            ("up-v3", "up-v3"),
+                            ("ramses-v3-robinhood", "Ramses"),
+                            ("pancakeswap-infinity-clmm", "Infinity")):
+            with self.subTest(dex=dex):
+                self.assertIn(expect, bot.venue_requirement("base", dex))
+
+    def test_v4_based_launchpads_are_labelled_v4(self):
+        for dex in ("bankr", "o1-launchpad"):
+            with self.subTest(dex=dex):
+                self.assertIn("V4", bot.venue_requirement("base", dex))
+
+    def test_unknown_venue_is_explicit_not_silent(self):
+        self.assertIn("no integration", bot.venue_requirement("base", "some-new-dex"))
+
+    def test_missing_dex_id_is_reported_as_unknown(self):
+        self.assertIn("unknown venue", bot.venue_requirement("base", None))
+
+    def test_requirement_never_implies_a_working_route(self):
+        """V4 requires Universal Router + Permit2, so it is NOT already configured."""
+        label = bot.venue_requirement("base", "uniswap-v4-base")
+        self.assertNotIn("already configured", label)
+
+    def test_supported_dexes_still_report_configured_routers(self):
+        self.assertIn("already configured", bot.venue_requirement("bsc", "pancakeswap-v3-bsc"))

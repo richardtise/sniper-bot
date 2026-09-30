@@ -355,6 +355,47 @@ def get_tradeable_dex_patterns(chain: str):
     return tuple(p.strip().lower() for p in raw.split(",") if p.strip())
 
 
+# What each venue would need before the bot could execute on it. This exists so
+# an alert says "needs the Aerodrome router" rather than a bare "no route" — the
+# missing unit is the DEX, not the router *version*. Evidence for that claim,
+# measured 2026-09-30 on Base: for a token actively trading on Aerodrome, the
+# Uniswap V3 factory returned address(0) for every fee tier (100/500/3000/10000)
+# and both quotes (WETH, USDC). A Uniswap V3 router routes only Uniswap V3
+# pools; having "a V3 router" says nothing about any other DEX's pools.
+_VENUE_REQUIREMENTS = (
+    (r"uniswap[-_]?v4", "Uniswap V4 (Universal Router + Permit2)"),
+    (r"bankr", "bankr launchpad (V4-based)"),
+    (r"o1[-_]?launchpad", "o1 launchpad (V4-based)"),
+    (r"^uniswap$|uniswap[-_]?v?3", "Uniswap V3 router (already configured)"),
+    (r"uniswap[-_]?v?2", "Uniswap V2 router (already configured)"),
+    (r"^pancakeswap$|pancakeswap[-_]?v?3", "PancakeSwap V3 router (already configured)"),
+    (r"pancakeswap[-_]?v?2", "PancakeSwap V2 router (already configured)"),
+    (r"pancakeswap[-_]?infinity", "PancakeSwap Infinity (CLMM) router"),
+    (r"aerodrome", "Aerodrome router (Slipstream for CL pools)"),
+    (r"pons", "Pons router (Robinhood V2-style)"),
+    (r"ramses", "Ramses router"),
+    (r"^up[-_]?v3", "up-v3 router"),
+    (r"alandale", "alandale router"),
+    (r"four[-_]?meme", "four.meme launchpad contract"),
+    (r"sushi", "SushiSwap router"),
+)
+
+
+def venue_requirement(chain: str, dex_id) -> str:
+    """Short human label for what trading this venue would take.
+
+    Purely descriptive: it never claims a route exists. Used in alerts and the
+    feature row so the gap per chain is a measured list rather than a guess.
+    """
+    dex = str(dex_id or "").strip().lower()
+    if not dex:
+        return "unknown venue (feed gave no dexId)"
+    for pattern, label in _VENUE_REQUIREMENTS:
+        if re.search(pattern, dex):
+            return label
+    return f"no integration for '{dex}'"
+
+
 def dex_is_supported(chain: str, dex_id) -> Optional[bool]:
     """Whether the configured routers can actually execute on this pool's DEX.
 
@@ -703,7 +744,7 @@ FEATURE_FIELDS = [
     # actually reach it. Alerting on an unroutable pool (Uniswap V4, a V3 fork,
     # Pons/Aerodrome/...) produced buy buttons that could only fail; this is the
     # column that makes that measurable instead of anecdotal.
-    "dex_id", "venue_tradeable",
+    "dex_id", "venue_tradeable", "venue_requirement",
     "signal_bonus", "signal_penalty", "signal_notes",
     # Per-component score breakdown. The total alone cannot answer "which part of
     # the model withheld the points", which is the question every miss raises.
@@ -736,7 +777,7 @@ _FEATURE_INT_FIELDS = {
 _FEATURE_TEXT_FIELDS = {
     "ts_utc", "chain", "token_address", "pair_address", "symbol", "source",
     "security_source", "signal_notes", "reject_reasons", "holder_source",
-    "dex_id",
+    "dex_id", "venue_requirement",
 }
 
 
@@ -2237,6 +2278,7 @@ async def evaluate_token(session, pair):
     # are actually tradeable" is a query, not a guess.
     dex_id = str(pair.get("dexId") or "").strip().lower()
     venue_tradeable = dex_is_supported(chain, dex_id)
+    venue_needs = venue_requirement(chain, dex_id)
 
     feat.update({
         "liquidity_usd": liquidity,
@@ -2244,6 +2286,7 @@ async def evaluate_token(session, pair):
         "age_minutes": age_minutes,
         "dex_id": dex_id,
         "venue_tradeable": None if venue_tradeable is None else int(venue_tradeable),
+        "venue_requirement": venue_needs,
         "vol_5m": vol_5m, "vol_15m": vol_15m, "vol_1h": vol_1h,
         "vol_6h": vol_6h, "vol_24h": vol_24h,
         "vol_liq_ratio": (vol_5m / liquidity) if liquidity else 0.0,
@@ -2497,6 +2540,7 @@ async def evaluate_token(session, pair):
         "age_minutes": age_minutes,
         "dex_id": dex_id,
         "venue_tradeable": venue_tradeable,
+        "venue_requirement": venue_needs,
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}",
         "price_usd": price,
         "price_native": float(pair.get("priceNative") or 0),
@@ -3778,12 +3822,13 @@ async def send_alert(alert):
     dex_display = esc(alert.get("dex_id") or "unknown")
     if venue_ok is False:
         untradeable_alerts += 1
+        needs = esc(alert.get("venue_requirement") or "unknown")
         route_text = (
             f"⚠️ <b>No route — not tradeable by this bot.</b>\n"
             f"  DEX: <code>{dex_display}</code>\n"
-            f"  The configured routers cannot reach this pool (Uniswap V4 and\n"
-            f"  non-Uniswap/Pancake V3 forks each need their own router).\n"
-            f"  <i>Buy buttons withheld so they cannot silently fail.</i>\n\n"
+            f"  Needs: {needs}\n"
+            f"  <i>A router only routes its own factory's pools, so a V2/V3 router\n"
+            f"  on this chain does not reach another DEX. Buttons withheld.</i>\n\n"
         )
     else:
         suffix = "" if venue_ok else " (tradeability unknown)"

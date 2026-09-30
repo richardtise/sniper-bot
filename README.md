@@ -170,6 +170,49 @@ Robinhood V2 router** (unlocks `pons-v2`, the dominant Robinhood `new_pools`
 venue), **(3) Aerodrome on Base**. Item 2 is only a config change *if* you have a
 verified Pons router address — do not guess one.
 
+#### Why V2 + V3 + V4 routers on every chain is still not enough
+
+The unit of trading coverage is the **DEX**, not the router version. A router
+routes only pools created by **its own factory**, so:
+
+* a Uniswap V3 router on Base reaches *Uniswap V3 Base* pools and nothing else —
+  not Aerodrome, not `up-v3`, not PancakeSwap Infinity;
+* a PancakeSwap router on BSC reaches *PancakeSwap* pools, not `four-meme`;
+* Uniswap V4 is a different architecture entirely (below), not a fourth router
+  address you can add to the existing V2/V3 code paths.
+
+Verified on-chain 2026-09-30, not asserted: for token `SI`
+(`0x5ea8f2c761c5da750eca48e5900c0639c8ed2c9b`), which trades actively on
+Aerodrome, the Uniswap V3 factory on Base
+(`0x33128a8fC17869897dcE68Ed026d694621f6FDfD`) returned
+`0x0000000000000000000000000000000000000000` for **every** fee tier
+(100 / 500 / 3000 / 10000) and **both** quotes (WETH, USDC). Nothing to route
+through, even with a V3 router and quoter configured and working.
+
+**What V4 actually requires.** All V4 pools live in a single `PoolManager`
+singleton; a "pool address" is a 32-byte `PoolId`, not a contract. Confirmed by
+reading `PoolManager.extsload` on Base — the pool id GeckoTerminal reports holds
+initialised state in the PoolManager's `_pools` mapping. Consequences:
+
+| Requirement | Why |
+|---|---|
+| Universal Router (command encoding) | V4 swaps are dispatched by opcode, not a simple `exactInputSingle` call |
+| Permit2 approval flow | The Universal Router pulls tokens through Permit2, so approval is two-step |
+| `PoolKey` = (currency0, currency1, fee, tickSpacing, hooks) | Needed to build the swap — and **GeckoTerminal publishes only the `PoolId` (its hash)**, no fee/tickSpacing/hooks. It must be recovered from `Initialize` logs or an indexer. |
+| Native ETH as `currency0 = address(0)` | ETH pools are not WETH pools in V4 |
+| A hooks review per pool | A pool may attach a hook contract with custom logic (fees, transfer restrictions). Attempts to reconstruct keys with `hooks = 0` over standard fee tiers failed for 8/8 sampled Base V4 pools, which is consistent with launchpad pools attaching hooks. Hooked pools cannot be assumed to behave like a plain AMM. |
+
+So the honest sequencing for "buy on all chains" is: Universal Router + Permit2 +
+`PoolKey` recovery first (unlocks V4 and every V4-based launchpad — `bankr`,
+`o1-launchpad`), then per-DEX routers (Pons on Robinhood, Aerodrome on Base,
+`four-meme` on BSC), each needing a *verified* address. This is not a config
+change, and it should not be written blind: the `PoolKey` source and hooks
+handling need a real log/indexer endpoint before any transaction path is built.
+
+Until then the bot stays honest: alerts name the DEX and the exact missing
+integration (`Venue requirement` in the `features` table), and withhold buy
+buttons rather than offering ones that fail.
+
 ## Detection latency — "why do I only get pinged after the pump?"
 
 Being late is two different failures that look identical in a log full of reject
