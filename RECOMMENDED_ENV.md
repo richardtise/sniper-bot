@@ -54,12 +54,18 @@ MIN_EFFECTIVE_SCORE=30
 ROBINHOOD_MIN_SCORE=50          # must be set, or it silently overrides MIN_SCORE
 PAPER_TRADING=true              # until you have watched a full day of alerts
 
-# ── Discovery: early on every chain ──────────────────────────────────────────
+# ── Discovery: BOTH sources (union, not either/or) ───────────────────────────
 USE_GECKOTERMINAL=true
 GT_SOURCES=new_pools,trending,top_volume
 GT_PAGES_NEW=1
 GT_PAGES_TRENDING=1
 SIG_MAX_AGE_MINUTES=0           # age is not a quality signal
+# Second source: small list, median ~24h old, but mostly small mcap and on
+# uniswap/pancakeswap — i.e. venues the routers can actually trade.
+DEXSCREENER_SOURCES=boosts,boosts_top,profiles
+# Drops the Uniswap V4 majority of new_pools before enrichment, so the spam you
+# cannot act on never reaches you while early entries on tradeable venues stay.
+REQUIRE_TRADEABLE_VENUE=true
 
 # ── Filters: safety is the part that works, so keep it strict ────────────────
 USE_SIGNALS=true

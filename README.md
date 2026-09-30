@@ -60,6 +60,7 @@ omitted key means the code default — currently the conservative/off side.
 | `COINGECKO_API_KEY` | — | — | Enables CEX-listing scoring (never applies to Robinhood). |
 | `USE_GECKOTERMINAL` | `false` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list (`/latest/dex/pairs/{chain}` 404s), so prefer `true`. Code default is `false` (unchanged behaviour until you opt in). |
 | `GT_SOURCES` | `new_pools,trending,top_volume` | `new_pools,trending,top_volume` | Sources for **every** chain. `new_pools` = the only early feed (carries a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` makes a sub-50k entry mathematically impossible — no threshold tuning can recover a pool the scanner never listed. |
+| `DEXSCREENER_SOURCES` | `""` (off) | `boosts,boosts_top,profiles` | DexScreener boost/profile lists as a **second** source alongside GeckoTerminal — a union, not a switch. Measured 2026-09-30: these list tokens at a median **~24h old** (p25 112m, min 26m), so they are *not* earlier than `new_pools`; the value is the opposite — a much smaller list (~20 tokens per cycle across four chains), skewed small (median mcap ~$107k) and mostly on `uniswap`/`pancakeswap`, i.e. venues the routers can actually trade. Costs one call per 30 tokens. |
 | `GT_SOURCES_<CHAIN>` | — (falls back to `GT_SOURCES`) | — | Per-chain override (also accepts `<CHAIN>_GT_SOURCES`). Use it to drop a feed on one chain, never to blind the early lane globally. `new_pools` was Robinhood-only until 2026-09-30, switched off on BSC after an **n=20** alert preview showed template-liquidity placeholders — the same error as tuning a floor on two tokens. It is now on every chain and the *filters* do the work, per chain. |
 | `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | `1` / `1` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort, so depth there buys little. `trending` is one page in `.env.example` because the second page buys lagging $3.5M-median pools that the mcap ceiling rejects anyway, and that budget is better spent on births now that `new_pools` runs everywhere. |
 | `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
@@ -212,6 +213,36 @@ handling need a real log/indexer endpoint before any transaction path is built.
 Until then the bot stays honest: alerts name the DEX and the exact missing
 integration (`Venue requirement` in the `features` table), and withhold buy
 buttons rather than offering ones that fail.
+
+#### Both sources, and what to do about `new_pools` spam
+
+Discovery is now the **union** of GeckoTerminal and DexScreener
+(`DEXSCREENER_SOURCES`). It used to be either/or, so turning on the early feed
+silently turned off the curated list. Measured 2026-09-30:
+
+| Source | Typical age at listing | List size | Character |
+|---|---|---|---|
+| GT `new_pools` | **3–5 minutes** | hundreds/cycle | mostly Uniswap V4 → unroutable |
+| DS boosts/profiles | median **~24h** (p25 112m, min 26m) | **~20 across 4 chains** | median mcap ~$107k; mostly `uniswap`/`pancakeswap` |
+
+So DexScreener is *not* earlier than `new_pools` — it is much later. If you
+remember being "genuinely early" on it, you were early relative to
+**competition**, not relative to birth: the list is tiny and few bots watch it,
+and its tokens are small ($107k median mcap, 13/21 inside the <200k window) and on
+tradeable venues.
+
+If `new_pools` spam is the problem, there are two fixes and they are not
+equivalent:
+
+* **(a) Drop it** — `GT_SOURCES=trending,top_volume`. You lose the only
+  3–5-minute source; earliest entry becomes ~26m at best, median ~24h.
+* **(b) Keep it and stop the spam reaching you** — `REQUIRE_TRADEABLE_VENUE=true`.
+  Most `new_pools` candidates are Uniswap V4 and cannot be bought anyway, so they
+  are rejected before enrichment and never alert. Early entries on tradeable
+  venues survive.
+
+(b) is usually what is wanted, and it costs nothing but the alerts you could not
+have acted on.
 
 #### Is Uniswap enough for ETH/Base/Robinhood, and PancakeSwap for BSC?
 

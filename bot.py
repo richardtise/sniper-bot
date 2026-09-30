@@ -85,6 +85,21 @@ ALERT_THRESHOLD = int(os.getenv("MIN_SCORE", os.getenv("ALERT_THRESHOLD", "65"))
 USE_SIGNALS = os.getenv("USE_SIGNALS", "false").lower() == "true" and SIGNALS_AVAILABLE
 USE_GECKOTERMINAL = os.getenv("USE_GECKOTERMINAL", "false").lower() == "true" and DISCOVERY_AVAILABLE
 
+# DexScreener as a SECOND discovery source, alongside GeckoTerminal rather than
+# instead of it. Measured 2026-09-30: boosts/profiles surface tokens at a median
+# ~24h old (much later than new_pools' 3-5 minutes), but the list is tiny (~20
+# tokens across four chains per cycle), skewed small (median mcap ~$107k) and
+# mostly on uniswap/pancakeswap — venues the routers can actually trade. Empty
+# string disables it; set "boosts,profiles".
+DEXSCREENER_SOURCES = tuple(
+    s.strip().lower() for s in os.getenv("DEXSCREENER_SOURCES", "").split(",") if s.strip()
+)
+DEXSCREENER_ENDPOINTS = {
+    "boosts": "https://api.dexscreener.com/token-boosts/latest/v1",
+    "boosts_top": "https://api.dexscreener.com/token-boosts/top/v1",
+    "profiles": "https://api.dexscreener.com/token-profiles/latest/v1",
+}
+
 # Early-runner fast lane: lets a genuinely strong *young* pool alert even though
 # its 1h/6h/24h windows are empty (and so its hand-tuned score can never reach
 # MIN_SCORE). Requires USE_SIGNALS and every AND-condition in
@@ -1540,54 +1555,98 @@ async def get_geckoterminal_pairs(session, network):
 
 
 async def get_all_pairs(session, network):
+    """Candidates for one chain — the UNION of GeckoTerminal and DexScreener.
+
+    Why both, measured 2026-09-30 rather than assumed:
+
+    * GeckoTerminal ``new_pools`` lists a pool **3-5 minutes** old. It is the only
+      source that early, and it is correspondingly noisy — on the birth feed most
+      pools are Uniswap V4, which the routers cannot reach.
+    * DexScreener's boost/profile lists surface tokens that are **median ~24h old**
+      (p25 ~112m, min 26m in a 21-token sample). That is much later than birth, but
+      the list is tiny (~20 tokens across all four chains per cycle instead of
+      hundreds), its tokens are mostly small (median mcap ~$107k, 13/21 inside the
+      <200k entry window) and most sit on ``uniswap`` / ``pancakeswap`` — i.e. on
+      venues the routers CAN trade.
+
+    So they are complements, not substitutes: GeckoTerminal for latency,
+    DexScreener for a low-volume, low-competition, mostly-tradeable shortlist. This
+    used to be an either/or switch (``USE_GECKOTERMINAL``), which meant turning on
+    the early feed silently turned off the curated one.
+
+    Enable with ``DEXSCREENER_SOURCES=boosts,profiles`` (empty disables it).
+    """
+    pairs: list = []
+    seen: set = set()
+
+    async def add_pair(pair):
+        addr = pair.get("pairAddress")
+        if not addr or addr in seen:
+            return
+        if pair.get("chainId") != network:
+            return
+        seen.add(addr)
+        pairs.append(pair)
+
     if USE_GECKOTERMINAL:
-        return await get_geckoterminal_pairs(session, network)
+        for pair in await get_geckoterminal_pairs(session, network):
+            await add_pair(pair)
 
-    pairs = []
-    seen = set()
-    async def add_pair(p):
-        addr = p.get("pairAddress")
-        if addr and addr not in seen:
-            seen.add(addr)
-            pairs.append(p)
+    if DEXSCREENER_SOURCES:
+        for pair in await get_dexscreener_pairs(session, network):
+            await add_pair(pair)
 
-    url = f"https://api.dexscreener.com/latest/dex/pairs/{network}?page=0&pageSize=300"
-    data = await fetch_json(session, url)
-    if data and "pairs" in data:
-        for p in data["pairs"]:
-            if p.get("chainId") == network:
-                await add_pair(p)
-
-    boost_data = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
-    if boost_data and isinstance(boost_data, list):
-        tasks = []
-        for b in boost_data:
-            if b.get("chainId") == network and b.get("tokenAddress"):
-                tasks.append(fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{network}/{b['tokenAddress']}"))
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    for p in res:
-                        if p.get("chainId") == network:
-                            await add_pair(p)
-
-    profiles_data = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
-    if profiles_data and isinstance(profiles_data, list):
-        tasks = []
-        for p in profiles_data:
-            if p.get("chainId") == network and p.get("tokenAddress"):
-                tasks.append(fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{network}/{p['tokenAddress']}"))
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    for p in res:
-                        if p.get("chainId") == network:
-                            await add_pair(p)
+    # Neither source enabled: keep the historical paid-list behaviour rather than
+    # returning nothing.
+    if not USE_GECKOTERMINAL and not DEXSCREENER_SOURCES:
+        data = await fetch_json(
+            session,
+            f"https://api.dexscreener.com/latest/dex/pairs/{network}?page=0&pageSize=300",
+        )
+        if data and "pairs" in data:
+            for pair in data["pairs"]:
+                await add_pair(pair)
 
     pairs.sort(key=lambda x: float(x.get("volume", {}).get("m5", 0) or 0), reverse=True)
     return pairs[:300]
+
+
+async def get_dexscreener_pairs(session, network):
+    """Boosted/profiled tokens for one chain, resolved to pairs.
+
+    ``/tokens/v1/{chain}/{a,b,c}`` accepts up to 30 addresses, so the whole list
+    costs one call instead of one per token — which matters because this runs
+    every scan cycle for every chain.
+    """
+    addresses = []
+    seen = set()
+    for kind in DEXSCREENER_SOURCES:
+        url = DEXSCREENER_ENDPOINTS.get(kind)
+        if not url:
+            logger.warning(f"Unknown DEXSCREENER_SOURCES entry {kind!r}")
+            continue
+        payload = await fetch_json(session, url)
+        for addr in discovery.dexscreener_token_addresses(payload, network):
+            if addr not in seen:
+                seen.add(addr)
+                addresses.append(addr)
+
+    if not addresses:
+        return []
+
+    out = []
+    for batch in discovery.chunked(addresses, 30):
+        url = f"https://api.dexscreener.com/tokens/v1/{network}/{','.join(batch)}"
+        data = await fetch_json(session, url)
+        for pair in (data if isinstance(data, list) else []):
+            if pair.get("chainId") != network:
+                continue
+            pair = dict(pair)
+            pair["source"] = "dexscreener:boost"
+            out.append(pair)
+    logger.info(f"{network}: {len(addresses)} boosted/profiled token(s) -> {len(out)} pair(s)")
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECURITY CHECKS

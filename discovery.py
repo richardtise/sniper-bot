@@ -48,6 +48,8 @@ __all__ = [
     "pool_to_pair",
     "dedupe_best_pool",
     "dexscreener_search",
+    "dexscreener_token_addresses",
+    "chunked",
 ]
 
 GT_BASE = "https://api.geckoterminal.com/api/v2"
@@ -366,3 +368,37 @@ async def dexscreener_search(fetch: Fetch, query: str, chain: str) -> List[dict]
             pair.setdefault("source", "dexscreener_search")
             out.append(pair)
     return dedupe_best_pool(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DexScreener as a second source (boosts / profiles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dexscreener_token_addresses(payload, chain: str) -> List[str]:
+    """Token addresses for one chain out of a boosts/profiles payload.
+
+    Both endpoints return a flat list of entries shaped like
+    ``{"chainId": "bsc", "tokenAddress": "0x..."}``, so a missing or malformed
+    payload must yield no candidates rather than raising — this runs inside the
+    scan loop, where an exception costs a whole cycle.
+    """
+    if not isinstance(payload, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("chainId") or "").lower() != str(chain).lower():
+            continue
+        addr = entry.get("tokenAddress")
+        if isinstance(addr, str) and addr and addr not in seen:
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
+def chunked(seq: List[str], size: int) -> List[List[str]]:
+    """Split into batches of at most ``size`` (DexScreener's /tokens/v1 cap is 30)."""
+    size = max(1, int(size))
+    return [seq[i:i + size] for i in range(0, len(seq), size)]

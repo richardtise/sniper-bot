@@ -22,6 +22,7 @@ os.environ.setdefault("CHAT_ID", "1")
 os.environ.setdefault("WALLET_PRIVATE_KEY", "")
 
 import bot  # noqa: E402  (import after env stubs)
+import discovery  # noqa: E402
 import signals  # noqa: E402
 
 
@@ -915,3 +916,117 @@ class TestVenueRequirements(unittest.TestCase):
 
     def test_supported_dexes_still_report_configured_routers(self):
         self.assertIn("already configured", bot.venue_requirement("bsc", "pancakeswap-v3-bsc"))
+
+
+class TestDexScreenerAsSecondSource(unittest.TestCase):
+    """Both discovery sources run together; they are complements, not rivals.
+
+    Measured 2026-09-30: GeckoTerminal new_pools lists a pool 3-5 minutes old but
+    is noisy and mostly Uniswap V4; DexScreener boosts/profiles surface tokens at a
+    median ~24h old in a list of only ~20 across four chains, skewed small (median
+    mcap ~$107k) and mostly on uniswap/pancakeswap, i.e. tradeable. Previously
+    enabling the early feed silently disabled the curated one.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "USE_GECKOTERMINAL": bot.USE_GECKOTERMINAL,
+            "DEXSCREENER_SOURCES": bot.DEXSCREENER_SOURCES,
+            "get_geckoterminal_pairs": bot.get_geckoterminal_pairs,
+            "get_dexscreener_pairs": bot.get_dexscreener_pairs,
+            "fetch_json": bot.fetch_json,
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(bot, k, v)
+
+    def test_token_addresses_are_filtered_by_chain(self):
+        payload = [
+            {"chainId": "bsc", "tokenAddress": "0xBSC1"},
+            {"chainId": "solana", "tokenAddress": "SoL1"},
+            {"chainId": "base", "tokenAddress": "0xBASE1"},
+            {"chainId": "bsc", "tokenAddress": "0xBSC1"},   # duplicate
+        ]
+        self.assertEqual(discovery.dexscreener_token_addresses(payload, "bsc"), ["0xBSC1"])
+        self.assertEqual(discovery.dexscreener_token_addresses(payload, "base"), ["0xBASE1"])
+
+    def test_malformed_payloads_yield_nothing_rather_than_raising(self):
+        for bad in (None, {}, [], [None], [{"chainId": "bsc"}], "nope"):
+            with self.subTest(payload=bad):
+                self.assertEqual(discovery.dexscreener_token_addresses(bad, "bsc"), [])
+
+    def test_chunking_respects_the_30_address_cap(self):
+        addrs = [f"0x{i}" for i in range(65)]
+        batches = discovery.chunked(addrs, 30)
+        self.assertEqual([len(b) for b in batches], [30, 30, 5])
+        self.assertEqual(discovery.chunked([], 30), [])
+
+    def _pair(self, addr, chain="bsc"):
+        return {"pairAddress": addr, "chainId": chain,
+                "volume": {"m5": 1.0}, "liquidity": {"usd": 1.0}}
+
+    def test_union_contains_candidates_from_both_sources(self):
+        import asyncio
+
+        async def fake_gt(session, network):
+            return [self._pair("0xgt", network)]
+
+        async def fake_ds(session, network):
+            return [self._pair("0xds", network)]
+
+        bot.USE_GECKOTERMINAL = True
+        bot.DEXSCREENER_SOURCES = ("boosts",)
+        bot.get_geckoterminal_pairs = fake_gt
+        bot.get_dexscreener_pairs = fake_ds
+
+        pairs = asyncio.run(bot.get_all_pairs(None, "bsc"))
+        addrs = {p["pairAddress"] for p in pairs}
+        self.assertEqual(addrs, {"0xgt", "0xds"})
+
+    def test_duplicate_pairs_are_collapsed_across_sources(self):
+        import asyncio
+
+        async def fake_gt(session, network):
+            return [self._pair("0xsame"), self._pair("0xgt")]
+
+        async def fake_ds(session, network):
+            return [self._pair("0xsame"), self._pair("0xds")]
+
+        bot.USE_GECKOTERMINAL = True
+        bot.DEXSCREENER_SOURCES = ("boosts",)
+        bot.get_geckoterminal_pairs = fake_gt
+        bot.get_dexscreener_pairs = fake_ds
+
+        pairs = asyncio.run(bot.get_all_pairs(None, "bsc"))
+        self.assertEqual(len(pairs), 3)
+
+    def test_other_chains_are_not_leaked_in(self):
+        import asyncio
+
+        async def fake_gt(session, network):
+            return [self._pair("0xgt", network), self._pair("0xwrong", "ethereum")]
+
+        async def fake_ds(session, network):
+            return []
+
+        bot.USE_GECKOTERMINAL = True
+        bot.DEXSCREENER_SOURCES = ("boosts",)
+        bot.get_geckoterminal_pairs = fake_gt
+        bot.get_dexscreener_pairs = fake_ds
+
+        pairs = asyncio.run(bot.get_all_pairs(None, "bsc"))
+        self.assertEqual({p["pairAddress"] for p in pairs}, {"0xgt"})
+
+    def test_no_source_enabled_falls_back_to_the_paid_list(self):
+        import asyncio
+
+        async def fake_fetch(session, url, **kw):
+            return {"pairs": [self._pair("0xpaid")]}
+
+        bot.USE_GECKOTERMINAL = False
+        bot.DEXSCREENER_SOURCES = ()
+        bot.fetch_json = fake_fetch
+
+        pairs = asyncio.run(bot.get_all_pairs(None, "bsc"))
+        self.assertEqual({p["pairAddress"] for p in pairs}, {"0xpaid"})
