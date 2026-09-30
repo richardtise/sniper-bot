@@ -426,6 +426,64 @@ the points.
 
 ## Alert gate
 
+### How good is the score? Measured, not assumed
+
+It has almost no rank power for forward returns, and *negative* rank power for the
+large moves the bot exists to catch. Re-run at HEAD with
+`diag/component_audit.py` (4,550 observations, 49 pools, Base 5-minute candles):
+
+| Forward move | positives | AUC of the tested components (0.5 = coin flip) |
+|---|---|---|
+| ≥ 10% in 1h | 66 | **0.568** |
+| ≥ 25% in 1h | 8 | **0.463** |
+| ≥ 25% in 6h | 89 | **0.480** |
+| ≥ 50% in 6h | 13 | **0.487** |
+| ≥ 100% in 6h | 1 | 0.461 (one positive — meaningless) |
+
+Rank correlation is ~0.02–0.09, and in economic terms the components are worth
+**+0.1 to +0.4 points** of forward 1-hour return (1.5% when a component fires vs
+1.4% when it does not). The one exception, `score_price`, shows +4.7 points — on
+**42 observations**, and it is a momentum term, i.e. buying what already moved.
+
+Two caveats that bound this, stated so it is not over-read:
+
+* It tests the **candle-derivable** components only — `vol_5m_1h`, `vol_1h_6h`,
+  `vol_6h_24h`, `score_price` ≈ 35 of the 100 points. Buy pressure (20), holders
+  (20), security (10) and CEX (5) cannot be reconstructed from candles. They
+  measure the same "recent accumulation" character, so the untested blocks are
+  not obviously better, but they are untested here.
+* The pool universe is GeckoTerminal trending/top-volume, i.e. already selected.
+  The per-pool sign test is robust to that for *within-pool* comparison; the
+  headline AUC is not a claim about all pools.
+
+**Why it fails structurally**, independent of the numbers: every volume component
+is a *ratio of a short window to a longer one*, which rewards volume spread
+evenly across the period and penalises volume concentrated into one bar. A pump
+is a step function, so the model penalises precisely the shape it is looking for.
+It also looks strictly backwards: at the ignition bar of the historical case study
+the model awarded 3.0 of 35 candle-derivable points while the next hour returned
++1,202%. On top of that the holder block (up to 20 points) rewards concentration
+that a genuinely distributed runner does not have.
+
+**What is actually sound in the pipeline** — worth keeping separate from the
+score, because it is a different mechanism:
+
+* the hard safety gates (honeypot, tax, `cannot_sell_all`, `hidden_owner`,
+  risky-flag rejects, unique-buyer and wash-trade gates) — binary and real;
+* attribution: the `score_*` columns sum to `hand_score`, pinned by a test, so the
+  model is auditable rather than a black box;
+* the early lane's AND-gated design, which cannot be gamed by one strong metric
+  the way an additive score can;
+* `SCORE_NORMALIZE`, which fixed a genuine "no alerts at all" bug.
+
+The honest conclusion is that the score should be a **feature, not the gate**.
+Ranking is the part that needs fitting on labelled outcomes
+(`diag/fit_thresholds.py`), and that currently refuses because the `features`
+table is empty. Until then, treat the score as an explanation of why a token was
+picked, not as evidence that it will move.
+
+### Notes on reachability
+
 The score is out of 100, but those 100 points are only meaningful if they are all
 *earnable* — and they are not:
 
