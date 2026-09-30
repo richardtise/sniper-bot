@@ -215,7 +215,41 @@ buttons rather than offering ones that fail.
 
 #### Is Uniswap enough for ETH/Base/Robinhood, and PancakeSwap for BSC?
 
-##### Do launchpad tokens later get an AMM pool — and how early?
+##### Will the buy button actually work on what it alerts on?
+
+**No — right now, essentially none of it.** Of the births the scanner sees, most
+are Uniswap V4, which the bot cannot route. Measured on a fresh birth sample
+(2026-09-30, `new_pools` pages 1–2, age-eligible for the early lane):
+
+| Chain | Births | Young enough | Pass floors | Early-lane alerts | Tradeable |
+|---|---|---|---|---|---|
+| Ethereum | 40 | 8 | 2 | 1 | 0 |
+| Base | 40 | 29 | 1 | 1 | 0 |
+| BSC | 40 | 40 | 4 | 0 | 0 |
+| Robinhood | 20 | 20 | 2 | 1 | 0 |
+| **Pooled** | 140 | **97** | **9** | **3** | **0 (0%)** |
+
+All three would-be alerts were Uniswap V4 pools, so all three would have arrived
+with **no route and no buy buttons** — the bot now says so explicitly rather than
+offering a button that fails at quote time.
+
+Two honest caveats. The sample is small (3 alerts), so treat 0% as "very few"
+rather than a precise rate; the broader coverage measurement above agrees in
+direction (20.6% of all births routable, V4 dominating the young cohort). And
+this simulates the **early lane only** — the momentum lane needs live
+holder/security/score lookups that cannot be reproduced offline.
+
+The practical upshot: the corrected joint floors did open the lane (3 alerts where
+the independent-p90 version produced 0), but **Uniswap V4 is now the gate on
+actually trading any of it**.
+
+Reproduce:
+
+```bash
+bot-env/bin/python diag/alert_tradeability.py --pages 6
+```
+
+#### Do launchpad tokens later get an AMM pool — and how early?
 
 Sometimes, and it is chain-dependent — this is the one place the "Uniswap will
 pick it up soon" intuition holds. Measured with `diag/launchpad_migration.py`
@@ -318,6 +352,7 @@ Reproduce any row:
 
 ```bash
 bot-env/bin/python diag/dex_coverage.py --pages 6 --pause 2.8
+bot-env/bin/python diag/alert_tradeability.py --pages 6
 ```
 
 ## Detection latency — "why do I only get pinged after the pump?"
@@ -528,28 +563,50 @@ To get there: `LOG_FEATURES=true`, let the bot run, then
 `python label_outcomes.py --fetch-current` and re-run the fitter. Until then treat
 the shipped floors as a declared policy with stated uncertainty, not calibration.
 
-#### Per-chain early floors
+#### Per-chain early floors, and the AND-trap
 
-The lane now runs on every chain (`new_pools` is global), so the floors are
-per-chain wherever a chain's own cohort is big enough to support one. Measured
-2026-09-30, `new_pools` page 1–2, p90:
+The lane runs on every chain (`new_pools` is global), so floors are per-chain
+wherever a chain's own cohort supports one. Crucially, they are derived against
+the **joint** pass rate, not per metric.
 
-| Chain | n | liq p90 | vol/liq p90 | txns p90 | buy ratio p90 | buyers p90 | Override set? |
-|---|---|---|---|---|---|---|---|
-| Robinhood | 40 | $5,402 | 0.112 | 20.3 | 0.574 | 12.2 | no — these **are** the globals |
-| BSC | 40 | $14,600 | 0.260 | 23 | 0.564 | 11 | **yes** |
-| Base | 15 | $204,100 | 0.502 | 44 | 0.908 | 14 | **no** — 95% CI $14.5k–$544k |
-| Ethereum | 2 | — | — | — | — | — | **no** — not a sample |
+**The trap:** these gates are ANDed, so setting each metric at its own p90 does
+*not* select the top decile. Measured on the Robinhood birth cohort, five
+independent p90 thresholds clear **0.71%** of births — and on the pooled cohort,
+none at all. The lane was effectively shut while every individual number looked
+defensible in isolation.
 
-Only BSC gets an override, because only BSC's sample justifies one. Base's n=15
-p90 carries a $14.5k–$544k interval, so quoting a $204k floor from it would be
-the two-token error with extra steps; Ethereum's n=2 is not a sample at all. Both
-fall back to the global values — correct behaviour, not a gap. Re-derive per
-chain as rows accumulate:
+**The fix:** choose one *common* quantile level such that the share of births
+clearing every gate hits a target volume.
 
 ```bash
-bot-env/bin/python diag/population_floors.py --chains bsc --sources new_pools --pages 2 --quantile 0.90
+bot-env/bin/python diag/population_floors.py \
+    --chains robinhood --sources new_pools --pages 6 --target-pass-rate 0.02
 ```
+
+Measured 2026-09-30, target 2%:
+
+| | independent p90 | joint (level 0.86) |
+|---|---|---|
+| liquidity | $5,650 | **$5,700** |
+| vol / liq | 0.202 | **0.070** |
+| txns 5m | 26 | **13** |
+| buy ratio | 0.602 | **0.561** |
+| buyers 5m | 11 | **6** |
+| **joint pass rate** | **0.71%** | **2.50%** |
+
+Per chain, same joint method (`robinhood` n=80 → level 0.86; `bsc` n=40 → level
+0.92, both 2.5% joint):
+
+| Chain | n | liq | vol/liq | txns | buy ratio | buyers | Override |
+|---|---|---|---|---|---|---|---|
+| Robinhood | 80 | $5,700 | 0.070 | 13 | 0.561 | 6 | no — these are the globals |
+| BSC | 40 | $13,600 | 0.045 | 8 | 0.74 | 5 | **yes** |
+| Base | 15 | — | — | — | — | — | **no** — p90 liq CI spans $14.5k–$544k |
+| Ethereum | 2 | — | — | — | — | — | **no** — not a sample |
+
+Base and Ethereum fall back to the globals: correct behaviour, not a gap. Quoting
+a $204k floor from Base's n=15 interval would be the two-token error with extra
+steps.
 
 This is the mechanism that answers "early on every chain, but no BSC spam"
 without switching the early feed off: an objective, per-chain-derived floor
@@ -615,6 +672,7 @@ against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
 | `diag/compare_decisions.py` | **Decision-neutrality check.** Runs 13 fixture cases through two revisions of `bot.py` and exits non-zero if any reject reason or alert decision changed — use it before shipping a refactor of `evaluate_token`. |
 | `diag/population_floors.py` | **Where the default floors come from.** Samples the cohort a lane actually receives and reports per-metric p50/p75/p90 with bootstrap CIs, then emits `.env`-ready floors at a declared quantile. Outcome-blind: it never reads price or performance, which is what keeps it free of survivorship bias. Change the policy with `--quantile`, never by picking tokens. |
 | `diag/dex_coverage.py` | **Where pools are born vs what the bot can trade.** Samples `new_pools` across chains and pages, reports each venue's share, and scores coverage under a declared router inventory (configured / +V4 / a hypothetical). Prints per-chain page depth and flags under-sampled chains so an incomplete fetch cannot masquerade as a chain-level difference. |
+| `diag/alert_tradeability.py` | **Of what would alert, what can be bought?** Replays the shipped floors and the real `signals.early_runner_reasons` gates over a birth cohort, then splits survivors by `bot.dex_is_supported`, reporting the missing integration behind each no-route alert. Excludes tokens older than the lane's age cap instead of counting them as failures. |
 | `diag/launchpad_migration.py` | **Do launchpad tokens reach an AMM, and when?** Reads a launchpad's pool listing, samples tokens evenly across age buckets, then measures each token's migration to an AMM and the lag from its birth pool. Age-stratified so a minutes-old token cannot be scored as a migration failure. |
 | `diag/fit_thresholds.py` | **Outcome-fitted thresholds, or a refusal.** Fits on realised forward returns with a time split *and* a token-grouped split, reports the base rate beside every precision, and **refuses to emit anything** below 30 positives across 30 tokens. Run against an empty `features` table it refuses — the honest answer until labelled data exists. |
 

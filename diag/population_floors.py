@@ -245,6 +245,55 @@ def summarise(rows: Sequence[Dict[str, float]], *, quantile_map: Dict[str, float
     return summary
 
 
+
+# Metrics the early lane ANDs together. Setting each at its own p90 does NOT
+# select the top decile: measured on the Robinhood cohort, five independent p90
+# thresholds pass 0.71% of births, because a token must clear all five at once.
+# So the quantile level has to be chosen against the JOINT pass rate.
+JOINT_METRICS = ("liquidity_usd", "vol_liq_ratio", "txns_5m",
+                 "buy_ratio_5m", "buyers_5m")
+
+
+def joint_pass_rate(rows: Sequence[Dict[str, float]], metrics: Sequence[str],
+                    thresholds: Dict[str, float]) -> float:
+    """Share of rows clearing every threshold simultaneously (AND, as the lane uses)."""
+    if not rows:
+        return 0.0
+    passed = 0
+    for row in rows:
+        if all(row.get(m) is not None and row[m] >= thresholds[m] for m in metrics):
+            passed += 1
+    return passed / len(rows)
+
+
+def pick_common_quantile(
+    rows: Sequence[Dict[str, float]],
+    metrics: Sequence[str] = JOINT_METRICS,
+    target: float = 0.05,
+    grid: Optional[Sequence[float]] = None,
+) -> Optional[Tuple[float, Dict[str, float], float]]:
+    """Most selective common quantile level that still meets a target alert volume.
+
+    Returns ``(level, thresholds, achieved_rate)``. A single level is used for
+    every metric so the result stays reproducible and explainable ("keep the most
+    active X% of births"), and the level is chosen so the *joint* rate hits the
+    target rather than each metric hitting it alone.
+    """
+    grid = list(grid) if grid is not None else [i / 100 for i in range(5, 100)]
+    best: Optional[Tuple[float, Dict[str, float], float]] = None
+    for level in sorted(grid):
+        thresholds = {
+            m: quantile([r[m] for r in rows if r.get(m) is not None], level)
+            for m in metrics
+        }
+        if any(v is None for v in thresholds.values()):
+            continue
+        rate = joint_pass_rate(rows, metrics, thresholds)
+        if rate >= target:
+            best = (level, thresholds, rate)
+    return best
+
+
 def format_env_block(summary: Dict[str, dict], *, chain: str, n: int, date: str, command: str) -> str:
     """Render the floors as .env lines with provenance and no token references."""
     lines = [
@@ -362,6 +411,11 @@ def main() -> int:
                         help="cohort definition: pools at most this old")
     parser.add_argument("--cache-dir", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), ".cache"))
+    parser.add_argument("--target-pass-rate", type=float, default=None,
+                        help="choose ONE common quantile level so the JOINT AND-pass "
+                             "rate hits this share of births (e.g. 0.02). Without it, "
+                             "each metric is set at --quantile independently, which "
+                             "ANDs to a far smaller joint rate than the level suggests.")
     parser.add_argument("--json", default=None, help="also write the summary as JSON")
     args = parser.parse_args()
 
@@ -420,6 +474,30 @@ def main() -> int:
             print(f"{metric:16s} {info['n']:>5d} {info['p50']:>12.4g} "
                   f"{info['p75']:>12.4g} {info['p90']:>12.4g} {info['value']:>12.4g}  {ci}{mark}")
         print("  (* censored: bounded by feed depth, not a pool property — not derived)")
+
+    if args.target_pass_rate is not None:
+        print("\n" + "=" * 72)
+        print(f"JOINT derivation for target pass rate {args.target_pass_rate:.1%}")
+        print("=" * 72)
+        payload["joint"] = {}
+        for name, rows in groups.items():
+            label = "POOLED" if name == "__all__" else name
+            picked = pick_common_quantile(rows, target=args.target_pass_rate)
+            if not picked:
+                print(f"  {label}: no common quantile reaches that volume (n={len(rows)})")
+                continue
+            level, thresholds, rate = picked
+            naive = {m: quantile([r[m] for r in rows if r.get(m) is not None], args.quantile)
+                     for m in JOINT_METRICS}
+            naive_rate = joint_pass_rate(rows, JOINT_METRICS, naive)
+            payload["joint"][name] = {"level": level, "thresholds": thresholds,
+                                      "achieved": rate, "naive_joint": naive_rate}
+            print(f"\n  {label}  n={len(rows)}")
+            print(f"    common level {level:.2f} -> JOINT {rate:.2%} of births pass ALL gates")
+            print(f"    (setting each metric at p{args.quantile * 100:.0f} independently "
+                  f"would pass {naive_rate:.2%} — the error this corrects)")
+            for m in JOINT_METRICS:
+                print(f"      {METRIC_ENV_KEYS[m]:32s} {thresholds[m]:.4g}")
 
     print("\n" + "=" * 72)
     print("Suggested .env blocks, one per cohort — copy the one matching the feeds")

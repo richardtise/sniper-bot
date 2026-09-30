@@ -480,3 +480,73 @@ class TestLaunchpadMigration(unittest.TestCase):
         self.assertEqual(out["rate"], 0.5)
         self.assertEqual(out["buckets"]["<1h"]["n"], 2)
         self.assertAlmostEqual(out["lag_median"], 4.0)
+
+
+class TestJointFloorDerivation(unittest.TestCase):
+    """ANDed gates: per-metric quantiles do not compose.
+
+    The bug this pins: each early-lane floor was set at its own p90, and the docs
+    called the result "the most active decile". Measured on the Robinhood birth
+    cohort, five independent p90 gates clear 0.71% of births, not 10% — and on
+    the pooled cohort, none. The lane was shut while every individual number
+    looked defensible.
+    """
+
+    def setUp(self):
+        from diag import population_floors as pf
+        self.pf = pf
+        # 100 rows where the metrics are independent-ish: row i clears metric m
+        # only if i is in the top decile for that metric.
+        self.rows = []
+        for i in range(100):
+            self.rows.append({
+                "liquidity_usd": float(i),
+                "vol_liq_ratio": float((i * 7) % 100),
+                "txns_5m": float((i * 13) % 100),
+                "buy_ratio_5m": float((i * 29) % 100),
+                "buyers_5m": float((i * 37) % 100),
+            })
+
+    def test_joint_rate_is_far_below_the_per_metric_rate(self):
+        thresholds = {m: self.pf.quantile([r[m] for r in self.rows], 0.9)
+                      for m in self.pf.JOINT_METRICS}
+        rate = self.pf.joint_pass_rate(self.rows, self.pf.JOINT_METRICS, thresholds)
+        self.assertLess(rate, 0.10, "ANDing five p90 gates cannot keep a decile")
+        self.assertGreaterEqual(rate, 0.0)
+
+    def test_joint_rate_is_one_when_every_threshold_is_minimal(self):
+        thresholds = {m: 0.0 for m in self.pf.JOINT_METRICS}
+        self.assertEqual(
+            self.pf.joint_pass_rate(self.rows, self.pf.JOINT_METRICS, thresholds), 1.0)
+
+    def test_joint_rate_is_zero_when_a_threshold_is_unreachable(self):
+        thresholds = {m: 0.0 for m in self.pf.JOINT_METRICS}
+        thresholds["txns_5m"] = 1e9
+        self.assertEqual(
+            self.pf.joint_pass_rate(self.rows, self.pf.JOINT_METRICS, thresholds), 0.0)
+
+    def test_missing_metric_values_never_pass(self):
+        rows = [{"liquidity_usd": None, "vol_liq_ratio": 5.0, "txns_5m": 5.0,
+                 "buy_ratio_5m": 5.0, "buyers_5m": 5.0}]
+        thresholds = {m: 1.0 for m in self.pf.JOINT_METRICS}
+        self.assertEqual(self.pf.joint_pass_rate(rows, self.pf.JOINT_METRICS, thresholds), 0.0)
+
+    def test_picker_hits_the_target_and_reports_its_level(self):
+        picked = self.pf.pick_common_quantile(self.rows, target=0.05)
+        self.assertIsNotNone(picked)
+        level, thresholds, rate = picked
+        self.assertGreaterEqual(rate, 0.05, "the chosen level must meet the target")
+        self.assertTrue(0.0 < level < 1.0)
+        # Recomputing from the returned thresholds must reproduce the rate.
+        self.assertAlmostEqual(
+            self.pf.joint_pass_rate(self.rows, self.pf.JOINT_METRICS, thresholds), rate)
+
+    def test_picker_prefers_the_most_selective_level_that_still_meets_target(self):
+        """Otherwise the lane is needlessly loud."""
+        loose = self.pf.pick_common_quantile(self.rows, target=0.20)
+        tight = self.pf.pick_common_quantile(self.rows, target=0.05)
+        self.assertGreater(loose[0], 0.0)
+        self.assertGreaterEqual(tight[0], loose[0] - 0.05)
+
+    def test_picker_returns_none_when_the_target_is_unreachable(self):
+        self.assertIsNone(self.pf.pick_common_quantile(self.rows, target=0.99))

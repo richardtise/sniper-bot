@@ -238,27 +238,26 @@ class Filters:
     # are empty. This lane lets a genuinely strong *young* pool alert, but only
     # if every condition below holds (AND, not a sum — a rug cannot compensate).
     #
-    # These defaults are p90 quantiles of the Robinhood new_pools cohort, which
-    # is the population this lane actually receives (new_pools is the only feed
-    # that delivers young pools, and it is enabled on Robinhood alone). Derive
-    # them for your own config rather than editing by hand:
+    # Derivation, and the trap it avoids: these gates are ANDed, so setting each
+    # metric at its own p90 does NOT select the top decile. Measured on the
+    # Robinhood birth cohort, five independent p90 thresholds pass 0.71% of
+    # births — and the pooled cohort passed none at all. One COMMON quantile
+    # level is therefore chosen so the JOINT pass rate hits a target (2% of
+    # births), which is what these values are:
     #
     #   bot-env/bin/python diag/population_floors.py \
-    #       --chains robinhood --sources new_pools --pages 2 --quantile 0.90
+    #       --chains robinhood --sources new_pools --pages 6 --target-pass-rate 0.02
     #
-    # Measured 2026-09-30, n=40. The population is mostly dead (median txns,
-    # buyers and vol/liq are all zero), so the quantile is a policy about alert
-    # volume, not a discovered fact, and the 95% CIs are wide (txns 2.9-39).
-    # Nothing here is fitted to a particular token's outcome; the previous values
-    # came from two known runners, which is a selection error rather than a
-    # small sample. See diag/fit_thresholds.py for the outcome-based route,
-    # which refuses to fit until enough labelled rows exist.
+    # Measured 2026-09-30, n=80: level 0.86 -> 2.50% of births clear every gate.
+    # The same run with independent p90s gives 0.71%, i.e. roughly 4x too strict.
+    # Nothing here is fitted to a token outcome; see diag/fit_thresholds.py for
+    # that route, which refuses until enough labelled rows exist.
     early_max_age_minutes: float = 30.0
-    early_min_liquidity_usd: float = 5_400.0
-    early_min_vol_liq_ratio: float = 0.112
-    early_min_txns_5m: int = 21
-    early_min_buy_ratio: float = 0.574
-    early_min_unique_buyers: int = 13
+    early_min_liquidity_usd: float = 5_700.0
+    early_min_vol_liq_ratio: float = 0.070
+    early_min_txns_5m: int = 13
+    early_min_buy_ratio: float = 0.561
+    early_min_unique_buyers: int = 6
     early_max_chg_5m: float = 150.0          # already vertical = late
     early_require_unique_buyers: bool = True
 
