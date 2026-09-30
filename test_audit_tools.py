@@ -389,3 +389,94 @@ class TestDexCoverage(unittest.TestCase):
         rep = self.dc.coverage_report({"base": collections.Counter()},
                                       self.dc.INVENTORY_CONFIGURED)
         self.assertEqual(rep["base"]["share"], 0.0)
+
+
+class TestLaunchpadMigration(unittest.TestCase):
+    """Do launchpad-born tokens later get an AMM pool, and how soon?
+
+    Measured 2026-09-30 with diag/launchpad_migration.py, age-stratified so
+    right-censoring does not distort it:
+      robinhood pons-v2  n=17  76% migrated, median lag  4 min -> uniswap-v4-robinhood
+      bsc       four-meme n=21   5% migrated, one case at  ~37 h
+      base      bankr     n=18  22% migrated, median lag 54 min
+    Samples are small; these tests pin the measurement mechanics, not the rates.
+    """
+
+    def setUp(self):
+        from diag import launchpad_migration as lm
+        self.lm = lm
+
+    def _pool(self, dex, when):
+        return {"attributes": {"pool_created_at": when},
+                "relationships": {"dex": {"data": {"id": dex}}}}
+
+    def test_classify_separates_amm_from_launchpad(self):
+        self.assertEqual(self.lm.classify("uniswap-v4-robinhood"), "amm")
+        self.assertEqual(self.lm.classify("pancakeswap_v2"), "amm")
+        self.assertEqual(self.lm.classify("pons-v2"), "launchpad")
+        self.assertEqual(self.lm.classify("four-meme"), "launchpad")
+        self.assertEqual(self.lm.classify("something-new"), "other")
+
+    def test_amm_patterns_do_not_claim_launchpads(self):
+        """bankr is V4-based boilerplate but is a launchpad venue, not an AMM."""
+        self.assertEqual(self.lm.classify("bankr"), "launchpad")
+
+    def test_birth_pool_is_the_earliest_and_lag_is_measured_from_it(self):
+        pools = [self._pool("uniswap-v4-robinhood", "2026-09-30T10:04:00Z"),
+                 self._pool("pons-v2", "2026-09-30T10:00:00Z")]
+        rec = self.lm.birth_and_first_amm(pools)
+        self.assertEqual(rec["birth_dex"], "pons-v2")
+        self.assertTrue(rec["migrated"])
+        self.assertEqual(rec["amm_dex"], "uniswap-v4-robinhood")
+        self.assertAlmostEqual(rec["lag_minutes"], 4.0)
+
+    def test_no_amm_pool_means_not_migrated_not_zero_lag(self):
+        pools = [self._pool("four-meme", "2026-09-30T10:00:00Z")]
+        rec = self.lm.birth_and_first_amm(pools)
+        self.assertFalse(rec["migrated"])
+        self.assertIsNone(rec["lag_minutes"])
+
+    def test_a_poolborn_token_is_not_reported_as_migrated(self):
+        """An AMM-born token has no migration to measure."""
+        pools = [self._pool("pancakeswap_v2", "2026-09-30T10:00:00Z")]
+        rec = self.lm.birth_and_first_amm(pools)
+        self.assertEqual(rec["birth_kind"], "amm")
+
+    def test_missing_timestamps_do_not_crash(self):
+        self.assertIsNone(self.lm.birth_and_first_amm([{"attributes": {},
+                                                        "relationships": {}}]))
+        self.assertIsNone(self.lm.birth_and_first_amm([]))
+
+    def test_bucket_boundaries(self):
+        self.assertEqual(self.lm.bucket_for(30), "<1h")
+        self.assertEqual(self.lm.bucket_for(60), "1-6h")
+        self.assertEqual(self.lm.bucket_for(360), "6-24h")
+        self.assertEqual(self.lm.bucket_for(1440), "1-7d")
+        self.assertEqual(self.lm.bucket_for(20000), ">7d")
+
+    def test_stratify_represents_every_age_bucket(self):
+        """Otherwise a recent-heavy listing answers only the short-lag question."""
+        now = 1_800_000_000.0
+        pairs = []
+        for i in range(40):                       # many recent
+            pairs.append((f"0xnew{i}", now - 60))
+        for i in range(3):                        # few old
+            pairs.append((f"0xold{i}", now - 900_000))
+        picked = self.lm.stratify_by_age(pairs, now, per_bucket=3)
+        self.assertIn("0xold0", picked)
+        self.assertEqual(len([p for p in picked if p.startswith("0xnew")]), 3)
+
+    def test_summarise_is_censoring_aware(self):
+        """A young token must not be counted as a migration failure."""
+        now = 1_800_000_000.0
+        recs = [
+            {"birth_dex": "pons-v2", "birth_ts": now - 600, "migrated": True,
+             "lag_minutes": 4.0},
+            {"birth_dex": "pons-v2", "birth_ts": now - 600, "migrated": False,
+             "lag_minutes": None},
+        ]
+        out = self.lm.summarise(recs, now)["pons-v2"]
+        self.assertEqual(out["n"], 2)
+        self.assertEqual(out["rate"], 0.5)
+        self.assertEqual(out["buckets"]["<1h"]["n"], 2)
+        self.assertAlmostEqual(out["lag_median"], 4.0)

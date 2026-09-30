@@ -215,6 +215,53 @@ buttons rather than offering ones that fail.
 
 #### Is Uniswap enough for ETH/Base/Robinhood, and PancakeSwap for BSC?
 
+##### Do launchpad tokens later get an AMM pool — and how early?
+
+Sometimes, and it is chain-dependent — this is the one place the "Uniswap will
+pick it up soon" intuition holds. Measured with `diag/launchpad_migration.py`
+2026-09-30, age-stratified so right-censoring cannot flatter the result:
+
+| Chain | Birth venue | n | Migrated to an AMM | Median lag after birth pool | Destination |
+|---|---|---|---|---|---|
+| Robinhood | `pons-v2` | 17 | **76%** | **4 min** (p25 2m, p75 12m) | `uniswap-v4-robinhood` (13/13 cases) |
+| BSC | `four-meme` | 21 | **5%** | ~37 h (single case) | — |
+| Base | `bankr` | 18 | 22% | 54 min (p25 16m, p75 123m) | — |
+
+By age bucket — the share of tokens *of that age* that have an AMM pool:
+
+| Venue | <1h | 1–6h | 6–24h | 1–7d | >7d |
+|---|---|---|---|---|---|
+| `pons-v2` (RH) | 100% | 60% | 80% | 80% | — |
+| `four-meme` (BSC) | 0% | 0% | 0% | 20% | 0% |
+| `bankr` (Base) | 0% | 0% | 0% | 25% | 75% |
+
+What this means for the strategy:
+
+* **Robinhood: waiting for the AMM is genuinely viable.** Pons tokens migrate to
+  `uniswap-v4-robinhood` with a median lag of **4 minutes**, so implementing
+  Uniswap V4 on Robinhood covers ~76% of pons births after a ~4-minute delay —
+  close to the value of integrating Pons directly. 24% never migrate, so it is
+  not a full substitute.
+* **BSC: no.** `four-meme` tokens essentially do not migrate (1/21), and the one
+  that did took ~37 hours. Waiting for PancakeSwap is not a strategy there;
+  `four-meme` has to be integrated, or those tokens skipped.
+* **Base: not early enough to help.** `bankr` migrates 22%, median ~54 minutes,
+  and **0% within 24 hours** in this sample (migration concentrates in tokens now
+  older than a week). A 54-minute-plus delay is past the entry the bot exists for.
+
+Caveats, stated because these samples are small: n=17–21 per venue, so treat the
+rates as indicative and the *lags* as the more robust part (the pons result is
+tight and single-destination, which is why it is the most trustworthy). Tokens
+that died early and were never indexed are absent, and a pool GT does not index
+is invisible here.
+
+Reproduce:
+
+```bash
+bot-env/bin/python diag/launchpad_migration.py --chain robinhood --dex-pools pons-v2 --per-bucket 5
+bot-env/bin/python diag/launchpad_migration.py --chain bsc --dex-pools four-meme --per-bucket 5
+```
+
 No — that holds on Ethereum, roughly on Base, and fails on BSC and Robinhood.
 Measured with `diag/dex_coverage.py` over **480 births, 120 per chain, 6 pages
 each, zero failed pages** (2026-09-30). Coverage of `new_pools`, i.e. "can the
@@ -568,6 +615,7 @@ against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
 | `diag/compare_decisions.py` | **Decision-neutrality check.** Runs 13 fixture cases through two revisions of `bot.py` and exits non-zero if any reject reason or alert decision changed — use it before shipping a refactor of `evaluate_token`. |
 | `diag/population_floors.py` | **Where the default floors come from.** Samples the cohort a lane actually receives and reports per-metric p50/p75/p90 with bootstrap CIs, then emits `.env`-ready floors at a declared quantile. Outcome-blind: it never reads price or performance, which is what keeps it free of survivorship bias. Change the policy with `--quantile`, never by picking tokens. |
 | `diag/dex_coverage.py` | **Where pools are born vs what the bot can trade.** Samples `new_pools` across chains and pages, reports each venue's share, and scores coverage under a declared router inventory (configured / +V4 / a hypothetical). Prints per-chain page depth and flags under-sampled chains so an incomplete fetch cannot masquerade as a chain-level difference. |
+| `diag/launchpad_migration.py` | **Do launchpad tokens reach an AMM, and when?** Reads a launchpad's pool listing, samples tokens evenly across age buckets, then measures each token's migration to an AMM and the lag from its birth pool. Age-stratified so a minutes-old token cannot be scored as a migration failure. |
 | `diag/fit_thresholds.py` | **Outcome-fitted thresholds, or a refusal.** Fits on realised forward returns with a time split *and* a token-grouped split, reports the base rate beside every precision, and **refuses to emit anything** below 30 positives across 30 tokens. Run against an empty `features` table it refuses — the honest answer until labelled data exists. |
 
 ```bash
