@@ -65,9 +65,9 @@ omitted key means the code default — currently the conservative/off side.
 | `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
 | `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (= disabled) | `200000` | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. Code default leaves behaviour unchanged until you set it. |
 | `NEAR_MISS_POINTS` | `15` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
-| `WATCHLIST_ENABLED` | `false` | `true` | Re-price pools that dropped out of the feeds (born quiet, runs days later — the CATTO shape). DexScreener lookups, no GT budget cost. Code default is `false`. |
+| `WATCHLIST_ENABLED` | `false` | `true` | Re-price pools that dropped out of the feeds: born quiet, runs later (the shape it targets — remember what was seen, re-price on a TTL, forget after expiry). DexScreener lookups, no GT budget cost. Code default is `false`. |
 | `USE_SIGNALS` | `false` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
-| `SIGNAL_BONUS_WEIGHT` | `0.0` | `0.5` | Weight on the signal bonus. Code default `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `.env.example` `0.5` is the starting compromise — WALLET at ignition (hand ~45, signal +26/−8, bar 48.6) dies at `0.0` (37) and alerts at `1.0` (63); a clean distributed runner cannot clear the bar on hand score alone, so `0.0` misses exactly the legitimate runners this bot exists to catch. Raising it re-opens the pass-2 flood vector — see [Catching re-ignited pools](#catching-re-ignited-pools). |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | `0.5` | Weight on the signal bonus. Code default `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `.env.example` uses `0.5`. The structural reason it is non-zero: a clean distributed runner earns 0 holder and 0 CEX points on Robinhood, so its hand score cannot reach a bar scaled for a concentrated one. **This value is not outcome-fitted** — treat it as a declared policy and re-fit with `diag/fit_thresholds.py` once labelled data exists. Raising it re-opens the pass-2 flood vector — see [Catching re-ignited pools](#catching-re-ignited-pools). |
 | `EARLY_RUNNER_MODE` | `false` | `true` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. Code default is `false`; without it a sub-50k pool structurally cannot alert. |
 | `SIG_MAX_AGE_MINUTES` | `0` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
@@ -210,7 +210,7 @@ Two structural guarantees now protect latency:
 floor can reject it:
 
 ```
-FIRST SIGHT PSF@robinhood age=2.0m mcap=$12,256 liq=$13,919 v5=$3,551 [geckoterminal:new_pools]
+FIRST SIGHT SYMBOL@robinhood age=2.0m mcap=$12,256 liq=$13,919 v5=$3,551 [geckoterminal:new_pools]
 ```
 
 That line is the answer to "was I early?": `age` is how long the pool had existed
@@ -301,25 +301,63 @@ what flooded Base with noise in pass 2.
 
 ### Where these numbers come from
 
-Thresholds in this repo are of two kinds, and the docs label them so you can tell
-which is which:
+Two different things are at work in this repo, and they are not interchangeable.
 
-* **Measured distributions** — feed ages/mcaps (`n=20` per chain/feed), the
-  ~30 calls/min GeckoTerminal budget, holder bands, the venue split above, and
-  `diag/component_audit.py`'s rank correlations over 5,148 bars. These generalise
-  within their sample.
-* **Single-case calibration** — the bar/floor/bonus values replayed against one
-  pool that ran (and one that was missed). These are *falsification cases*: they
-  prove a setting admits a known runner without admitting a known rug. They do
-  not estimate a probability, and they are marked as illustrative wherever they
-  appear.
+**Population-derived thresholds (the defaults).** The early-lane floors are
+quantiles of the population the lane actually receives, produced by
+`diag/population_floors.py`. That is objective in the sense that matters:
+reproducible, outcome-blind, and a property of the cohort rather than of any
+named token. Nothing in the derivation reads price or subsequent performance,
+which is what keeps it free of survivorship bias.
 
-Neither is a fitted model. `n=20` on one day is a small sample, and a case study
-is one observation. The intended path is to re-derive the knobs from your own
-labelled data: `LOG_FEATURES=true` → `label_outcomes.py --export training.csv`,
-then split **by token, not by row**, and compare precision/recall against the
-hand score **at the same alert volume**. Until then, treat the shipped numbers as
-defensible starting points rather than calibration.
+The lane only ever fires on young pools, and young pools only arrive from
+`new_pools`, which the shipped config enables on Robinhood alone — so the
+relevant cohort is Robinhood `new_pools`, not a cross-chain pool:
+
+```bash
+bot-env/bin/python diag/population_floors.py \
+    --chains robinhood --sources new_pools --pages 2 --quantile 0.90
+```
+
+Measured 2026-09-30, **n=40** births, floor at p90 ("keep the most active decile"):
+
+| Metric | p50 | p75 | p90 | Floor @ p90 | 95% CI |
+|---|---|---|---|---|---|
+| Liquidity | $4,477 | $4,806 | $5,402 | **$5,400** | $4.9k – $7.2k |
+| vol / liq | 0 | 0.0011 | 0.112 | **0.112** | 0.003 – 0.276 |
+| txns 5m | 0 | 2.25 | 20.3 | **21** | 2.9 – 39 |
+| buy ratio | 0 | 0.042 | 0.574 | **0.574** | 0.05 – 0.77 |
+| unique buyers | 0 | 0.25 | 12.2 | **13** | 1 – 16 |
+
+Three findings worth stating plainly:
+
+1. **The population is mostly dead.** Median txns, buyers and vol/liq are all
+   zero. Any floor above ~p75 is selecting a small tail, so *the quantile choice
+   is the alert-volume policy* — not a fact to be discovered.
+2. **The intervals are wide** (txns 2.9–39, buyers 1–16). n=40 cannot pin these
+   tightly. The values this replaced were derived from **n=2**, which cannot pin
+   them at all.
+3. **The old floors were not what their own comment claimed.** They were
+   described as the "upper quartile"; measured against this population, txns 20
+   was p90, buyers 15 was *above* p90 (p90 = 12.2), and liquidity 10,000 sat
+   beyond the sample maximum of $10,090 — roughly p99. A liquidity floor above
+   almost every pool that exists is a sufficient explanation for early entries
+   never firing, and it is exactly the error that picking tokens produces.
+
+**Outcome-fitted thresholds (none exist yet).** A quantile says "this is a strong
+pool for its cohort". It does not say the pool goes up — `diag/component_audit.py`
+measured the underlying components at AUC ≈ 0.59 for a ≥10% move and ≈ 0.24 for
+≥100%, i.e. near-useless for the tail this bot is hunting. Thresholds that claim
+predictive power must be fitted on realised forward returns, and
+`diag/fit_thresholds.py` does that with a hard gate: it **refuses to emit any
+recommendation** below 30 positive outcomes across 30 distinct tokens, splits by
+time *and* by token, and reports the base rate next to every precision figure.
+Run today it refuses, because the `features` table is empty — which is the honest
+state of affairs, not a missing feature.
+
+To get there: `LOG_FEATURES=true`, let the bot run, then
+`python label_outcomes.py --fetch-current` and re-run the fitter. Until then treat
+the shipped floors as a declared policy with stated uncertainty, not calibration.
 
 
 
@@ -355,8 +393,15 @@ redeploys.
 ## Tests
 
 ```bash
-python -m unittest -v test_signals test_discovery test_features
+python -m unittest -v          # 183 tests, no network
 ```
+
+The suite includes the objectivity guards that matter for the floors:
+`test_audit_tools.TestPopulationFloors` asserts the cohort selection reads no
+outcome field and names no token, that the censored age metric is excluded from
+the derived floors, and that provenance (chain, n, command) is always emitted;
+`TestThresholdFitting` asserts the fitter's small-sample gate refuses a two-token
+sample and that the grouped split never puts one token on both sides.
 
 ## Research tooling (`diag/`)
 
@@ -372,13 +417,22 @@ against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
 | `diag/log_boar_row.py` | The exact `features` row the bot would write for any token, no scan required. |
 | `diag/repro_boar.py` | Reproduces the hard-reject decision for the boar fixtures. |
 | `diag/compare_decisions.py` | **Decision-neutrality check.** Runs 13 fixture cases through two revisions of `bot.py` and exits non-zero if any reject reason or alert decision changed — use it before shipping a refactor of `evaluate_token`. |
+| `diag/population_floors.py` | **Where the default floors come from.** Samples the cohort a lane actually receives and reports per-metric p50/p75/p90 with bootstrap CIs, then emits `.env`-ready floors at a declared quantile. Outcome-blind: it never reads price or performance, which is what keeps it free of survivorship bias. Change the policy with `--quantile`, never by picking tokens. |
+| `diag/fit_thresholds.py` | **Outcome-fitted thresholds, or a refusal.** Fits on realised forward returns with a time split *and* a token-grouped split, reports the base rate beside every precision, and **refuses to emit anything** below 30 positives across 30 tokens. Run against an empty `features` table it refuses — the honest answer until labelled data exists. |
 
 ```bash
 bot-env/bin/python diag/component_audit.py --pages 3 --csv diag/.cache/audit.csv
 bot-env/bin/python diag/holders_from_logs.py 0xTokenAddress
 bot-env/bin/python diag/compare_decisions.py            # HEAD vs working tree
+bot-env/bin/python diag/population_floors.py --chains robinhood --quantile 0.90
+bot-env/bin/python diag/fit_thresholds.py               # refuses until data exists
 python -m unittest -v test_audit_tools
 ```
+
+The `*_boar.py` tools and `FINDINGS_BOAR_2026-09-26.md` are post-mortems for one
+incident. They are named after it because that is what they investigate; **no
+shipped threshold references any token**, and `test_audit_tools` asserts that the
+floor derivation names none and reads no outcome field.
 
 ## Training data
 

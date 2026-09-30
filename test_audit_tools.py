@@ -135,3 +135,178 @@ class TestPartialWindows(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def _now_iso():
+    """A fresh pool timestamp, so age-based cohort filtering is exercised."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+class TestPopulationFloors(unittest.TestCase):
+    """The floors must be a reproducible function of the population.
+
+    These tests exist because the previous floors were set from two tokens whose
+    outcome was already known — a selection error, not a small-sample one. What
+    is pinned here is that the derivation is outcome-blind (nothing in the
+    selection path reads price or performance) and that its uncertainty is
+    reported rather than hidden.
+    """
+
+    def setUp(self):
+        from diag import population_floors as pf
+        self.pf = pf
+
+    def test_quantile_matches_linear_interpolation(self):
+        self.assertEqual(self.pf.quantile([1, 2, 3, 4, 5], 0.0), 1)
+        self.assertEqual(self.pf.quantile([1, 2, 3, 4, 5], 1.0), 5)
+        self.assertEqual(self.pf.quantile([1, 2, 3, 4, 5], 0.5), 3)
+
+    def test_quantile_is_defined_for_tiny_samples(self):
+        """statistics.quantiles needs n>=2 and drops the extremes; a floor does not."""
+        self.assertEqual(self.pf.quantile([7.0], 0.9), 7.0)
+        self.assertIsNone(self.pf.quantile([], 0.5))
+
+    def test_bootstrap_ci_brackets_the_point_estimate(self):
+        values = [float(i) for i in range(1, 51)]
+        lo, hi = self.pf.bootstrap_quantile_ci(values, 0.75, iterations=200)
+        point = self.pf.quantile(values, 0.75)
+        self.assertLessEqual(lo, point)
+        self.assertGreaterEqual(hi, point)
+
+    def test_bootstrap_ci_needs_enough_points(self):
+        self.assertEqual(self.pf.bootstrap_quantile_ci([1.0, 2.0], 0.5), (None, None))
+
+    def test_majors_are_excluded_because_the_scanner_excludes_them(self):
+        pools = [
+            {"attributes": {"address": "0xa", "name": "WETH / USDC",
+                            "reserve_in_usd": "5000000", "pool_created_at": _now_iso(),
+                            "volume_usd": {"m5": "100"}, "transactions": {"m5": {"buys": 5, "sells": 1}}}},
+            {"attributes": {"address": "0xb", "name": "NEW / WETH",
+                            "reserve_in_usd": "5000", "pool_created_at": _now_iso(),
+                            "volume_usd": {"m5": "100"}, "transactions": {"m5": {"buys": 5, "sells": 1}}}},
+        ]
+        cohort = self.pf.select_cohort(pools, max_age_minutes=30.0,
+                                       chain_of={"0xa": "base", "0xb": "base"})
+        self.assertEqual([r["liquidity_usd"] for r in cohort], [5000.0])
+
+    def test_cohort_selection_reads_no_outcome_fields(self):
+        """Outcome-blindness is the property that removes survivorship bias.
+
+        Checked against the parsed code with the docstring stripped, so a comment
+        that merely *mentions* price can neither satisfy nor fail this test.
+        """
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(self.pf.select_cohort))
+        func = tree.body[0]
+        if (func.body and isinstance(func.body[0], ast.Expr)
+                and isinstance(func.body[0].value, ast.Constant)):
+            func.body = func.body[1:]          # drop the docstring
+        code = ast.unparse(func).lower()
+        # Outcome/look-ahead identifiers only. Plain words like "return" are
+        # Python keywords and would match the function's own return statement.
+        for forbidden in ("max_mult", "hit_", "chg_", "priceusd", "price_usd",
+                          "pricechange", "ath", "forward", "profit", "pnl"):
+            self.assertNotIn(forbidden, code)
+
+    def test_selection_does_not_hardcode_token_names(self):
+        import inspect
+        src = inspect.getsource(self.pf)
+        for token in ("boar", "CATTO", "PSF", "Tbook", "WALLET", "SHRUB"):
+            self.assertNotIn(token, src)
+
+    def test_age_is_flagged_censored_and_not_derived(self):
+        rows = [
+            {"age_minutes": 10.0, "liquidity_usd": 100.0, "vol_liq_ratio": 0.1,
+             "txns_5m": 5, "buy_ratio_5m": 0.5, "buyers_5m": 3},
+            {"age_minutes": 20.0, "liquidity_usd": 200.0, "vol_liq_ratio": 0.2,
+             "txns_5m": 10, "buy_ratio_5m": 0.6, "buyers_5m": 6},
+        ]
+        summary = self.pf.summarise(rows, quantile_map={"_default": 0.9})
+        self.assertTrue(summary["age_minutes"]["censored"])
+        self.assertFalse(summary["liquidity_usd"]["censored"])
+        block = self.pf.format_env_block(summary, chain="test", n=2,
+                                         date="2026-09-30", command="cmd")
+        self.assertIn("NOT derived", block)
+        self.assertNotIn("SIG_EARLY_MAX_AGE_MINUTES=", block)
+
+    def test_env_block_reports_provenance_and_sample_size(self):
+        rows = [{"liquidity_usd": float(i), "vol_liq_ratio": 0.01 * i,
+                 "txns_5m": i, "buy_ratio_5m": 0.1 * i, "buyers_5m": i}
+                for i in range(1, 21)]
+        summary = self.pf.summarise(rows, quantile_map={"_default": 0.75})
+        block = self.pf.format_env_block(summary, chain="robinhood", n=20,
+                                         date="2026-09-30", command="the-cmd")
+        self.assertIn("robinhood", block)
+        self.assertIn("the-cmd", block)
+        self.assertIn("n=20", block)
+
+    def test_pool_metrics_returns_none_without_age(self):
+        pool = {"attributes": {"address": "0xa", "reserve_in_usd": "1000"}}
+        self.assertIsNone(self.pf.pool_metrics(pool))
+
+    def test_pool_metrics_computes_ratios_safely(self):
+        pool = {"attributes": {
+            "address": "0xa", "reserve_in_usd": "0", "pool_created_at": _now_iso(),
+            "volume_usd": {"m5": "50"}, "transactions": {"m5": {"buys": 0, "sells": 0}}}}
+        m = self.pf.pool_metrics(pool)
+        self.assertEqual(m["vol_liq_ratio"], 0.0)   # no ZeroDivisionError
+        self.assertEqual(m["buy_ratio_5m"], 0.0)
+
+
+class TestThresholdFitting(unittest.TestCase):
+    """The fitter must refuse thin samples and never leak across tokens."""
+
+    def setUp(self):
+        from diag import fit_thresholds as ft
+        self.ft = ft
+
+    def test_base_rate_and_lift(self):
+        self.assertAlmostEqual(self.ft.base_rate([1, 0, 0, 0]), 0.25)
+        self.assertAlmostEqual(self.ft.lift(0.5, 0.25), 2.0)
+        self.assertIsNone(self.ft.lift(0.5, 0.0))
+
+    def test_precision_at_threshold(self):
+        alerts, precision = self.ft.precision_at_threshold([0.1, 0.5, 0.9], [0, 1, 1], 0.5)
+        self.assertEqual(alerts, 2)
+        self.assertAlmostEqual(precision, 1.0)
+
+    def test_threshold_for_alert_volume_matches_volume(self):
+        cut = self.ft.threshold_for_alert_volume([0.1, 0.4, 0.6, 0.9], 2)
+        self.assertAlmostEqual(cut, 0.6)
+
+    def test_auc_both_classes(self):
+        self.assertEqual(self.ft.roc_auc([0.0, 1.0], [0, 1]), 1.0)
+        self.assertIsNone(self.ft.roc_auc([1.0, 1.0], [1, 1]))
+
+    def test_grouped_split_never_shares_a_token(self):
+        rows = [{"chain": "base", "token_address": f"0x{i}", "ts_epoch": i} for i in range(20)]
+        train, test = self.ft.grouped_split(rows)
+        tr = {(r["chain"], r["token_address"]) for r in train}
+        te = {(r["chain"], r["token_address"]) for r in test}
+        self.assertEqual(tr & te, set(), "a token must not appear on both sides")
+
+    def test_time_split_is_ordered(self):
+        rows = [{"ts_epoch": i} for i in range(10)]
+        train, test = self.ft.time_split(rows)
+        self.assertLessEqual(max(r["ts_epoch"] for r in train),
+                             min(r["ts_epoch"] for r in test))
+
+    def test_gate_refuses_a_two_token_sample(self):
+        """The exact failure this exists to prevent."""
+        rows = [{"chain": "base", "token_address": "0xA"}, {"chain": "base", "token_address": "0xB"}]
+        reasons = self.ft.sample_gate(rows, [1, 1], min_positives=30, min_tokens=30)
+        self.assertTrue(reasons)
+        self.assertTrue(any("distinct tokens" in r for r in reasons))
+
+    def test_gate_allows_a_sufficient_sample(self):
+        rows = [{"chain": "base", "token_address": f"0x{i}"} for i in range(40)]
+        labels = [1] * 35 + [0] * 5
+        self.assertEqual(self.ft.sample_gate(rows, labels, min_positives=30, min_tokens=30), [])
+
+    def test_selection_report_states_coverage_limits(self):
+        text = " ".join(self.ft.selection_report(
+            [{"chain": "base", "token_address": "0xA"}]))
+        self.assertIn("not every pool", text)
+        self.assertIn("not", text.lower())
