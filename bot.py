@@ -153,6 +153,61 @@ ALLOW_SECURITY_FALLBACK = os.getenv("ALLOW_SECURITY_FALLBACK", "false").lower() 
 # the gate, exactly as in the original bot.
 SIGNAL_BONUS_WEIGHT = min(1.0, max(0.0, float(os.getenv("SIGNAL_BONUS_WEIGHT", "0.0"))))
 
+# ── Configuration self-audit ─────────────────────────────────────────────────
+# Nearly everything here is deliberately opt-in, so the code defaults are "off".
+# A deployment that sets only the required variables therefore runs a different
+# bot from the documented one, and the difference is invisible from outside: it
+# discovers from the lagging DexScreener boost list, has no rug/wash gates and no
+# early lane, and has no alert ceiling.
+#
+# This was not hypothetical. Alerting on $3M and $22M tokens, false positives on
+# wash-traded pools, and no early entries is exactly the output of those defaults.
+# Saying so at startup is cheaper than diagnosing it from alert screenshots later.
+def config_warnings() -> list:
+    """Settings left at a default that silently degrades this bot."""
+    warns = []
+    ceiling = float(os.getenv("MAX_MARKET_CAP_USD", "0") or 0)
+    if ceiling <= 0:
+        warns.append(
+            "MAX_MARKET_CAP_USD=0 -> NO alert ceiling. It will alert on tokens that "
+            "already ran. Set 100000 for sub-100k entries, 50000 to be stricter."
+        )
+    if not USE_SIGNALS:
+        warns.append(
+            "USE_SIGNALS=false -> rug / wash-trade / unique-buyer gates AND the "
+            "early-runner lane are ALL off (the lane needs USE_SIGNALS=true)."
+        )
+    if not USE_GECKOTERMINAL:
+        warns.append(
+            "USE_GECKOTERMINAL=false -> discovery is the DexScreener boost/profile "
+            "list only, which cannot see a pool while it is minutes old. This is the "
+            "main cause of 'it pinged me at $3M instead of $300k'."
+        )
+    if not EARLY_RUNNER_MODE:
+        warns.append(
+            "EARLY_RUNNER_MODE=false -> a young sub-50k-mcap pool can never alert."
+        )
+    if not LOG_FEATURES:
+        warns.append(
+            "LOG_FEATURES=false -> no training rows, so the score can never be "
+            "refitted against outcomes."
+        )
+    return warns
+
+
+def config_notes() -> list:
+    """Trade-offs that are configured correctly but worth stating once."""
+    notes = []
+    if not ALLOW_SECURITY_FALLBACK:
+        notes.append(
+            "ALLOW_SECURITY_FALLBACK=false -> BSC/ETH/Base pools GoPlus has not yet "
+            "indexed are dropped, which is most pools in their first minutes."
+        )
+    if PAPER_TRADING:
+        notes.append("PAPER_TRADING=true -> no real orders will be placed.")
+    return notes
+
+
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID in .env")
 
@@ -745,6 +800,7 @@ FEATURE_FIELDS = [
     # Pons/Aerodrome/...) produced buy buttons that could only fail; this is the
     # column that makes that measurable instead of anecdotal.
     "dex_id", "venue_tradeable", "venue_requirement",
+    "first_sight_mcap", "first_sight_age_minutes", "first_sight_ts",
     "signal_bonus", "signal_penalty", "signal_notes",
     # Per-component score breakdown. The total alone cannot answer "which part of
     # the model withheld the points", which is the question every miss raises.
@@ -1222,7 +1278,7 @@ def db_log_paper_trade(chain, token_address, symbol, action, amount_native, amou
 # seen at $6k on minute 3 (early, and the gate is the problem) or at $3M on hour
 # 5 (discovery is the problem). Deliberately logged *before* the floors so a
 # first sighting is recorded even when the token is instantly rejected.
-_first_sight: Dict[str, float] = {}
+_first_sight: Dict[str, dict] = {}
 FIRST_SIGHT_TTL = 6 * 3600
 
 
@@ -1230,16 +1286,22 @@ def _first_sight_note(chain, token, symbol, pair, *, liquidity, market_cap, age_
     """Log a token the first time the scanner sees it, with age and mcap."""
     key = f"{chain}:{str(token).lower()}"
     now = time.time()
-    if key in _first_sight:
-        return
-    _first_sight[key] = now
+    existing = _first_sight.get(key)
+    if existing:
+        return existing
     v5 = float((pair.get("volume") or {}).get("m5") or 0)
     src = str(pair.get("source") or "?")
+    record = {
+        "ts": now, "mcap": market_cap, "liq": liquidity,
+        "age_minutes": age_minutes, "v5": v5, "source": src,
+    }
+    _first_sight[key] = record
     age_txt = f"{age_minutes:.1f}m" if age_minutes is not None else "?"
     logger.info(
         f"FIRST SIGHT {symbol}@{chain} age={age_txt} mcap=${market_cap:,.0f} "
         f"liq=${liquidity:,.0f} v5=${v5:,.0f} [{src}]"
     )
+    return record
 
 
 def prune_caches():
@@ -1251,7 +1313,8 @@ def prune_caches():
     stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
     for k in stale:
         del holder_cache[k]
-    stale = [k for k, ts in _first_sight.items() if now - ts > FIRST_SIGHT_TTL]
+    stale = [k for k, rec in _first_sight.items()
+             if now - rec.get("ts", 0) > FIRST_SIGHT_TTL]
     for k in stale:
         del _first_sight[k]
     if PAIR_HISTORY is not None:
@@ -2316,9 +2379,14 @@ async def evaluate_token(session, pair):
 
     # Detection-latency probe: record and log the first time this token is ever
     # seen, before any floor can reject it. See _first_sight_note.
-    _first_sight_note(chain, token, symbol, pair,
-                      liquidity=liquidity, market_cap=market_cap,
-                      age_minutes=age_minutes)
+    first_sight = _first_sight_note(chain, token, symbol, pair,
+                                    liquidity=liquidity, market_cap=market_cap,
+                                    age_minutes=age_minutes)
+    feat.update({
+        "first_sight_mcap": (first_sight or {}).get("mcap"),
+        "first_sight_age_minutes": (first_sight or {}).get("age_minutes"),
+        "first_sight_ts": (first_sight or {}).get("ts"),
+    })
 
     # ── Floors (same order as before: first failure still wins the label) ────
     if liquidity < min_liq: return reject("liquidity")
@@ -2541,6 +2609,9 @@ async def evaluate_token(session, pair):
         "dex_id": dex_id,
         "venue_tradeable": venue_tradeable,
         "venue_requirement": venue_needs,
+        "first_sight_mcap": (first_sight or {}).get("mcap"),
+        "first_sight_age_minutes": (first_sight or {}).get("age_minutes"),
+        "first_sight_ts": (first_sight or {}).get("ts"),
         "dex_url": f"https://dexscreener.com/{chain}/{pair_id}",
         "price_usd": price,
         "price_native": float(pair.get("priceNative") or 0),
@@ -3833,11 +3904,27 @@ async def send_alert(alert):
     else:
         suffix = "" if venue_ok else " (tradeability unknown)"
         route_text = f"🏦 Venue: <code>{dex_display}</code>{suffix}\n\n"
+
+    # How early were we? Either discovery saw this small and the gate held it
+    # back, or discovery never saw it small — opposite fixes, and previously only
+    # distinguishable by grepping FIRST SIGHT out of the log.
+    fs_mcap = alert.get("first_sight_mcap")
+    fs_ts = alert.get("first_sight_ts")
+    first_text = ""
+    if fs_mcap:
+        mins = (time.time() - fs_ts) / 60.0 if fs_ts else None
+        mult = (alert["market_cap"] / fs_mcap) if fs_mcap else 0
+        ago = f"{mins:.0f}m ago" if mins is not None else "earlier"
+        first_text = (
+            f"👀 <b>First seen:</b> {ago} at ${fs_mcap:,.0f} mcap "
+            f"-> now ${alert['market_cap']:,.0f} ({mult:.1f}x)\n\n"
+        )
     text = (
         f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']:.0f}/100</b>\n\n"
         f"<b>{esc(alert['name'])}</b> ({esc(alert['symbol'])})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
         f"🕒 Age: <b>{age_display} min</b>\n\n"
+        f"{first_text}"
         f"{route_text}"
         f"<b>Liquidity:</b> ${alert['liquidity']:,.0f}\n"
         f"<b>Market Cap:</b> ${alert['market_cap']:,.0f}\n"
@@ -3938,8 +4025,14 @@ async def bot_task():
                 f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>\n"
                 f"Scan interval: {SCAN_INTERVAL}s\n"
                 f"Alert threshold: {ALERT_THRESHOLD}/100\n"
-                f"Feature logging: {'ON' if LOG_FEATURES else 'off'}\n\n"
-                f"<b>Paste any CA to buy instantly!</b>",
+                f"Feature logging: {'ON' if LOG_FEATURES else 'off'}\n"
+                + (
+                    "\n⚠️ <b>CONFIG WARNINGS</b>\n"
+                    + "\n".join(f"• {esc(w)}" for w in config_warnings())
+                    + "\n"
+                    if config_warnings() else ""
+                )
+                + "\n<b>Paste any CA to buy instantly!</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -4080,6 +4173,9 @@ async def health_check():
         "security_unknown_rejects": security_unknown_rejects,
         "unsupported_venue_rejects": unsupported_venue_rejects,
         "untradeable_alerts": untradeable_alerts,
+        # A deployment running code defaults is a different bot; report that
+        # rather than letting it be inferred from the alerts it produces.
+        "config_warnings": config_warnings(),
         "features": FEATURE_LOGGER.stats(),
     }
 

@@ -355,6 +355,48 @@ bot-env/bin/python diag/dex_coverage.py --pages 6 --pause 2.8
 bot-env/bin/python diag/alert_tradeability.py --pages 6
 ```
 
+## "Why did it ping me at $3M instead of $300k?"
+
+Two opposite causes, and they need opposite fixes:
+
+* **discovery never saw it small** — the feed only listed the pool after the move;
+* **the gate held it back** — it was seen small and rejected until the score caught up.
+
+Every alert now answers this directly, so it does not need a log grep:
+
+```
+🕒 Age: 52 min
+
+👀 First seen: 47m ago at $62,000 mcap -> now $3,100,000 (50.0x)
+```
+
+If `First seen` is minutes ago at a small mcap, discovery was early and the
+**gate** is the problem. If it is at a large mcap, **discovery** is the problem
+(a wrong `GT_SOURCES`, or `USE_GECKOTERMINAL` off). `_first_sight` is recorded
+before any floor can reject a token, and `first_sight_mcap` /
+`first_sight_age_minutes` / `first_sight_ts` are stored on every `features` row.
+
+### The most likely cause: a deployment running code defaults
+
+Nearly every guard in this bot is opt-in, so its **code defaults are "off"**. A
+deployment that sets only `TELEGRAM_TOKEN` and `CHAT_ID` therefore runs:
+
+| Setting | Code default | Consequence |
+|---|---|---|
+| `USE_GECKOTERMINAL` | `false` | discovery is the DexScreener boost/profile list — it cannot see a pool while it is minutes old |
+| `USE_SIGNALS` | `false` | no rug/wash-trade/unique-buyer gates, and the early lane is disabled |
+| `MAX_MARKET_CAP_USD` | `0` | **no alert ceiling** — it will alert on $3M and $22M tokens that already ran |
+| `EARLY_RUNNER_MODE` | `false` | a young sub-50k pool can never alert |
+| `LOG_FEATURES` | `false` | no training rows, so the score can never be refitted |
+| `MIN_SCORE` | `65` | unreachable on a young pool (ceiling ~53) |
+
+That combination reproduces exactly: alerts on multi-million-mcap tokens, false
+positives on wash-traded pools, and no early entries. **`bot.py` now prints these
+at startup and exposes them at `/health` as `config_warnings`**, because the
+difference between the documented bot and a defaulted one is otherwise invisible
+from the outside. Set them in the *deployment's* environment (e.g. the Render
+dashboard) — a local `.env` does not affect a hosted instance.
+
 ## Detection latency — "why do I only get pinged after the pump?"
 
 Being late is two different failures that look identical in a log full of reject

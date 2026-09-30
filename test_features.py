@@ -3,6 +3,7 @@
 Run with: python -m unittest -v test_features
 """
 
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -712,3 +713,114 @@ class TestMarketCapCeiling(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.recorder.rows[-1]["reject_reasons"], "mcap_too_high")
         finally:
             os.environ.pop("ROBINHOOD_MAX_MARKET_CAP_USD", None)
+
+
+class TestConfigSelfAudit(unittest.TestCase):
+    """A deployment that relies on code defaults runs a different bot.
+
+    Every guard here is deliberately opt-in, so an unconfigured deployment
+    discovers from the lagging DexScreener boost list, has no rug/wash gates, no
+    early lane and no alert ceiling. That combination reproduces the exact
+    symptoms that prompted this: alerts on $3M/$22M tokens, false positives on
+    wash-traded pools, and no early entries.
+    """
+
+    def setUp(self):
+        self._saved = {k: getattr(bot, k) for k in
+                       ("USE_SIGNALS", "USE_GECKOTERMINAL", "EARLY_RUNNER_MODE",
+                        "LOG_FEATURES")}
+        self._saved_env = os.environ.get("MAX_MARKET_CAP_USD")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(bot, k, v)
+        if self._saved_env is None:
+            os.environ.pop("MAX_MARKET_CAP_USD", None)
+        else:
+            os.environ["MAX_MARKET_CAP_USD"] = self._saved_env
+
+    def _all_off(self):
+        bot.USE_SIGNALS = False
+        bot.USE_GECKOTERMINAL = False
+        bot.EARLY_RUNNER_MODE = False
+        bot.LOG_FEATURES = False
+        os.environ["MAX_MARKET_CAP_USD"] = "0"
+
+    def test_code_defaults_are_reported_as_warnings(self):
+        self._all_off()
+        warns = " ".join(bot.config_warnings())
+        self.assertIn("MAX_MARKET_CAP_USD", warns)
+        self.assertIn("USE_SIGNALS", warns)
+        self.assertIn("USE_GECKOTERMINAL", warns)
+        self.assertIn("EARLY_RUNNER_MODE", warns)
+        self.assertIn("LOG_FEATURES", warns)
+
+    def test_no_ceiling_warning_names_the_consequence(self):
+        self._all_off()
+        warns = " ".join(bot.config_warnings())
+        self.assertIn("already ran", warns)
+
+    def test_a_configured_bot_produces_no_warnings(self):
+        bot.USE_SIGNALS = True
+        bot.USE_GECKOTERMINAL = True
+        bot.EARLY_RUNNER_MODE = True
+        bot.LOG_FEATURES = True
+        os.environ["MAX_MARKET_CAP_USD"] = "100000"
+        self.assertEqual(bot.config_warnings(), [])
+
+    def test_health_endpoint_exposes_the_warnings(self):
+        """So a misconfigured deployment is visible without reading logs."""
+        self._all_off()
+        payload = asyncio.run(bot.health_check())
+        self.assertIn("config_warnings", payload)
+        self.assertTrue(payload["config_warnings"])
+
+    def test_paper_mode_is_reported_as_a_note_not_a_warning(self):
+        notes = " ".join(bot.config_notes())
+        if bot.PAPER_TRADING:
+            self.assertIn("PAPER_TRADING", notes)
+        self.assertNotIn("PAPER_TRADING", " ".join(bot.config_warnings()))
+
+
+class TestFirstSightContext(unittest.TestCase):
+    """Alerts must say how early the token was seen and what it was worth then.
+
+    "Why did it ping me at $3M instead of $300k" has two opposite answers —
+    discovery never saw it small, or the gate held it back — and telling them
+    apart used to require grepping FIRST SIGHT out of the log.
+    """
+
+    def setUp(self):
+        bot._first_sight.clear()
+
+    def tearDown(self):
+        bot._first_sight.clear()
+
+    def _pair(self, mcap):
+        return {"chainId": "bsc", "source": "geckoterminal:new_pools",
+                "volume": {"m5": 1234.0}, "marketCap": mcap}
+
+    def test_first_sight_is_recorded_once_and_returned(self):
+        rec = bot._first_sight_note("bsc", "0xAbC", "BI", self._pair(62000.0),
+                                    liquidity=15000.0, market_cap=62000.0,
+                                    age_minutes=3.0)
+        self.assertEqual(rec["mcap"], 62000.0)
+        self.assertEqual(rec["liq"], 15000.0)
+        # A later, bigger sighting must not overwrite the original.
+        again = bot._first_sight_note("bsc", "0xabc", "BI", self._pair(3_100_000.0),
+                                      liquidity=15000.0, market_cap=3_100_000.0,
+                                      age_minutes=52.0)
+        self.assertEqual(again["mcap"], 62000.0)
+
+    def test_key_is_case_insensitive_across_pools(self):
+        bot._first_sight_note("bsc", "0xABC", "BI", self._pair(1.0),
+                              liquidity=1.0, market_cap=1.0, age_minutes=1.0)
+        self.assertEqual(len(bot._first_sight), 1)
+
+    def test_prune_removes_only_expired_records(self):
+        now = time.time()
+        bot._first_sight["bsc:0xold"] = {"ts": now - bot.FIRST_SIGHT_TTL - 10}
+        bot._first_sight["bsc:0xnew"] = {"ts": now}
+        bot.prune_caches()
+        self.assertNotIn("bsc:0xold", bot._first_sight)
+        self.assertIn("bsc:0xnew", bot._first_sight)
