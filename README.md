@@ -39,42 +39,57 @@ WALLET_PRIVATE_KEY=       # only needed for live trading
 PAPER_TRADING=true
 ```
 
-Everything else has a sane default. `.env.example` documents every variable.
+Everything else has a sane default. `.env.example` documents most variables, but
+not all of them (`ALERT_THRESHOLD` appears there only as a commented alias, and
+per-chain variants such as `BASE_MIN_SCORE` are not listed at all) — where it is
+silent, the table below is the source of truth.
 
 ## Configuration
 
 The handful you are most likely to change. Two values matter per knob:
 **code default** (what runs if `.env` omits it) vs **`.env.example` recommends**
-(what the measured rollout uses). Your live `.env` predates most flags, so an
-omitted key means the code default — currently the conservative/off side.
+(what the measured rollout uses). Your live `.env` was synced from
+`.env.example` on 2026-09-30 and has since diverged on specific keys
+(`MIN_SCORE`, `MIN_EFFECTIVE_SCORE`, `ROBINHOOD_MIN_SCORE`,
+`MAX_MARKET_CAP_USD`, `MAX_ALLOWED_TAX`, `REQUIRE_TRADEABLE_VENUE`,
+`GT_SOURCES`), so neither "the key is absent" nor "the key is present" tells you
+what runs — this table does. If your deployment's value and this table disagree,
+the table is the source of truth and your `.env` is the override to check.
 
 | Variable | Code default | `.env.example` recommends | Purpose |
 |---|---|---|---|
 | `PAPER_TRADING` | `true` | `true` | Simulate trades. Set to `false` only with a funded hot wallet. |
+| `SCAN_INTERVAL` | `30` (floored at 5) | `30` | Seconds between scan cycles. The startup message prints it (`Scan interval:`); the cycle sleeps the remainder after the work, so a slow cycle shortens the pause instead of stacking. |
 | `MIN_SCORE` | `65` | `65` | Alert threshold (0–100), scaled per chain — see [Alert gate](#alert-gate). |
 | `SCORE_NORMALIZE` | `true` | `true` | Scale the alert bar to the points actually reachable on a chain/age. `false` gates on raw `MIN_SCORE`. |
-| `MIN_EFFECTIVE_SCORE` | `35` | `45` | Floor for the scaled threshold, so scaling can't become a rubber stamp. At age ~3m the reachable ceiling is ~53, so `MIN_SCORE=55` scales to 29 and the floor is what actually gates young pools. `35` admitted a token at hand=35.0 exactly; `45` makes the early lane's AND-gates the way in instead. |
+| `MIN_EFFECTIVE_SCORE` | `35` | `45` | Floor for the scaled threshold, so scaling can't become a rubber stamp. At age ~3m the reachable ceiling is ~53, so `MIN_SCORE=55` scales to 29 and the floor is what actually gates young pools. `35` admitted a token at hand=35.0 exactly; `45` makes the early lane's AND-gates the way in instead. The `30` used in [`RECOMMENDED_ENV.md`](RECOMMENDED_ENV.md) is conditional on that profile's `MIN_SCORE=50` (30 ≈ 57% of a young pool's reachable 53); paired with `MIN_SCORE=65` the same floor is a looser bar (34.5 rather than 45), which is why `45` is the recommendation here. |
 | `MAX_ALLOWED_TAX` | `0` | `10` | Reject tokens above this buy/sell tax %. |
 | `ETHERSCAN_API_KEY` | — | — | Contract verification on all four chains, including Robinhood (chainid 4663). `SCANNER_API_KEY` is accepted as an alias. |
 | `MORALIS_API_KEY` | — | — | Optional. Only used for an exact top-100 figure on BSC/ETH/Base. **Not** needed for holder scoring, and not supported on Robinhood. |
 | `COINGECKO_API_KEY` | — | — | Enables CEX-listing scoring (never applies to Robinhood). |
-| `USE_GECKOTERMINAL` | `false` | `true` | GeckoTerminal discovery. The DexScreener alternative is only the paid-boost shill list (`/latest/dex/pairs/{chain}` 404s), so prefer `true`. Code default is `false` (unchanged behaviour until you opt in). |
+| `USE_GECKOTERMINAL` | `false` | `true` | GeckoTerminal discovery. With the code default `false` **and** `DEXSCREENER_SOURCES` defaulting to `""`, there is no boost/profile list either: the only fallback left is DexScreener's dead `/latest/dex/pairs/{chain}` (HTTP 404), i.e. **no candidates at all**. The paid-boost shill list only feeds the bot once `DEXSCREENER_SOURCES` is set, so prefer `true` — code default is `false` (unchanged behaviour until you opt in). |
 | `GT_SOURCES` | `new_pools,trending,top_volume` | `new_pools,trending,top_volume` | Sources for **every** chain. `new_pools` = the only early feed (carries a pool while it is minutes old and small). `trending` = momentum, but *lagging*: on Robinhood the youngest pool it offered was 234 min old at a median $3.5M mcap. `top_volume` = liquid universe (median age 24h, $12.4M). Dropping `new_pools` makes a sub-50k entry mathematically impossible — no threshold tuning can recover a pool the scanner never listed. |
 | `DEXSCREENER_SOURCES` | `""` (off) | `boosts,boosts_top,profiles` | DexScreener boost/profile lists as a **second** source alongside GeckoTerminal — a union, not a switch. Measured 2026-09-30: these list tokens at a median **~24h old** (p25 112m, min 26m), so they are *not* earlier than `new_pools`; the value is the opposite — a much smaller list (~20 tokens per cycle across four chains), skewed small (median mcap ~$107k) and mostly on `uniswap`/`pancakeswap`, i.e. venues the routers can actually trade. Costs one call per 30 tokens. |
 | `GT_SOURCES_<CHAIN>` | — (falls back to `GT_SOURCES`) | — | Per-chain override (also accepts `<CHAIN>_GT_SOURCES`). Use it to drop a feed on one chain, never to blind the early lane globally. `new_pools` was Robinhood-only until 2026-09-30, switched off on BSC after an **n=20** alert preview showed template-liquidity placeholders — the same error as tuning a floor on two tokens. It is now on every chain and the *filters* do the work, per chain. |
-| `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` | `1` / `2` / `1` | `1` / `1` / `1` | Pages per source per chain. Page 1 of `new_pools` *is* the newest cohort, so depth there buys little. `trending` is one page in `.env.example` because the second page buys lagging $3.5M-median pools that the mcap ceiling rejects anyway, and that budget is better spent on births now that `new_pools` runs everywhere. |
-| `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` | `30` / `60` / `180` | `30` / `60` / `180` | Per-source list cache (s). `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
-| `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (= disabled) | `200000` | Alert **ceiling**. Without it the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. Code default leaves behaviour unchanged until you set it. |
+| `SEED_ONLY_SOURCES` | `""` (none) | `""` | Sources whose pools are **recorded but never scored or alerted** — they only write the baseline history and the standing universe, which is how a feed can seed the surge lane without flooding it. Set to `new_pools` for the pattern in [Seeding the universe](#seeding-the-universe-so-a-new-pool-is-never-never-seen); leave empty when `new_pools` itself must feed the early lane. |
+| `GT_PAGES_<KIND>` (e.g. `GT_PAGES_TRENDING_5M`) | `1` (`trending` `2`) | `1` / `1` / `1` | Pages per source per chain, for **every** source kind (`new_pools`, `trending`, `trending_5m`, `top_txns`, `top_volume`). The legacy `GT_PAGES_NEW` / `GT_PAGES_TRENDING` / `GT_PAGES_TOP` spellings still work as aliases for `new_pools` / `trending` / `top_volume`; a blank value counts as unset. Page 1 of `new_pools` *is* the newest cohort, so depth there buys little. `trending` is one page in `.env.example` because the second page buys lagging $3.5M-median pools that the mcap ceiling rejects anyway, and that budget is better spent on births now that `new_pools` runs everywhere. |
+| `GT_LIST_TTL_<KIND>` (e.g. `GT_LIST_TTL_TOP_TXNS`) | `30` / `60` / `45` / `90` / `180` for `new_pools` / `trending` / `trending_5m` / `top_txns` / `top_volume` (s) | `30` / `60` / `180` | Per-source list cache (s), bound for every source kind from `discovery.DEFAULT_LIST_TTLS`; legacy `GT_LIST_TTL_NEW` / `GT_LIST_TTL_TRENDING` / `GT_LIST_TTL_TOP` still work as aliases, blank = unset. `new_pools` churns a cohort every few minutes; `top_volume` barely moves, so a long TTL there saves budget for holder lookups. |
+| `MAX_MARKET_CAP_USD` (+ per-chain) | `0` (= disabled) | `200000` | Alert **ceiling**, applied to **fdv as well as market cap**: a token is rejected `mcap_too_high` *or* `fdv_too_high`, so a small circulating cap next to a multi-million FDV no longer clears the gate (fdv `0`/absent never triggers it). Without the ceiling the scanner alerts on $3M/$22M tokens that already ran. Verified to reject a $1.9M launch that `new_pools` surfaced. Code default leaves behaviour unchanged until you set it. |
 | `NEAR_MISS_POINTS` | `15` | `15` | Tokens within this many points of the bar still log full score lines at INFO. The rest die silently into the features table — this is what makes `new_pools` + `VERBOSE_LOGGING=true` usable instead of spam. |
+| `RE_ALERTS` | `false` | `false` | Repeat alerts for a token you were already told about. `false` = one message per (chain, token) for the life of the `alerts` table; see [One alert per token](#one-alert-per-token) for the four paths that used to duplicate. `true` restores the old policy, with `RE_ALERT_COOLDOWN_HOURS` (was hard-coded `4`) and `RE_ALERT_MIN_IMPROVEMENT` (was hard-coded `12`) now settable. |
 | `WATCHLIST_ENABLED` | `false` | `true` | Re-price pools that dropped out of the feeds: born quiet, runs later (the shape it targets — remember what was seen, re-price on a TTL, forget after expiry). DexScreener lookups, no GT budget cost. Code default is `false`. |
+| `WATCHLIST_MAX` | `300` | `300` | Standing-universe size: how many watched pools may be re-checked per cycle. The design is a broad universe (300) rather than a shortlist, because re-pricing is batched (30 addresses per DexScreener call, so 300 pools ≈ 10 calls). |
+| `WATCHLIST_RECHECK_MINUTES` | `10` | `5` | Minimum minutes between two re-checks of the same pool. |
+| `WATCHLIST_TTL_HOURS` | `24` | `24` | How long a pool stays on the watchlist after it was last seen. |
+| `WATCHLIST_MIN_BEST_SCORE` | `0` | `0` | Only remember pools whose best score reached this. `0` = remember **every** evaluated pool (the design: a pool scoring 0 today is the one that can surge tomorrow); raise it to keep the universe small and selective. |
 | `USE_SIGNALS` | `false` | `true` | Enable the signal engine. It only **removes** candidates by default (rejects + penalties), using unique-buyer data DexScreener doesn't provide. The **code default is `false`** — `.env.example` sets `USE_SIGNALS=true`, and you must copy that across or `signals.py` is never called and none of the `SIG_*` filters below do anything. |
-| `SIGNAL_BONUS_WEIGHT` | `0.0` | `0.5` | Weight on the signal bonus. Code default `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `.env.example` uses `0.5`. The structural reason it is non-zero: a clean distributed runner earns 0 holder and 0 CEX points on Robinhood, so its hand score cannot reach a bar scaled for a concentrated one. **This value is not outcome-fitted** — treat it as a declared policy and re-fit with `diag/fit_thresholds.py` once labelled data exists. Raising it re-opens the pass-2 flood vector — see [Catching re-ignited pools](#catching-re-ignited-pools). |
+| `SIGNAL_BONUS_WEIGHT` | `0.0` | `0.5` | Weight on the signal bonus. Code default `0.0` means the hand-tuned score stays the gate; a bonus can never create an alert. `.env.example` uses `0.5`. The structural reason it is non-zero: a clean distributed runner earns 0 holder and 0 CEX points on Robinhood, so its hand score cannot reach a bar scaled for a concentrated one. **This value is not outcome-fitted** — treat it as a declared policy and re-fit with `diag/fit_thresholds.py` once labelled data exists. Raising it re-opens the pass-2 flood vector — see [Catching re-ignited pools](#catching-re-ignited-pools). **The bonus includes history-gated components** (`vol_accel`, `score_rising`, holder delta, `vol_rising`) that only exist when `signals.evaluate()` receives `PAIR_HISTORY` — that argument was missing until 2026-10-01, so at `0.5` the weight was multiplying a bonus that could never be earned. With the wiring restored, a non-zero weight can now actually move a candidate across the bar; set it back to `0.0` if you want the hand score to stay the only gate. |
 | `EARLY_RUNNER_MODE` | `false` | `true` | Lets a strong *young* pool alert (its long volume windows are empty, so it can't reach the threshold). Every AND-condition in `SIG_EARLY_*` must hold. Code default is `false`; without it a sub-50k pool structurally cannot alert. |
 | `SIG_MAX_AGE_MINUTES` | `0` | `0` | `0` = **no upper age limit**. Pool age isn't a quality signal; the activity floors already reject dead pools. Set a number to restore a hard cap. |
 | `ALLOW_SECURITY_FALLBACK` | `false` | `false` | `false` drops tokens GoPlus doesn't know (original behaviour). `true` accepts a simulated honeypot.is record instead. |
 | `SIG_REQUIRE_OPEN_SOURCE` | `false` | `false` | Require a verified contract source. Leave `false` — most Robinhood tokens are unverified, including the ones that run. |
 | `SIG_HOLDER_STANCE` | `pump` | `pump` | `pump` rewards concentrated supply (early runners); `rug` penalises it. |
-| `<CHAIN>_SIG_EARLY_*` | — (falls back to the global `SIG_EARLY_*`) | BSC overrides only | Per-chain early-lane floors, so one chain can be objectively stricter without the early feed being disabled. The global values are the **Robinhood** cohort; BSC's p90 birth liquidity is ~$14.6k vs ~$5.4k, so BSC gets its own floors. Base (n=15) and Ethereum (n=2) deliberately get none — see [per-chain floors](#per-chain-early-floors). |
+| `<CHAIN>_SIG_EARLY_*` | — (falls back to the global `SIG_EARLY_*`) | BSC overrides only | Per-chain early-lane floors, so one chain can be objectively stricter without the early feed being disabled. The global values are the **Robinhood** cohort; BSC's p90 birth liquidity is ~$14.6k vs ~$5.4k, so BSC gets its own floors. Base (n=15) and Ethereum (n=2) deliberately get none — see [per-chain floors](#per-chain-early-floors-and-the-and-trap). |
 | `ROBINHOOD_MIN_SCORE` / `BASE_MIN_SCORE` etc. | — (falls back to `MIN_SCORE`) | `55` for Robinhood in `.env.example` | Per-chain threshold override, same convention as the floors below. Robinhood `55` because distributed-clean runners there earn 0 holder/CEX points. |
 | `BASE_MIN_LIQUIDITY_USD` etc. | — | — (examples commented out) | Per-chain floors. Use these to tighten one noisy chain without changing the rest. |
 | `ALLOWED_USER_IDS` | — | — | Extra Telegram allowlist when `CHAT_ID` is a group. |
@@ -85,6 +100,7 @@ omitted key means the code default — currently the conservative/off side.
 | `SIG_SURGE_MIN_OBSERVATIONS` | `3` | `3` | Scans of history before the lane can fire. Without a baseline nothing is abnormal, which is what stops it firing on a first sighting. |
 | `SIG_SURGE_MIN_LIQUIDITY_USD` / `SIG_SURGE_MIN_VOL_LIQ` / `SIG_SURGE_MIN_TXNS_5M` / `SIG_SURGE_MIN_BUY_RATIO` | `8000` / `0.05` / `15` / `0.55` | same | Depth and participation sanity: a surge must be tradeable and buyer-led, not one whale. |
 | `SIG_SURGE_MAX_CHG_5M` | `200` | `200` | Already vertical by the time we see it is late, not early. |
+| `SIG_SURGE_MAX_AGE_MINUTES` | `0` (= no cap) | `0` | Upper age limit for the volume-surge lane only, so an established pool that re-ignites weeks later still qualifies. `0` disables it (the same reasoning as `SIG_MAX_AGE_MINUTES`); a number caps the lane to "fresh" pools. |
 | `REQUIRE_TRADEABLE_VENUE` | `false` | `false` | Reject a pool whose DEX the configured routers cannot reach (Uniswap V4, V3 forks, Pons, Aerodrome) before spending enrichment budget. `false` still alerts but names the DEX and withholds buy buttons. See [Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4). |
 | `TRADEABLE_DEXES` / `<CHAIN>_TRADEABLE_DEXES` | — (built-in per-chain patterns) | — | Regex patterns (matched against the feed's `dexId`) for venues you have added routers for. Overrides the built-in uniswap v2/v3 (eth/base/robinhood) and pancakeswap v2/v3 (bsc) defaults. |
 
@@ -150,7 +166,11 @@ its *own* factory, so:
   PancakeSwap router.
 
 Measured 2026-09-30 on GeckoTerminal page 1 (20 pools per feed) — the share of
-pools the configured routers can execute on:
+pools the configured routers can execute on. This is a **page-1 snapshot**: one
+page per chain per feed, so it describes what the *top* of each feed lists right
+now, not the birth population (that is the separate 480-birth `dex_coverage`
+sample further down — the two have different sampling frames and should not be
+quoted against each other):
 
 | Chain | Feed | Routable | What the rest is |
 |---|---|---|---|
@@ -335,7 +355,10 @@ bot-env/bin/python diag/launchpad_migration.py --chain bsc --dex-pools four-meme
 No — that holds on Ethereum, roughly on Base, and fails on BSC and Robinhood.
 Measured with `diag/dex_coverage.py` over **480 births, 120 per chain, 6 pages
 each, zero failed pages** (2026-09-30). Coverage of `new_pools`, i.e. "can the
-bot buy this pool at birth":
+bot buy this pool at birth". Sampling frame: a **birth cohort walked six pages
+deep per chain**, unlike the page-1 feed snapshot in
+[Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4) — the two tables
+are not interchangeable and should not be quoted against each other:
 
 | Scenario | Ethereum | Base | BSC | Robinhood | Pooled |
 |---|---|---|---|---|---|
@@ -511,7 +534,7 @@ deployment that sets only `TELEGRAM_TOKEN` and `CHAT_ID` therefore runs:
 
 | Setting | Code default | Consequence |
 |---|---|---|
-| `USE_GECKOTERMINAL` | `false` | discovery is the DexScreener boost/profile list — it cannot see a pool while it is minutes old |
+| `USE_GECKOTERMINAL` | `false` | no GeckoTerminal candidates — and with `DEXSCREENER_SOURCES` also defaulting to `""`, the boost/profile list is off too, so the only fallback is DexScreener's dead `/latest/dex/pairs/{chain}` (HTTP 404): **no candidates at all** |
 | `USE_SIGNALS` | `false` | no rug/wash-trade/unique-buyer gates, and the early lane is disabled |
 | `MAX_MARKET_CAP_USD` | `0` | **no alert ceiling** — it will alert on $3M and $22M tokens that already ran |
 | `EARLY_RUNNER_MODE` | `false` | a young sub-50k pool can never alert |
@@ -524,6 +547,28 @@ at startup and exposes them at `/health` as `config_warnings`**, because the
 difference between the documented bot and a defaulted one is otherwise invisible
 from the outside. Set them in the *deployment's* environment (e.g. the Render
 dashboard) — a local `.env` does not affect a hosted instance.
+
+**Which file, and which ceiling, are now explicit.** `bot.py` loads the `.env`
+sitting **next to itself**, never "whatever directory the process happened to
+start in": the bare `load_dotenv()` resolved against the working directory, so a
+service launched from another path (a systemd unit, a container `WORKDIR`, a
+hosted build) read *no* config and every default above silently applied — with
+the ceiling reading `0`, i.e. **no ceiling at all**, which is exactly "I set
+`MAX_MARKET_CAP_USD=100000` and still get alerted on $5M tokens". Three places
+now state the running truth instead of leaving it to be inferred:
+
+* the log line `Config file: <path>` at import, and `Config:` / `Mcap ceiling:`
+  lines in the startup Telegram message;
+* `/health` → `env_file`, `mcap_ceiling_usd` (per chain, read fresh, `0` shown
+  as `NONE`), `threshold_by_chain` (the unscaled bar each chain starts from
+  before age-scaling) and `re_alerts`;
+* `/health` → `config_warnings` for defaults that degrade the bot, plus the
+  deliberate choices (`PAPER_TRADING`, `ALLOW_SECURITY_FALLBACK`,
+  `RE_ALERTS`) which the startup message prints under `NOTES`.
+
+The ceiling itself is enforced twice — `mcap_too_high` on circulating market cap
+and `fdv_too_high` on fully-diluted — because feeds disagree about which of the
+two they publish, and only one of them is the number the charts show.
 
 ## Detection latency — "why do I only get pinged after the pump?"
 
@@ -595,6 +640,29 @@ at `age=3m mcap=$6k` and you still get no alert, the gate is the problem — and
 the points.
 
 ## Alert gate
+
+### One alert per token
+
+"Stop telling me about the same token" was a bug report with five distinct
+causes, and closing it took five fixes — because each one duplicated on its own:
+
+| Cause | Why it duplicated | Fix |
+|---|---|---|
+| **Two pools, one scan.** | The union in `get_all_pairs()` de-duplicated on `pairAddress`. GeckoTerminal returns pool A of a contract, DexScreener's `/tokens/v1` answers with pool B, so `evaluate_token` ran twice and produced two results seconds apart. | `discovery.dedupe_best_pool()` now collapses the **union** to one row per token (deepest pool wins — also the tradeable one), and `dispatch_alerts()` takes one **cycle-wide** batch key shared by the discovery and watchlist lanes, so a second reading of the same token cannot send even when the scores differ. |
+| **The re-alert policy.** | `RE_ALERT_COOLDOWN_HOURS=4` re-alerted unconditionally after four hours, and the 12-point `SCORE_IMPROVEMENT_THRESHOLD` re-alerted *within* the cooldown whenever the score gained 12 points. Scores bounce by more than that between scans — windows roll, holder data arrives late, the bar is normalised — so a token that stayed in the feeds kept pinging. | `RE_ALERTS=false` (default): one message per (chain, token) for the life of the `alerts` table. The old policy is still available, with both thresholds now `.env` knobs: `RE_ALERT_COOLDOWN_HOURS` and `RE_ALERT_MIN_IMPROVEMENT`. |
+| **Case-sensitive identity.** | The key was compared byte-for-byte while feeds disagree about checksum casing, so `0xAbC…` and `0xabc…` were two identities and the second alert behaved as if the first never happened. | The address is lower-cased once in `evaluate_token()`, and `db_get_last_alert()` / `db_record_alert()` normalise both sides (`COLLATE NOCASE` on the read). Existing rows in `alerts`, `watchlist` and `features` are migrated at startup (collapse first, *then* lower-case — the reverse order collides with its own twin under `UNIQUE`). |
+| **Silent loss of dedupe state.** | `db_record_alert()` upserts with `ON CONFLICT(chain, token_address)`. Against a table created without that UNIQUE clause the statement is rejected — and the rejection was caught and logged as a *warning*. No state, every cycle, same token, looking like a threshold problem. | `_migrate_alerts_dedupe_key()` runs at startup: collapse duplicates to the newest, lower-case, create the unique index. Plus `ALERTED_THIS_RUN`, an in-memory copy that covers the run even if the upsert fails again. |
+| **A failed send consumed the alert.** | `send_alert()` swallowed its own exception, so the dispatcher recorded the token as reported even when Telegram rejected the message — and with `RE_ALERTS=false` that record never expires: one transient outage silenced the token for good, while the feature row said `alert_sent=0`. | `send_alert()` now reports success; dedupe state, counters and the log line are written only after a delivered message, so the next cycle retries. The cycle batch still blocks a double attempt inside one cycle. |
+
+`test_alert_dedupe.py` pins all five: 17 cases covering same-cycle duplicates,
+the re-alert policy in both states, checksum spelling, a failed upsert, a failed
+send, the shared cross-lane batch, the startup migration (including a table that
+already had the UNIQUE constraint), and the union collapse.
+
+> **Persistence caveat:** the dedupe state *is* the `alerts` table, and `*.db`
+> is gitignored. A redeploy that does not carry the database over starts with an
+> empty table — every token the old deployment had already reported becomes
+> reportable again. Keep the file on a volume if you restart often.
 
 ### How good is the score? Measured, not assumed
 
@@ -669,7 +737,7 @@ transaction counts, holder bands and security lookups). Measured per block:
 | security | 10 | non-discriminating — every survivor passes it | | |
 | CEX listings | 5 | late signal; unreachable on Robinhood | | |
 
-**The 15 price points alone rank as well as all 45 testable points combined**
+**The 15 price points alone rank as well as all 35 testable points combined**
 (0.565 vs 0.568 at ≥10%) and better on the moves that matter (0.558 vs 0.463 at
 ≥25%/1h). The 30 volume-ratio points buy essentially nothing, and
 `vol_5m / vol_1h` (8 pts) is a literal coin flip.
@@ -771,8 +839,11 @@ named token. Nothing in the derivation reads price or subsequent performance,
 which is what keeps it free of survivorship bias.
 
 The lane only ever fires on young pools, and young pools only arrive from
-`new_pools`, which the shipped config enables on Robinhood alone — so the
-relevant cohort is Robinhood `new_pools`, not a cross-chain pool:
+`new_pools` — a feed that is **global**: it has run on every chain since
+2026-09-30 (BSC's per-chain override below comes from BSC's own cohort). The
+*global* floors below were derived from the first cohort measured, so the
+relevant cohort for these particular numbers is Robinhood `new_pools`, not a
+cross-chain pool:
 
 ```bash
 bot-env/bin/python diag/population_floors.py \
@@ -806,8 +877,12 @@ Three findings worth stating plainly:
 
 **Outcome-fitted thresholds (none exist yet).** A quantile says "this is a strong
 pool for its cohort". It does not say the pool goes up — `diag/component_audit.py`
-measured the underlying components at AUC ≈ 0.59 for a ≥10% move and ≈ 0.24 for
-≥100%, i.e. near-useless for the tail this bot is hunting. Thresholds that claim
+measured the underlying components at AUC **0.568** for a ≥10% move and **0.461**
+for ≥100% (HEAD re-run table above), i.e. near-useless for the tail this bot is
+hunting. (An earlier run of the same tool, reported in
+[`FINDINGS_BOAR_2026-09-26.md`](FINDINGS_BOAR_2026-09-26.md) §11, printed
+≈0.59 / ≈0.24 on a smaller 50-pool sample — that is the older number, superseded
+by the table above.) Thresholds that claim
 predictive power must be fitted on realised forward returns, and
 `diag/fit_thresholds.py` does that with a hard gate: it **refuses to emit any
 recommendation** below 30 positive outcomes across 30 distinct tokens, splits by
@@ -894,7 +969,9 @@ sell 25/50/100%, buy more, and set trailing stop.
 `bot.py` is a FastAPI app; `python bot.py` starts it on `PORT` (default `10000`)
 and the bot runs from the app lifespan. `GET /health` returns status, counters and
 open positions, including the three "why was it quiet" counters
-(`security_unknown_rejects`, `unsupported_venue_rejects`, `untradeable_alerts`).
+(`security_unknown_rejects`, `unsupported_venue_rejects`, `untradeable_alerts`),
+the config audit (`config_warnings`), and the four "which config am I running"
+fields: `env_file`, `mcap_ceiling_usd`, `threshold_by_chain`, `re_alerts`.
 Works on Render or any host that injects `PORT`. SQLite
 (`pump_bot_v5.db`) and logs are local, so attach a disk if state must survive
 redeploys.
@@ -902,7 +979,8 @@ redeploys.
 ## Tests
 
 ```bash
-python -m unittest -v          # 183 tests, no network
+python -m unittest -v          # 308 tests (offline fixtures; importing bot.py
+                               # still connects to the configured RPCs)
 ```
 
 The suite includes the objectivity guards that matter for the floors:
@@ -967,7 +1045,7 @@ missed:
   `score_vol_5m_1h`, `score_vol_1h_6h`, `score_vol_6h_24h`, `score_buy_5m`,
   `score_buy_1h`, `score_price`, `score_holder`, `score_security`, `score_cex`
   and `penalties_total` sum to `hand_score`, so a token that scored 48 against a
-  bar of 64 can be attributed to the components that withheld the points.
+  bar of 61.26 can be attributed to the components that withheld the points.
   `ceiling_score` is the reachable maximum the bar was scaled against, and
   `alert_threshold` is the bar itself — recorded provisionally even for rows
   rejected before the holder lookup runs.

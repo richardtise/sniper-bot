@@ -51,7 +51,7 @@ this tape. The number the bot needed to beat while boar sat at $250k–$370k was
 
 `effective_threshold()` scales the bar by `max_possible_score()`, which is a
 theoretical ceiling computed by driving every ratio to its top tier
-(`bot.py:1650-1714`). At age 655 min (13:53 UTC) the ceiling is 98.25, so the
+(`bot.py:1650-1714`). At age 655 min (13:53 UTC) the ceiling is 94.25, so the
 gate becomes `65 × 94.25/100 = **61.26**`, i.e. the model demanded **65 % of all
 points**. (With a top-100 holder figure available the ceiling would be 98.25 and
 the bar 63.86 — the *higher* number quoted elsewhere. Boar's deployment gets no
@@ -103,7 +103,7 @@ holders       16.0 (top100 unmeasurable)
 security      10.0
 cex            0.0
              ─────────
-              77.3 – 79.3  of a 98.25 ceiling = 79–81 % of ceiling
+              77.3 – 79.3  of a 94.25 ceiling = 82–84 % of ceiling
 ```
 
 So a *textbook* pump bar could clear 61.26 — barely, and only if the 5-minute
@@ -168,7 +168,7 @@ scale being policed at 65 %.
 boar was ranked **below** the gate at 38 and 48 while it was 12 hours into a
 13× move. It was not a filter problem and not a latency problem — the model
 looked at a live runner and called it mediocre. **No amount of threshold tuning
-makes a 48 out of 64**, and the same function also scored `TALIS`
+makes a 48 out of 61.26**, and the same function also scored `TALIS`
 (`0xd5D26bac…`, Robinhood) high enough to be a false positive while it was
 `h6 = −51 %` with a 0.54 buy ratio. Both errors are the same error: component
 weights that do not correspond to forward return.
@@ -205,10 +205,11 @@ partly blind:
    read before the floors, and `ceiling_score` / `alert_threshold` are recorded
    provisionally (with `has_top100=False`) so even an early reject shows the bar it
    faced. Pinned by `test_floor_reject_still_carries_the_raw_metrics`.
-2. ⬜ **OPEN — `LOG_FEATURES` is off in the deployment's `.env`** (only
-   `.env.example` documents it), and the local `features` table is empty. Nothing
-   below matters until this is on: every day it runs blind is a day of training
-   data that cannot be recovered.
+2. ⬜ **OPEN — the local `features` table is empty (0 rows).** The configuration
+   half has since been done — `LOG_FEATURES=true` is now set in the deployment's
+   `.env`, and both `.env.example` and the README document it — but nothing below
+   matters until rows actually exist: every day it runs blind is a day of
+   training data that cannot be recovered.
 3. ✅ **CLOSED — the score components are now stored**, not just the total:
    `score_vol_liq`, `score_vol_5m_1h`, `score_vol_1h_6h`, `score_vol_6h_24h`,
    `score_buy_5m`, `score_buy_1h`, `score_price`, `score_holder`, `score_security`,
@@ -251,6 +252,15 @@ was never able to act on the alerts that did fire. **Detection fixes are of
 limited value until V4/Universal Router execution exists**, or until alerts
 refuse to present dead buy buttons and say why.
 
+> **Since closed — the alert half only.** Alerts now name the venue and, when no
+> configured router reaches the pool, print a `⚠️ No route — not tradeable by
+> this bot.` header naming the DEX, with the buy buttons withheld
+> (`build_no_route_keyboard`); `REQUIRE_TRADEABLE_VENUE=true` drops such pools
+> before they cost enrichment budget instead (see the README's
+> [Tradeable venues](README.md#tradeable-venues--do-you-need-uniswap-v4) section).
+> **Still open:** V4 / Universal Router *execution* itself — the bot still has no
+> V4 path, so even a venue-named alert cannot be acted on for those pools.
+
 ## 7. One-paragraph answer to "is this code better than the initial one?"
 
 On *discovery*, yes and unambiguously: the initial version called
@@ -258,8 +268,8 @@ On *discovery*, yes and unambiguously: the initial version called
 `token-boosts/top/v1` (currently 30 entries, **0 on Base**), so it could only
 ever see paid shills — it would never have put boar in front of any gate. On
 *scoring*, no: both versions use the same hand-tuned ratio model, and that model
-is what scored a 13× mover 38–48 against a 64 bar. The initial code's silence on
-Base was accidental; the current code's silence on boar is systematic.
+is what scored a 13× mover 38–48 against a 61.26 bar. The initial code's
+silence on Base was accidental; the current code's silence on boar is systematic.
 
 ## 8. What shipped on 2026-09-27 (findings only — scoring untouched)
 
@@ -282,8 +292,8 @@ Verification performed:
   → **64 tests, OK**.
 * `diag/compare_decisions.py` (HEAD vs working tree) → **13/13 cases identical**,
   including all four floors, the three signal vetoes, the three security rejects,
-  `phase1_gate`, `below_threshold` and `robinhood_too_new`. The logging change is
-  decision-neutral.
+  `alert_eligible`, `below_threshold` and `robinhood_too_new`. The logging change
+  is decision-neutral.
 * `diag/log_boar_row.py` on live boar data wrote a full row
   (`score_vol_liq=2.0`, `score_security=10.0`, `penalties=15`,
   `base_score=1.0`, `ceiling_score=94.25`, `alert_threshold=61.26`,
@@ -303,12 +313,22 @@ behaviour change and was left to you.
 ### Still open (unchanged by this pass)
 
 1. The scoring model itself (§3) — the actual reason boar was missed.
-2. `LOG_FEATURES=true` in the deployment `.env` (gap 2). Nothing above matters
-   until this is on.
-3. The ignition watchlist for pools that go quiet and re-ignite (§5, gap 4).
-4. V4 / Universal Router execution, or alerts that refuse dead buy buttons (§6).
-5. A false-positive guard for the `TALIS` pattern — h6 ≈ −50 % with a 0.54 buy
+2. Training rows (gap 2): the local `features` table still has **0 rows** — the
+   configuration half is now done (`LOG_FEATURES=true` in the deployment's `.env`,
+   documented in the README), but nothing above matters until rows start
+   accumulating.
+3. V4 / Universal Router *execution* (§6) — only half closed: alerts now refuse
+   dead buy buttons, but the router path does not exist yet.
+4. A false-positive guard for the `TALIS` pattern — h6 ≈ −50 % with a 0.54 buy
    ratio while alerting (§4).
+
+**Since closed (after this pass):** the ignition watchlist for pools that go
+quiet and re-ignite (§5, gap 4) shipped in commit `dc37eae` —
+`bot.db_watchlist_remember` / `collect_watchlist_pairs`, and the README now calls
+the [watchlist the main
+lane](README.md#the-universe-problem--and-why-the-watchlist-is-now-the-main-lane).
+The alert half of item 3 also shipped: alerts name the venue and withhold buy
+buttons when no configured router reaches the pool (§6).
 
 
 ## 9. The two legs, scored with the bot's own functions

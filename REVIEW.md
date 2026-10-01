@@ -128,7 +128,7 @@ date. Measured across 122 live pools on Robinhood/BSC/Base:
 
 Two of the four were multi-thousand-percent runners. **Fixed:** the cap now
 defaults to `0` = no limit, with `SIG_MAX_AGE_MINUTES=7200` restoring the old
-behaviour. `tests/test_sources.py::TestAgeGate` pins both, including that a dead
+behaviour. `test_sources.py::TestAgeGate` pins both, including that a dead
 27-day pool is *still* rejected by the activity floors.
 
 #### The second, deeper blocker — `SIGNAL_BONUS_WEIGHT` was dead
@@ -222,7 +222,7 @@ the end of this section.
 | 5.4 No Telegram 429 handling | ✅ `tg_send()` catches `RetryAfter` and retries with backoff |
 | 5.5 Unescaped HTML | ✅ `esc()` applied to token names/symbols/tx hashes |
 | 5.6 `telebot` not in requirements | ✅ `test_telegram.py` rewritten on python-telegram-bot |
-| 5.7 Unused `.env` keys | ⚠️ Documented; `AUTO_BUY_*`/`SCANNER_API_KEY` are still dead config (remove or implement) |
+| 5.7 Unused `.env` keys | ⚠️ Documented; `AUTO_BUY_*` are still dead config (remove or implement — since deleted from the live `.env`). `SCANNER_API_KEY` is *not* dead: `bot.py` reads it as the Etherscan-key alias (3.3) and the live `.env` sets only that name |
 
 ### 0c. Pass-2 regression — excess Base noise (fixed)
 
@@ -239,7 +239,9 @@ showed up as a flood of Base alerts. Three separate causes:
    `max_bonus = 45` let a legacy ~40 token clear `MIN_SCORE=65`. *Fixed:*
    `SIGNAL_BONUS_WEIGHT` (default `0.0`) weights the bonus, and the alert gate is
    the hand-tuned score again (`legacy_total >= ALERT_THRESHOLD`); signals can
-   only veto or demote.
+   only veto or demote. *(Gate form is pass-2 history, superseded by pass 3: the
+   gate is now `total_score` alone — see the pass-3 note above — while the
+   default `SIGNAL_BONUS_WEIGHT=0.0` still means the bonus adds nothing.)*
 3. **Loosened signal thresholds.** liquidity 8000→4000, 5m vol 500→250, age
    3→1 min, txns 8→5, avg-trade 0.10→0.25, holders 50→10. *Fixed:* restored the
    strict values in `signals.py` and `.env.example`.
@@ -276,9 +278,11 @@ the opposite, for reasons that are worth stating plainly:
 `MIN_SCORE` only if *every* condition holds (`signals.early_runner_reasons`):
 age ≤ 30 min, liquidity ≥ $15k, liquidity/mcap ≥ 1%, 5m volume ≥ 10% of
 liquidity, ≥ 20 txns, buy ratio ≥ 60%, ≥ 15 **unique buyers**, 5m change ≤ 150%,
-and a clean security record. AND semantics mean strong volume cannot compensate
-for a missing unique-buyer base — which a weighted score always allows. Default
-off; needs `USE_SIGNALS=true`.
+and a clean security record. Those are the original pass-1 gate as first written,
+since re-derived: the shipped floors are liquidity $5,700, vol/liq 0.070, 13 txns,
+0.561 buy ratio and 6 unique buyers (see README, "Per-chain early floors"). AND
+semantics mean strong volume cannot compensate for a missing unique-buyer base —
+which a weighted score always allows. Default off; needs `USE_SIGNALS=true`.
 
 **Also added — the AND-gates GeckoTerminal unlocks.** Unique buyers are data
 DexScreener does not return, so `SIG_MIN_UNIQUE_BUYER_RATIO` (unique wallets /
@@ -345,7 +349,11 @@ and it removes your dependence on any third-party listing.
 
 ## 2. P0 — security
 
-### 2.1 ✅ A live Telegram token is sitting in `crime_pump.log`
+### 2.1 ⚠️ A live Telegram token is sitting in `crime_pump.log`
+
+> **Status (2026-10-01):** `.gitignore` is fixed (`*.log` ignored), but the token
+> is still live on disk — `grep -c` on the token pattern in `crime_pump.log` still
+> returns 9. Revoking the token and deleting the log are **still pending**.
 
 `crime_pump.log` contains the bot token in plaintext 9 times (httpx logs the full
 `.../bot<id>:<secret>/sendMessage` URL), and `*.log` was **not** in `.gitignore`,
@@ -421,7 +429,9 @@ the float. So `signals.py` makes it a deliberate choice:
   distribution, penalises 45–60%, hard-rejects above `SIG_MAX_TOP10_PCT` /
   `SIG_MAX_CREATOR_PCT`.
 
-Related defaults were loosened for early entry and are all tunable:
+Related defaults were loosened for early entry and are all tunable
+(pass-1 history: §0c records these restored to 8000 / 3 / 8 / 0.10 / 50, which
+is what `signals.py` defaults to today):
 `SIG_MIN_AGE_MINUTES=1`, `SIG_MIN_LIQUIDITY_USD=4000`, `SIG_MIN_TXNS_5M=5`,
 `SIG_MAX_AVG_TRADE_LIQ=0.25` (whale-dominated pools allowed), `SIG_MIN_HOLDERS=10`.
 
@@ -559,9 +569,13 @@ routing). This is the main "quote" improvement left.
    (names, symbols, tx hashes, signal notes) before `ParseMode.HTML`.
 6. ✅ **`test_telegram.py` imports `telebot`.** Rewritten on python-telegram-bot,
    which is already in `requirements.txt`.
-7. ⚠️ **`.env` contains unused keys**: `SCANNER_API_KEY`, `AUTO_BUY_ENABLED`,
-   `AUTO_BUY_AMOUNT`, `AUTO_BUY_MIN_SCORE`. `AUTO_BUY_*` in particular implies an
-   auto-buy feature that does not exist. Still dead config — remove or implement.
+7. ⚠️ **`.env` contained unused keys**: `AUTO_BUY_ENABLED`, `AUTO_BUY_AMOUNT`,
+   `AUTO_BUY_MIN_SCORE`. `AUTO_BUY_*` in particular implies an
+   auto-buy feature that does not exist. Still dead config — remove or implement
+   (all three have since been deleted from the live `.env`). `SCANNER_API_KEY`,
+   listed here at the time, is *not* dead: `bot.py` reads it as the Etherscan-key
+   alias (pass 3, row 3.3), the live `.env` sets only that name, and removing it
+   would silently disable contract verification.
 
 ---
 
@@ -618,8 +632,11 @@ line and the contributing reasons, and rejected tokens are logged as
 `Signal reject SYMBOL@chain: reason` under `VERBOSE_LOGGING`.
 
 **Important:** `USE_SIGNALS` *adds* `bonus − penalty` to the existing 0–100 score.
-Until you backtest (see §5.2), keep `MIN_SCORE` where it is and treat the signal
-line as an explanation, not as a calibrated probability.
+*(Pass-2 wording, superseded by pass 3: the gate is now `total_score` alone, and
+at the default `SIGNAL_BONUS_WEIGHT=0.0` the bonus term adds nothing — the
+signal line can only subtract until you raise the weight.)* Until you backtest
+(see §5.2), keep `MIN_SCORE` where it is and treat the signal line as an
+explanation, not as a calibrated probability.
 
 ---
 

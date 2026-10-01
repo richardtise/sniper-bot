@@ -50,8 +50,10 @@ Set these in `.env`. Everything else can keep its documented default.
 # ── The gate you asked for ───────────────────────────────────────────────────
 SCORE_NORMALIZE=true
 MIN_SCORE=50
+# Conditional on this profile's MIN_SCORE=50; README recommends 45 when
+# MIN_SCORE=65 (the pairing is what makes the floor mean the same bar).
 MIN_EFFECTIVE_SCORE=30
-ROBINHOOD_MIN_SCORE=50          # must be set, or it silently overrides MIN_SCORE
+ROBINHOOD_MIN_SCORE=50          # only needed when Robinhood should differ from MIN_SCORE
 PAPER_TRADING=true              # until you have watched a full day of alerts
 
 # ── Strategy: volume surge over a volume-ranked universe ────────────────────
@@ -67,6 +69,10 @@ SIG_SURGE_MIN_BUY_RATIO=0.55
 # ── Discovery: BOTH sources (union, not either/or) ───────────────────────────
 USE_GECKOTERMINAL=true
 GT_SOURCES=top_volume,trending      # volume universe, re-scanned each cycle
+# Seeding: a pool the bot never evaluated cannot trip the surge lane (README →
+# "Seeding the universe"). Takes effect once new_pools is in GT_SOURCES above:
+# it then records baselines and the watchlist entry, never a score or an alert.
+SEED_ONLY_SOURCES=new_pools
 GT_PAGES_NEW=1
 GT_PAGES_TRENDING=1
 SIG_MAX_AGE_MINUTES=0           # age is not a quality signal
@@ -108,8 +114,8 @@ NEAR_MISS_POINTS=15
 # ── Watchlist for pools that go quiet and re-ignite ─────────────────────────
 WATCHLIST_ENABLED=true
 
-# ── Venues ──────────────────────────────────────────────────────────────────
-REQUIRE_TRADEABLE_VENUE=false   # false = still alert, but say there is no route
+# ── Alerts: one message per token (README → "One alert per token") ───────────
+RE_ALERTS=false               # true restores repeat alerts; see the trade-offs
 ```
 
 ### Two settings that are genuine trade-offs, not defaults
@@ -152,7 +158,7 @@ security lookups. Per block, measured:
 | security | 10 | n/a | n/a | n/a | **non-discriminating**: every survivor passes it |
 | CEX listings | 5 | n/a | n/a | n/a | late signal, and unreachable on Robinhood |
 
-The headline: **the 15 price points alone rank as well as all 45 testable points
+The headline: **the 15 price points alone rank as well as all 35 testable points
 combined** (0.565 vs 0.568 at ≥10%), and *better* on the moves that matter
 (0.558 vs 0.463 at ≥25%/1h; 0.518 vs 0.480 at ≥25%/6h). The 30 volume-ratio
 points are buying essentially nothing.
