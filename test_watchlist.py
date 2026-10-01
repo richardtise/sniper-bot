@@ -23,6 +23,37 @@ os.environ.setdefault("WALLET_PRIVATE_KEY", "")
 import bot  # noqa: E402
 
 
+def _code_default(name, env_keys=()):
+    """The value bot.py's own top-level assignment produces without ``env_keys``.
+
+    ``bot.<NAME>`` is whatever the operator's ``.env`` configured, so a test
+    claiming to pin "the default" has to re-read the source: the single
+    assignment statement is re-executed in a copy of the module globals rather
+    than ``importlib.reload(bot)``, which would re-run every module-level side
+    effect for the rest of the suite.
+    """
+    import ast
+
+    with open(bot.__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            continue
+        segment = ast.get_source_segment(src, node)
+        saved = {k: os.environ.pop(k, None) for k in env_keys}
+        try:
+            namespace = dict(vars(bot))          # a copy: bot itself is untouched
+            exec(compile(segment, bot.__file__, "exec"), namespace)
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+        return namespace[name]
+    raise AssertionError(f"no top-level assignment to {name} in {bot.__file__}")
+
+
 class WatchlistTestBase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -297,10 +328,6 @@ class TestWatchlistEndToEnd(WatchlistTestBase):
         self.assertEqual(result["token_address"], "0xboar")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStandingUniverse(WatchlistTestBase):
     """Batching is what makes a standing universe affordable.
 
@@ -332,13 +359,20 @@ class TestStandingUniverse(WatchlistTestBase):
 
         saved = bot.fetch_json
         bot.fetch_json = fake_fetch
+        # The base class caps the standing universe at 40; lift it so all 65
+        # due entries are visible and the batching itself is what is measured.
+        bot.WATCHLIST_MAX = 300
         try:
             asyncio.run(bot.collect_watchlist_pairs(None))
         finally:
             bot.fetch_json = saved
-        # 65 pools must cost 3 calls, not 65.
-        self.assertLessEqual(len(calls), 3)
+        # 65 pools must cost exactly 3 calls, not 65 and not 1.
+        self.assertEqual(len(calls), 3)
         self.assertTrue(all("/tokens/v1/" in u for u in calls), calls[:2])
+        # ...and the three calls are the 30 / 30 / 5 split, not any other
+        # division (a test that only allowed "up to 3" also passed on 1 or 2).
+        self.assertEqual([len(u.rsplit("/", 1)[1].split(",")) for u in calls],
+                         [30, 30, 5])
 
     def test_deepest_pool_wins_for_a_multi_pool_token(self):
         import asyncio
@@ -379,8 +413,30 @@ class TestStandingUniverse(WatchlistTestBase):
         self.assertEqual(pairs, [])
 
     def test_code_defaults_remember_everything(self):
-        """A pool scoring 0 today is the one that can surge tomorrow."""
-        import inspect
-        src = inspect.getsource(bot)
-        self.assertIn('WATCHLIST_MIN_BEST_SCORE", "0"', src)
-        self.assertIn('WATCHLIST_MAX", "300"', src)
+        """A pool scoring 0 today is the one that can surge tomorrow.
+
+        The defaults come from re-running bot.py's own assignments with the
+        operator's ``.env`` removed — reading the source for a literal string
+        (the previous version) proved only that the string was there — and are
+        then exercised: at the code default, a pool that scored nothing is
+        remembered *and* still due for a re-check.
+        """
+        default_min = _code_default("WATCHLIST_MIN_BEST_SCORE",
+                                    env_keys=("WATCHLIST_MIN_BEST_SCORE",))
+        default_max = _code_default("WATCHLIST_MAX", env_keys=("WATCHLIST_MAX",))
+        self.assertEqual(default_min, 0.0,
+                         "the code default must not filter out weak pools")
+        self.assertEqual(default_max, 300)
+
+        # Behaviour: with the code defaults in force, a zero-score pool is
+        # remembered and comes back around (the base class pins 25.0 here).
+        bot.WATCHLIST_MIN_BEST_SCORE = default_min
+        bot.WATCHLIST_MAX = default_max
+        self.note(token="0xcold", hand=0.0)
+        due = bot.db_watchlist_due()
+        self.assertEqual([d["token_address"] for d in due], ["0xcold"],
+                         "a pool that scored 0 must still be re-checked")
+
+
+if __name__ == "__main__":
+    unittest.main()

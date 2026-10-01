@@ -21,7 +21,7 @@ Quick wiring (see REVIEW.md for the full diff)::
     HISTORY.observe(pair, security=security, gt=gt_meta)
     if verdict.rejected:
         return None
-    total_score = legacy_score + verdict.bonus - verdict.penalty
+    total_score = legacy_score + verdict.bonus * SIGNAL_BONUS_WEIGHT - verdict.penalty
 
 Design notes
 ------------
@@ -39,6 +39,7 @@ Design notes
 
 from __future__ import annotations
 
+import logging
 import os
 import statistics
 import time
@@ -205,6 +206,23 @@ _CHAIN_ENV_PREFIX = {
 }
 
 
+_env_warned: set = set()
+
+
+def _warn_bad_env(env_key: str, raw: Any, error: Exception) -> None:
+    """Report an unparseable SIG_* value once per key.
+
+    ``with_chain_overrides`` runs for every candidate, so without the guard a
+    single typo would print a warning per token per cycle.
+    """
+    if env_key in _env_warned:
+        return
+    _env_warned.add(env_key)
+    logging.getLogger("signals").warning(
+        f"Ignoring invalid {env_key}={raw!r} ({error}) — keeping the default"
+    )
+
+
 @dataclass
 class Filters:
     """All tunable thresholds. Override with ``Filters.from_env()``."""
@@ -330,15 +348,21 @@ class Filters:
 
     @classmethod
     def from_env(cls) -> "Filters":
-        """Read ``SIG_*`` env overrides; anything unset keeps its default."""
+        """Read ``SIG_*`` env overrides; anything unset keeps its default.
+
+        A value that does not parse keeps the default **and is reported once** —
+        ``SIG_MIN_TXNS_5M=abc`` used to be swallowed in silence, so an operator
+        who thought they had tightened a gate was in fact running the stock one
+        with no indication anywhere.
+        """
         f = cls()
         for env_key, (attr, caster) in _GLOBAL_ENV_MAPPING.items():
             raw = os.getenv(env_key)
             if raw not in (None, ""):
                 try:
                     setattr(f, attr, caster(raw))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as e:
+                    _warn_bad_env(env_key, raw, e)
         return f
 
     @classmethod
@@ -347,7 +371,9 @@ class Filters:
 
         Per-chain because the early-lane population differs by chain by an order
         of magnitude: measured 2026-09-30 on new_pools page 1-2, the p90
-        liquidity of a birth is ~$5.4k on Robinhood and ~$14.6k on BSC. One
+        liquidity of a birth is ~$5.4k on Robinhood and ~$14.6k on BSC (the
+        shipped floors are 5,700 / 13,600 — joint-quantile, not each cohort's
+        p90). One
         global floor is therefore either spam on one chain or blindness on the
         other. Overrides are read at call time (not import time) so a test or a
         config reload is respected, and ``base`` is never mutated.
@@ -360,8 +386,8 @@ class Filters:
                 continue
             try:
                 setattr(f, attr, caster(raw))
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as e:
+                _warn_bad_env(f"{prefix}_{env_suffix}", raw, e)
         return f
 
 

@@ -134,11 +134,6 @@ class TestPartialWindows(unittest.TestCase):
         self.assertGreater(partial[0]["vol_24h"], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 def _now_iso():
     """A fresh pool timestamp, so age-based cohort filtering is exercised."""
     from datetime import datetime, timezone
@@ -310,7 +305,14 @@ class TestThresholdFitting(unittest.TestCase):
         text = " ".join(self.ft.selection_report(
             [{"chain": "base", "token_address": "0xA"}]))
         self.assertIn("not every pool", text)
-        self.assertIn("not", text.lower())
+        # Independent of that sentence: the report must also state what the
+        # sample *is*, so the caveat can be checked against it — one row, one
+        # distinct token, one chain — and must say the rejects are in there
+        # (i.e. this is not a winners-only sample).
+        self.assertIn("rows=1", text)
+        self.assertIn("distinct tokens=1", text)
+        self.assertIn("'base': 1", text)
+        self.assertIn("rejects are included", text)
 
 
 class TestDexCoverage(unittest.TestCase):
@@ -550,3 +552,7 @@ class TestJointFloorDerivation(unittest.TestCase):
 
     def test_picker_returns_none_when_the_target_is_unreachable(self):
         self.assertIsNone(self.pf.pick_common_quantile(self.rows, target=0.99))
+
+
+if __name__ == "__main__":
+    unittest.main()

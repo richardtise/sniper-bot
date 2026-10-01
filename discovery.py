@@ -3,14 +3,16 @@ discovery.py — candidate pair discovery for the sniper bot.
 
 Why this module exists
 ----------------------
-``bot.get_all_pairs()`` starts with::
+``bot.get_all_pairs()`` used to start with (that call is now a last-resort
+fallback, reached only when *both* discovery sources are switched off)::
 
     GET https://api.dexscreener.com/latest/dex/pairs/{chain}?page=0&pageSize=300
 
-That endpoint does not exist — it returns **HTTP 404**, so the only candidates
-the bot ever sees come from ``token-boosts/top/v1`` (paid promotions) and
-``token-profiles/latest/v1`` (paid profiles). In other words the scanner was
-looking at the shill list, which is the opposite of organic runner discovery.
+That endpoint does not exist — it returns **HTTP 404**. When the DexScreener
+endpoint was the *only* discovery path, the candidates therefore came from
+``token-boosts/top/v1`` (paid promotions) and ``token-profiles/latest/v1`` (paid
+profiles): the scanner was looking at the shill list, the opposite of organic
+runner discovery.
 
 This module replaces discovery with **GeckoTerminal** (free, no API key), which
 exposes real pool listings *and* the fields the old code was missing:
@@ -20,6 +22,8 @@ exposes real pool listings *and* the fields the old code was missing:
 * ``pools?sort=h24_volume_usd_desc`` — liquid universe for context
 * unique ``buyers`` / ``sellers`` per window (not just tx counts)
 * ``gt_score`` / ``gt_verified`` / socials / holder distribution via token info
+  (``GeckoTerminal.token_info`` supplies this, but ``evaluate_token`` does not
+  call it yet — the ``gt=`` argument to ``signals.evaluate`` is unwired)
 
 Every function is dependency-injected with a ``fetch`` callable matching
 ``bot.fetch_json(session, url)`` so it reuses the existing aiohttp session,
@@ -318,7 +322,11 @@ class GeckoTerminal:
             return []
         sep = "&" if "?" in fragment else "?"
         path = f"networks/{network}/{fragment}{sep}page={page}&include={include}"
-        payload = await self._get(path)
+        # `kind` must reach _get: without it _ttl_for sees None, falls through to
+        # the blanket cache_ttl_s, and every GT_LIST_TTL_* knob (plus this
+        # module's own per-source defaults) silently does nothing — the split
+        # TTLs were introduced but never wired to the call site.
+        payload = await self._get(path, kind=kind)
         if not isinstance(payload, dict):
             return []
         included = _parse_included(payload)

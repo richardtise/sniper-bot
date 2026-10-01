@@ -17,6 +17,42 @@ os.environ.setdefault("WALLET_PRIVATE_KEY", "")
 import bot  # noqa: E402  (import after env stubs)
 import label_outcomes  # noqa: E402
 
+# Captured at import, before any test mutates it: a later leak of
+# bot.SIGNAL_BONUS_WEIGHT is then detectable instead of invisible.
+_IMPORT_TIME_SIGNAL_BONUS_WEIGHT = bot.SIGNAL_BONUS_WEIGHT
+
+
+def _code_default(name, env_keys=()):
+    """The value bot.py's own top-level assignment produces *without* ``env_keys``.
+
+    ``bot`` is imported once with the operator's ``.env`` already loaded, so
+    ``bot.<NAME>`` reports the deployment's config, not the code default. A test
+    that claims to pin "the default" therefore has to re-read the source: the
+    single assignment statement is re-executed (in a copy of the module globals,
+    with the named keys popped) instead of ``importlib.reload(bot)``, which
+    would re-run every module-level side effect for the rest of the suite.
+    """
+    import ast
+
+    with open(bot.__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            continue
+        segment = ast.get_source_segment(src, node)
+        saved = {k: os.environ.pop(k, None) for k in env_keys}
+        try:
+            namespace = dict(vars(bot))          # a copy: bot itself is untouched
+            exec(compile(segment, bot.__file__, "exec"), namespace)
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+        return namespace[name]
+    raise AssertionError(f"no top-level assignment to {name} in {bot.__file__}")
+
 
 def _insert_feature(conn, **overrides):
     row = bot._empty_feature()
@@ -269,7 +305,25 @@ class TestFilterGates(unittest.IsolatedAsyncioTestCase):
         """SIGNAL_BONUS_WEIGHT defaults to 0.0, so the hand score stays the gate.
 
         This is the pass-2 anti-noise guarantee and it must not regress.
+
+        The default is pinned from bot.py's own assignment, not from
+        ``bot.SIGNAL_BONUS_WEIGHT``: the module attribute is whatever the
+        operator's ``.env`` says (0.5 in this repo), so asserting on it could
+        never notice the code fallback changing to 0.5 — which would make the
+        bonus an unconditional promotion for every unconfigured deployment.
         """
+        self.assertEqual(
+            _code_default("SIGNAL_BONUS_WEIGHT", env_keys=("SIGNAL_BONUS_WEIGHT",)),
+            0.0,
+            "bot.py's fallback must stay 0.0 — a non-zero code default reopens "
+            "the pass-2 flood the 0.0 default exists to prevent",
+        )
+        # The module attribute is still the one imported with this file: no
+        # earlier test may have left its own override behind.
+        self.assertEqual(bot.SIGNAL_BONUS_WEIGHT, _IMPORT_TIME_SIGNAL_BONUS_WEIGHT,
+                         "a previous test leaked a SIGNAL_BONUS_WEIGHT mutation")
+
+        # ...only now apply the override the behavioural half of this test needs.
         self._install_security(self._good_security())
         bot.SIGNAL_BONUS_WEIGHT = 0.0
         bot.ALERT_THRESHOLD = 0
@@ -544,11 +598,6 @@ class TestScoreBreakdownLogging(unittest.IsolatedAsyncioTestCase):
                          "a vetoed token has no hand score; components explain why")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class TestFirstSightLatency(unittest.IsolatedAsyncioTestCase):
     """The log must answer "was it seen early?" independently of the gate.
 
@@ -706,6 +755,32 @@ class TestMarketCapCeiling(unittest.IsolatedAsyncioTestCase):
         result = await bot.evaluate_token(None, self._pair(45_000.0))
         self.assertIsNotNone(result, "a $45k mcap must not hit the ceiling")
 
+    def _pair_with_fdv(self, market_cap, fdv):
+        pair = self._pair(market_cap)
+        pair["fdv"] = fdv
+        return pair
+
+    async def test_ceiling_also_applies_to_fdv(self):
+        """A small circulating cap beside a multi-million FDV must not pass.
+
+        This is the reported case: MAX_MARKET_CAP_USD is set, yet alerts arrive
+        on "tokens in the millions" — because the alert prints `market_cap` and
+        the charts show `fdv`, and the feeds disagree about which one they
+        publish. GeckoTerminal substitutes fdv only when the circulating cap is
+        missing, so $45k circulating next to $5M FDV used to clear the gate.
+        """
+        os.environ["MAX_MARKET_CAP_USD"] = "100000"
+        self.assertIsNone(
+            await bot.evaluate_token(None, self._pair_with_fdv(45_000.0, 5_000_000.0))
+        )
+        self.assertEqual(self.recorder.rows[-1]["reject_reasons"], "fdv_too_high")
+
+    async def test_unknown_fdv_never_triggers_the_fdv_ceiling(self):
+        """fdv absent/0 means 'not published', not 'worthless'."""
+        os.environ["MAX_MARKET_CAP_USD"] = "100000"
+        result = await bot.evaluate_token(None, self._pair(45_000.0))
+        self.assertIsNotNone(result)
+
     async def test_ceiling_disabled_by_default(self):
         os.environ.pop("MAX_MARKET_CAP_USD", None)
         result = await bot.evaluate_token(None, self._pair(2_183_213.0))
@@ -850,7 +925,7 @@ class TestSeedOnlySources(unittest.TestCase):
         self._saved = {
             k: getattr(bot, k) for k in
             ("SEED_ONLY_SOURCES", "USE_SIGNALS", "PAIR_HISTORY", "VOLUME_SURGE_MODE",
-             "ALERT_THRESHOLD", "USE_GECKOTERMINAL")
+             "ALERT_THRESHOLD", "USE_GECKOTERMINAL", "DEXSCREENER_SOURCES")
         }
         self._saved_fns = {
             "get_geckoterminal_pairs": bot.get_geckoterminal_pairs,
@@ -1003,3 +1078,7 @@ class TestSeedOnlySources(unittest.TestCase):
         pair = self._pair("geckoterminal:new_pools")   # not tagged
         asyncio.run(bot.evaluate_token(None, pair))
         self.assertNotEqual(self.recorder.rows[-1]["reject_reasons"], "seed_only")
+
+
+if __name__ == "__main__":
+    unittest.main()

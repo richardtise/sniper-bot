@@ -20,8 +20,6 @@ for name in ("web3", "telegram", "fastapi", "uvicorn", "eth_account"):
             m.HTTPProvider = object
         sys.modules[name] = m
 
-import bot  # noqa: E402
-import signals  # noqa: E402
 
 
 def pair(**over):
@@ -63,27 +61,35 @@ SEC = {
     "creator_percent": 0.0, "source": "goplus",
 }
 
-base = pair()
-cases = {
-    "A  as-lived 18:15  (5m vol $12.5k, liq $392k, chg_5m +8%)":
-        base,
-    "B  real 18:10 pump bar (5m vol $62k, chg_5m +30%)":
-        pair(volume={**base["volume"], "m5": 62000.0},
-             priceChange={**base["priceChange"], "m5": 30.0}),
-    "C  same as A but only $60k of liquidity (thin old pool)":
-        pair(liquidity={"usd": 60000.0}),
-    "D  as-lived but 5m tape flips to sells (chg_5m -40%)":
-        pair(priceChange={**base["priceChange"], "m5": -40.0},
-             txns={**base["txns"], "m5": {"buys": 8, "sells": 40, "buyers": 7, "sellers": 30}}),
-}
 
-print("=== signals.hard_reject_reasons (the veto that logged 'Signal reject') ===")
-for label, p in cases.items():
-    print(f"{label}\n    -> {signals.hard_reject_reasons(p, security=SEC)}")
+def main():
+    import bot  # noqa: F401  — importing these connects the RPCs, so
+    import signals  # noqa: F401  they belong behind the script guard
+    base = pair()
+    cases = {
+        "A  as-lived 18:15  (5m vol $12.5k, liq $392k, chg_5m +8%)":
+            base,
+        "B  real 18:10 pump bar (5m vol $62k, chg_5m +30%)":
+            pair(volume={**base["volume"], "m5": 62000.0},
+                 priceChange={**base["priceChange"], "m5": 30.0}),
+        "C  same as A but only $60k of liquidity (thin old pool)":
+            pair(liquidity={"usd": 60000.0}),
+        "D  as-lived but 5m tape flips to sells (chg_5m -40%)":
+            pair(priceChange={**base["priceChange"], "m5": -40.0},
+                 txns={**base["txns"], "m5": {"buys": 8, "sells": 40, "buyers": 7, "sellers": 30}}),
+    }
 
-print()
-print("=== what the bar asks for, base chain, SCORE_NORMALIZE=true ===")
-for age in (10, 30, 60, 120, 400):
-    ceil = bot.max_possible_score("base", age)
-    print(f"age {age:>4}m  reachable={ceil:5.1f}/100  threshold={bot.effective_threshold('base', age):5.1f}"
-          f"  (floor MIN_EFFECTIVE_SCORE={os.getenv('MIN_EFFECTIVE_SCORE', '35')})")
+    print("=== signals.hard_reject_reasons (the veto that logged 'Signal reject') ===")
+    for label, p in cases.items():
+        print(f"{label}\n    -> {signals.hard_reject_reasons(p, security=SEC)}")
+
+    print()
+    print("=== what the bar asks for, base chain, SCORE_NORMALIZE=true ===")
+    for age in (10, 30, 60, 120, 400):
+        ceil = bot.max_possible_score("base", age)
+        print(f"age {age:>4}m  reachable={ceil:5.1f}/100  threshold={bot.effective_threshold('base', age):5.1f}"
+              f"  (floor MIN_EFFECTIVE_SCORE={os.getenv('MIN_EFFECTIVE_SCORE', '35')})")
+
+
+if __name__ == "__main__":
+    main()

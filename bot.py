@@ -49,7 +49,53 @@ except ImportError:
     WEB3_AVAILABLE = False
     print("WARNING: web3 not installed. Run: pip install web3")
 
-load_dotenv()
+# Load the .env that sits NEXT TO this file, never "whichever directory the
+# process happened to start in". `load_dotenv()` with no argument resolves
+# relative to the caller's working directory, so `python /path/to/bot.py`, a
+# systemd unit with a different WorkingDirectory, or a container whose WORKDIR
+# is not the repo loads *no* config at all — while every documented default that
+# matters stays at its code value. The visible symptom is exactly the one
+# reported against this repo: "MAX_MARKET_CAP_USD=100000 is in my .env, why do
+# I still get alerted on $5M tokens?" — because that process never read the file.
+# Which file was loaded is logged at startup and served at /health as `env_file`.
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_ENV_FILE):
+    load_dotenv(_ENV_FILE)
+    ENV_FILE_LOADED = _ENV_FILE
+else:
+    # No .env beside the module: keep the historical cwd search so an operator
+    # who deliberately runs with the config elsewhere still gets it.
+    load_dotenv()
+    try:
+        from dotenv import find_dotenv
+        ENV_FILE_LOADED = find_dotenv() or "(no .env found)"
+    except Exception:
+        ENV_FILE_LOADED = "(no .env found)"
+
+
+def _env_float(key: str, default: float) -> float:
+    """Parse an env float, warn-and-default on anything unparseable.
+
+    ``float(os.getenv(...))`` has three failure modes in this codebase, all of
+    them bad: raised *per candidate* (``MIN_EFFECTIVE_SCORE``, ``MAX_MARKET_CAP_USD``,
+    ``NEAR_MISS_POINTS``) where ``dispatch_alerts`` dropped the exception and the
+    bot silently sent zero alerts for as long as the value stayed broken; raised
+    *at import* (``RE_ALERT_COOLDOWN_HOURS``, ``MAX_ALLOWED_TAX``, ``WATCHLIST_*``)
+    where the process exits before it can explain itself; and raised *per cycle*
+    (``GT_PAGES_*``) where it crash-looped the whole scan. One helper, one
+    behaviour: log the offending key and use the default. Defined this early
+    because import-time constants call it too.
+    """
+    raw = os.getenv(key, "")
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        return float(str(raw).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        logging.getLogger("pump_bot_v5").warning(
+            f"Ignoring invalid {key}={raw!r} — using {default}"
+        )
+        return float(default)
 
 try:
     import signals
@@ -74,7 +120,7 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
-MAX_ALLOWED_TAX = float(os.getenv("MAX_ALLOWED_TAX", "0"))
+MAX_ALLOWED_TAX = _env_float("MAX_ALLOWED_TAX", 0.0)
 VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 
 ALERT_THRESHOLD = int(os.getenv("MIN_SCORE", os.getenv("ALERT_THRESHOLD", "65")))
@@ -144,9 +190,10 @@ ALLOWED_USER_IDS = {
 #
 # This lane remembers pools the bot has already seen and re-prices the promising
 # ones on a timer, so a pool that re-ignites after going quiet gets scored even
-# though no feed is listing it. Re-checks go through DexScreener's single-pair
-# endpoint, which is a *different* provider from GeckoTerminal and therefore does
-# not consume the shared GT budget that discovery and holder lookups compete for.
+# though no feed is listing it. Re-checks go through DexScreener's batched
+# /tokens/v1/{chain}/{a,b,c} endpoint (30 addresses per call, ~10 calls for a
+# 300-pool universe), a *different* provider from GeckoTerminal, so they do not
+# consume the shared GT budget that discovery and holder lookups compete for.
 #
 # Default OFF, like the other lanes. When enabling, watch the noise: a re-check
 # carries no unique-buyer data (DexScreener has none), so the AND-gates in
@@ -160,6 +207,9 @@ WATCHLIST_RECHECK_MINUTES = float(os.getenv("WATCHLIST_RECHECK_MINUTES", "10"))
 # point is to be watching a pool BEFORE its volume spikes, and a pool that
 # scores 0 today is exactly the one that can surge tomorrow.
 WATCHLIST_MIN_BEST_SCORE = float(os.getenv("WATCHLIST_MIN_BEST_SCORE", "0"))
+
+# CoingGecko ticker cache lifetime: the read side and the pruner must agree.
+TICKER_TTL = 3600
 
 # Feature logging for offline model training (see FeatureLogger below).
 # Default OFF so a long-running bot cannot silently fill the disk.
@@ -176,8 +226,9 @@ PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT", "1.0"))  # modelled fee per sid
 SECURITY_TTL = 1800
 SECURITY_FAIL_TTL = 120
 
-# Holder concentration rarely changes scan-to-scan, so it caches longer than
-# security. Applies to every provider (GeckoTerminal, Moralis, Blockscout).
+# Holder concentration rarely changes scan-to-scan, so this cache is long —
+# though shorter than SECURITY_TTL (1800), which is the one that must survive a
+# provider outage. Applies to every provider (GeckoTerminal, Moralis, Blockscout).
 HOLDER_TTL = 600
 
 # Whether to accept a honeypot.is record when GoPlus has no data for a token.
@@ -190,7 +241,7 @@ ALLOW_SECURITY_FALLBACK = os.getenv("ALLOW_SECURITY_FALLBACK", "false").lower() 
 # signal engine can only REMOVE candidates (hard rejects + penalties); it can
 # never promote a sub-threshold token into an alert. The hand-tuned score stays
 # the gate, exactly as in the original bot.
-SIGNAL_BONUS_WEIGHT = min(1.0, max(0.0, float(os.getenv("SIGNAL_BONUS_WEIGHT", "0.0"))))
+SIGNAL_BONUS_WEIGHT = min(1.0, max(0.0, _env_float("SIGNAL_BONUS_WEIGHT", 0.0)))
 
 # ── Configuration self-audit ─────────────────────────────────────────────────
 # Nearly everything here is deliberately opt-in, so the code defaults are "off".
@@ -205,7 +256,7 @@ SIGNAL_BONUS_WEIGHT = min(1.0, max(0.0, float(os.getenv("SIGNAL_BONUS_WEIGHT", "
 def config_warnings() -> list:
     """Settings left at a default that silently degrades this bot."""
     warns = []
-    ceiling = float(os.getenv("MAX_MARKET_CAP_USD", "0") or 0)
+    ceiling = _env_float("MAX_MARKET_CAP_USD", 0.0)
     if ceiling <= 0:
         warns.append(
             "MAX_MARKET_CAP_USD=0 -> NO alert ceiling. It will alert on tokens that "
@@ -218,9 +269,12 @@ def config_warnings() -> list:
         )
     if not USE_GECKOTERMINAL:
         warns.append(
-            "USE_GECKOTERMINAL=false -> discovery is the DexScreener boost/profile "
-            "list only, which cannot see a pool while it is minutes old. This is the "
-            "main cause of 'it pinged me at $3M instead of $300k'."
+            "USE_GECKOTERMINAL=false -> GeckoTerminal is off, so discovery is only "
+            "as good as DEXSCREENER_SOURCES (boost/profile list: median ~24h old, "
+            "never a pool while it is minutes old). If that is empty too, the only "
+            "fallback left is DexScreener's dead /latest/dex/pairs endpoint -> NO "
+            "candidates at all. Either way this is the main cause of 'it pinged me "
+            "at $3M instead of $300k' — or of a bot that never pings."
         )
     if not EARLY_RUNNER_MODE:
         warns.append(
@@ -250,7 +304,38 @@ def config_notes() -> list:
         )
     if PAPER_TRADING:
         notes.append("PAPER_TRADING=true -> no real orders will be placed.")
+    if RE_ALERTS_ENABLED:
+        notes.append(
+            "RE_ALERTS=true -> tokens already reported to you CAN be reported "
+            "again (after RE_ALERT_COOLDOWN_HOURS, or earlier once the score "
+            "gains RE_ALERT_MIN_IMPROVEMENT points). RE_ALERTS=false sends one "
+            "message per token."
+        )
     return notes
+
+
+def effective_mcap_ceilings() -> Dict[str, float]:
+    """The alert ceiling each chain is actually gated on, read fresh from env.
+
+    Exposed at startup and in ``/health`` because the ceiling is the setting
+    whose absence is least obvious from the outside: ``MAX_MARKET_CAP_USD``
+    missing (or the process not having read the ``.env`` that sets it) means
+    ``0`` = *no ceiling at all*, and the only symptom is alerts on tokens that
+    already ran. This makes the running value inspectable instead of inferred.
+    """
+    default = _env_float("MAX_MARKET_CAP_USD", 0.0)
+    return {chain: _chain_floor(chain, "MAX_MARKET_CAP_USD", default) for chain in NETWORKS}
+
+
+def _fmt_ceilings(ceilings: Dict[str, float]) -> str:
+    values = set(ceilings.values())
+    if len(values) == 1:
+        value = values.pop()
+        return "⚠️ NONE (0)" if value <= 0 else f"${value:,.0f}"
+    return ", ".join(
+        f"{chain.upper()} {'off' if value <= 0 else f'${value:,.0f}'}"
+        for chain, value in ceilings.items()
+    )
 
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -380,7 +465,14 @@ def get_gt_sources(chain: str) -> tuple:
         raw = os.getenv(key, "").strip()
         if raw:
             return tuple(s.strip() for s in raw.split(",") if s.strip())
-    raw = os.getenv("GT_SOURCES", "new_pools,trending,top_volume")
+    # A present-but-blank key must not mean "no GeckoTerminal at all": dotenv
+    # yields "" for `GT_SOURCES=`, and the per-chain branch above only falls
+    # through when *its* key is blank, so one stray empty line blinded every
+    # chain while GT_SOURCES still looked configured. To actually switch the
+    # source off, use USE_GECKOTERMINAL=false.
+    raw = os.getenv("GT_SOURCES", "") or ""
+    if not raw.strip():
+        raw = "new_pools,trending,top_volume"
     return tuple(s.strip() for s in raw.split(",") if s.strip())
 
 # Runtime resolvers — env vars read fresh every time (fixes import-time caching)
@@ -445,7 +537,7 @@ REQUIRE_TRADEABLE_VENUE = os.getenv("REQUIRE_TRADEABLE_VENUE", "false").lower() 
 
 
 def get_tradeable_dex_patterns(chain: str):
-    """Override patterns for one chain, via TRADEABLE_DEXES_<CHAIN> or global."""
+    """Override patterns for one chain, via <CHAIN>_TRADEABLE_DEXES or global."""
     raw = (
         os.getenv(_env_key(chain, "TRADEABLE_DEXES"), "").strip()
         or os.getenv("TRADEABLE_DEXES", "").strip()
@@ -528,7 +620,6 @@ def dex_is_supported(chain: str, dex_id) -> Optional[bool]:
 
 
 NATIVE_SYMBOL = {"ethereum": "ETH", "bsc": "BNB", "base": "ETH", "robinhood": "ETH"}
-NATIVE_DECIMALS = {"ethereum": 18, "bsc": 18, "base": 18, "robinhood": 18}
 
 V3_FEE_TIERS_BY_CHAIN = {
     "ethereum": [100, 500, 3000, 10000],
@@ -547,7 +638,7 @@ V2_HOP_STABLES = {
     "robinhood": [],
 }
 
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = max(5, int(_env_float("SCAN_INTERVAL", 30.0)))  # seconds between cycles
 HEARTBEAT_INTERVAL = 3600
 POSITION_CHECK_INTERVAL = 30
 
@@ -567,8 +658,22 @@ SECURITY_PTS = 10; CEX_LISTING_PTS = 3; CEX_PERPS_PTS = 2
 PENALTY_SELL_PRESSURE_5M = 15; PENALTY_SELL_PRESSURE_1H = 10
 PENALTY_LOW_TX_5M = 8; PENALTY_LOW_TX_1H = 4; PENALTY_UNVERIFIED_CONTRACT = 8
 
-RE_ALERT_COOLDOWN_HOURS = 4
-SCORE_IMPROVEMENT_THRESHOLD = 12
+# ── Re-alert policy ──────────────────────────────────────────────────────────
+# OFF by default: a (chain, token) pair is alerted ONCE, for the lifetime of the
+# alerts table. Duplicate messages were the complaint this replaced — the old
+# policy re-alerted after 4 hours unconditionally, and *within* those 4 hours
+# whenever the score had climbed 12 points, and scores bounce by more than that
+# between scans (windows roll, holder data arrives late, the bar itself is
+# normalised), so one token could ping repeatedly while it stayed in the feeds.
+#
+# RE_ALERTS=true restores that policy, with both thresholds now tunable instead
+# of hard-coded:
+#   RE_ALERT_COOLDOWN_HOURS  silent period after an alert (default 4)
+#   RE_ALERT_MIN_IMPROVEMENT points the score must gain to beat the cooldown
+#                            early (default 12; 0 = never beat it early)
+RE_ALERTS_ENABLED = os.getenv("RE_ALERTS", "false").lower() == "true"
+RE_ALERT_COOLDOWN_HOURS = _env_float("RE_ALERT_COOLDOWN_HOURS", 4.0)
+SCORE_IMPROVEMENT_THRESHOLD = _env_float("RE_ALERT_MIN_IMPROVEMENT", 12.0)
 MAX_RETRIES = 2; API_TIMEOUT = 10; CONCURRENT_API_LIMIT = 15
 COINGECKO_CALLS_PER_MINUTE = 25 if COINGECKO_API_KEY else 10
 PHASE1_MIN_SCORE = 20
@@ -643,7 +748,8 @@ def _spawn_handler(coro):
     task.add_done_callback(_done)
     return task
 
-# Signal engine state (only populated when USE_SIGNALS=true).
+# Signal engine state: built whenever signals.py imports; whether it is USED is
+# USE_SIGNALS (import-time), re-checked at each gate that depends on it.
 SIGNAL_FILTERS = signals.Filters.from_env() if SIGNALS_AVAILABLE else None
 
 
@@ -716,6 +822,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("pump_bot_v5")
+logger.info(f"Config file: {ENV_FILE_LOADED}")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 api_semaphore = asyncio.Semaphore(CONCURRENT_API_LIMIT)
@@ -805,6 +912,12 @@ else:
 total_pairs_scanned = 0
 tokens_evaluated = 0
 alerts_sent = 0
+# (chain, token) pairs this process has already pushed, lowercase. The alerts
+# table is the durable dedupe state; this is the fallback for the case where its
+# upsert failed (logged, swallowed) — without it a single failed write turns
+# into "the same token every cycle" for the rest of the run. Bounded by the
+# number of distinct alerts the bot can send, so it never needs pruning.
+ALERTED_THIS_RUN: set = set()
 # Reasons a candidate never reached the user, counted so "the bot is quiet" is
 # diagnosable from /health instead of inferred from a log file.
 security_unknown_rejects = 0
@@ -988,19 +1101,31 @@ class FeatureLogger:
                     continue
                 if item[0] == "stop":
                     break
-                self._apply(conn, *item)
-                # Opportunistically drain a batch before paying the commit cost.
-                for _ in range(199):
+                try:
+                    self._apply(conn, *item)
+                    # Opportunistically drain a batch before paying the commit cost.
+                    for _ in range(199):
+                        try:
+                            nxt = self._q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if nxt[0] == "stop":
+                            item = nxt
+                            break
+                        self._apply(conn, *nxt)
+                    conn.commit()
+                    self.written += 1
+                except Exception as e:
+                    # One malformed row or one locked commit must not kill the
+                    # writer for the rest of the run: the thread never restarts,
+                    # the 20k queue then fills, and every later training row is
+                    # dropped with nothing but a counter to show for it.
+                    self.dropped += 1
+                    logger.error(f"Feature write failed (writer continues): {e}")
                     try:
-                        nxt = self._q.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt[0] == "stop":
-                        item = nxt
-                        break
-                    self._apply(conn, *nxt)
-                conn.commit()
-                self.written += 1
+                        conn.rollback()
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Feature writer stopped: {e}")
         finally:
@@ -1036,6 +1161,90 @@ FEATURE_LOGGER = FeatureLogger(FEATURE_DB_PATH or DB_PATH, LOG_FEATURES)
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _migrate_alerts_dedupe_key(conn: sqlite3.Connection):
+    """Make (chain, token_address) a key that actually dedupes.
+
+    Two failure modes produced "the same token alerted me again":
+
+    1. **Case.** The key was compared byte-for-byte while feeds hand over the
+       same address checksummed and lowercase. Two spellings, two rows, and the
+       second alert behaved as if the first had never happened.
+    2. **No unique constraint.** ``db_record_alert`` upserts with
+       ``ON CONFLICT(chain, token_address)``. On a table created without that
+       UNIQUE clause the statement is rejected, the rejection is caught and
+       logged as a warning, and *no dedupe state is ever written* — so the same
+       token re-alerted every single cycle while looking like a config problem.
+
+    Lower-case everything, collapse to the newest row per key, then make sure
+    the unique index exists. All steps are cheap and idempotent.
+
+    **Order matters.** The collapse must group on ``LOWER(...)`` *before* the
+    lower-casing UPDATE: on a table that already has ``UNIQUE(chain,
+    token_address)`` — which every schema here has — the UPDATE would collide
+    with its own twin ('0xAbC' vs '0xabc' are distinct under BINARY collation),
+    abort the statement, and leave both rows exactly as they were. Each step
+    therefore runs in its own try: a failure in one must not silently skip the
+    others.
+    """
+    try:
+        conn.execute(
+            "DELETE FROM alerts WHERE id NOT IN ("
+            "SELECT MAX(id) FROM alerts GROUP BY LOWER(chain), LOWER(token_address))"
+        )
+        conn.execute(
+            "UPDATE alerts SET chain = LOWER(chain), token_address = LOWER(token_address)"
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.warning(f"alerts case-collapse failed: {e}")
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_chain_token "
+            "ON alerts(chain, token_address)"
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.warning(f"alerts dedupe index failed: {e}")
+    _migrate_address_case(conn)
+
+
+def _migrate_address_case(conn: sqlite3.Connection):
+    """Lower-case stored token addresses in the tables keyed by them.
+
+    ``evaluate_token`` now lower-cases on write, so without this an existing
+    deployment keeps two identities for one contract: duplicate watchlist rows
+    (the table's primary key is exact-match, so the same token would be
+    re-checked twice and its ``evals``/``best_hand`` split), and feature rows
+    that no longer join to each other — which breaks the per-token forward-price
+    series ``label_outcomes.py`` builds. The ``alerts`` table is handled by
+    ``_migrate_alerts_dedupe_key`` (it needs the collapse first).
+
+    ``features`` has no unique constraint on (chain, token_address), so a plain
+    UPDATE cannot collide and cannot drop rows — important, because those rows
+    *are* the training series and deleting duplicates would delete history.
+    """
+    try:
+        conn.execute(
+            "UPDATE features SET chain = LOWER(chain), token_address = LOWER(token_address)"
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.warning(f"features address-case migration failed: {e}")
+    try:
+        # watchlist has a composite primary key, so collapse before lowering
+        # (same collision rule as alerts), keeping the most recently written row.
+        conn.execute(
+            "DELETE FROM watchlist WHERE rowid NOT IN ("
+            "SELECT MAX(rowid) FROM watchlist GROUP BY LOWER(chain), LOWER(token_address))"
+        )
+        conn.execute(
+            "UPDATE watchlist SET chain = LOWER(chain), token_address = LOWER(token_address)"
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.warning(f"watchlist address-case migration failed: {e}")
+
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -1088,6 +1297,7 @@ def init_db() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_features_token ON features(chain, token_address);"
         "CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_epoch);"
     )
+    _migrate_alerts_dedupe_key(conn)
     defaults = {
         "slippage": str(DEFAULT_SLIPPAGE),
         "trailing_stop": str(DEFAULT_TRAILING_STOP),
@@ -1134,9 +1344,14 @@ def db_set_setting(key: str, value: str):
     db_conn.commit()
 
 def db_get_last_alert(chain, token_address):
+    # Normalised on both sides: the dedupe key is (chain, token) and an address
+    # that arrives checksummed from one feed and lowercase from another is the
+    # SAME token — keying on the raw string silently created two rows and the
+    # second one alerted as if the first had never happened.
     cur = db_conn.execute(
-        "SELECT total_score, alert_time FROM alerts WHERE chain=? AND token_address=?",
-        (chain, token_address)
+        "SELECT total_score, alert_time FROM alerts "
+        "WHERE chain = ? AND token_address = ? COLLATE NOCASE",
+        (str(chain).lower(), str(token_address).lower())
     )
     row = cur.fetchone()
     return {"total_score": row[0], "alert_time": row[1]} if row else None
@@ -1147,11 +1362,13 @@ def db_record_alert(chain, token_address, symbol, score):
             "INSERT INTO alerts (chain, token_address, symbol, total_score, alert_time) "
             "VALUES (?,?,?,?,?) ON CONFLICT(chain, token_address) DO UPDATE SET "
             "total_score=excluded.total_score, alert_time=excluded.alert_time, symbol=excluded.symbol",
-            (chain, token_address, symbol, score, time.time())
+            (str(chain).lower(), str(token_address).lower(), symbol, score, time.time())
         )
         db_conn.commit()
+        return True
     except Exception as e:
         logger.warning(f"DB alert upsert failed: {e}")
+        return False
 
 
 # ── watchlist persistence ────────────────────────────────────────────────────
@@ -1352,11 +1569,14 @@ def _first_sight_note(chain, token, symbol, pair, *, liquidity, market_cap, age_
 
 def prune_caches():
     now = time.time()
-    for cache, ttl in [(security_cache, 1800), (coingecko_ticker_cache, 7200)]:
+    # TTLs must match the READ side (SECURITY_TTL, TICKER_TTL, HOLDER_TTL) or
+    # the prune keeps entries the lookups already ignore — pure memory waste
+    # that a long run only reveals as a slowly growing dict.
+    for cache, ttl in [(security_cache, SECURITY_TTL), (coingecko_ticker_cache, TICKER_TTL)]:
         stale = [k for k, (_, ts) in cache.items() if now - ts > ttl]
         for k in stale:
             del cache[k]
-    stale = [k for k, (_, ts) in holder_cache.items() if now - ts > 3600]
+    stale = [k for k, (_, ts) in holder_cache.items() if now - ts > HOLDER_TTL]
     for k in stale:
         del holder_cache[k]
     stale = [k for k, rec in _first_sight.items()
@@ -1560,11 +1780,12 @@ _gt_client = None
 
 # ── Shared GeckoTerminal budget ──────────────────────────────────────────────
 # GT's free tier allows roughly 30 calls/minute and answers a burst with 429.
-# Discovery (discovery.py) throttles itself, but the token-info calls for holder
-# concentration go through fetch_json directly, so without a *shared* limiter the
+# The discovery client is built with min_interval_s=0.0 (the limiter below is
+# what paces it), and the token-info calls for holder concentration go through
+# fetch_json directly, so without a *shared* limiter the
 # two paths would each believe they owned the whole budget and collectively blow
 # it. One process-wide limiter therefore covers both.
-GT_MIN_INTERVAL = float(os.getenv("GT_MIN_INTERVAL_S", "2.1"))  # ~28 calls/min
+GT_MIN_INTERVAL = _env_float("GT_MIN_INTERVAL_S", 2.1)  # ~28 calls/min
 _gt_throttle_lock: Optional[asyncio.Lock] = None
 _gt_throttle_loop = None
 _gt_last_call = 0.0
@@ -1596,30 +1817,84 @@ async def gt_fetch_json(session, url, **kwargs):
     return await fetch_json(session, url, **kwargs)
 
 
+# Legacy env spellings kept as aliases so existing .env files keep working
+# (GT_PAGES_NEW -> new_pools, GT_PAGES_TOP -> top_volume, and the TTL trio).
+_GT_PAGES_LEGACY = {
+    "new_pools": "GT_PAGES_NEW",
+    "trending": "GT_PAGES_TRENDING",
+    "top_volume": "GT_PAGES_TOP",
+}
+_GT_TTL_LEGACY = {
+    "new_pools": "GT_LIST_TTL_NEW",
+    "trending": "GT_LIST_TTL_TRENDING",
+    "top_volume": "GT_LIST_TTL_TOP",
+}
+_GT_PAGE_DEFAULTS = {"new_pools": 1, "trending": 2, "top_volume": 1}
+
+
+def _gt_env_value(kind: str, prefix: str, legacy: Dict[str, str], default: float) -> float:
+    """First non-blank of ``<PREFIX>_<KIND>`` then the legacy name, else default.
+
+    A blank value counts as unset — otherwise a `GT_PAGES_TOP=` line silently
+    turns into a parse of "" and, worse, hides that the default is in force.
+    """
+    for name in (f"{prefix}_{kind.upper()}", legacy.get(kind, "")):
+        if not name:
+            continue
+        raw = os.getenv(name, "")
+        if raw is not None and str(raw).strip():
+            return _env_float(name, default)
+    return float(default)
+
+
+def _gt_source_pages() -> Dict[str, int]:
+    """Pages per source for EVERY source the feeds define.
+
+    Only three literal names used to be bound (bot.py's old inline dict), so
+    the sources the shipped profile actually runs — `trending_5m` and
+    `top_txns` — were hard-capped at one page while `GT_PAGES_TRENDING` and
+    `GT_PAGES_NEW` sat in `.env` doing nothing for them. Depth is now tunable
+    for every kind, and a typo still falls back to the default rather than
+    raising mid-cycle.
+    """
+    return {
+        kind: max(1, int(_gt_env_value(
+            kind, "GT_PAGES", _GT_PAGES_LEGACY, _GT_PAGE_DEFAULTS.get(kind, 1)
+        )))
+        for kind in discovery.GT_ENDPOINTS
+    }
+
+
+def _gt_source_ttls() -> Dict[str, float]:
+    """List-cache TTL (s) per source; defaults come from discovery.DEFAULT_LIST_TTLS."""
+    return {
+        kind: max(5.0, _gt_env_value(
+            kind, "GT_LIST_TTL", _GT_TTL_LEGACY,
+            discovery.DEFAULT_LIST_TTLS.get(kind, 90.0)
+        ))
+        for kind in discovery.GT_ENDPOINTS
+    }
+
+
 async def get_geckoterminal_pairs(session, network):
     """Candidate discovery via GeckoTerminal (see discovery.py).
 
     Replaces the DexScreener `latest/dex/pairs/{chain}` call, which 404s and
     silently left the scanner with only paid boost/profile tokens.
 
-    Depth is tunable per deployment and per source: GT_PAGES_NEW (default 1),
-    GT_PAGES_TRENDING (2), GT_PAGES_TOP (1). Page 1 of new_pools is the newest
-    birth cohort — that freshness is the whole point of the feed — so depth
-    there buys less than it costs, while trending rewards a second page. All of
-    it shares the GT_MIN_INTERVAL_S budget with holder lookups.
+    Depth is tunable per deployment and per source: ``GT_PAGES_<KIND>`` (e.g.
+    ``GT_PAGES_TRENDING_5M``) and ``GT_LIST_TTL_<KIND>``, with the legacy
+    ``GT_PAGES_NEW`` / ``GT_PAGES_TOP`` / ``GT_LIST_TTL_*`` spellings still
+    accepted. Page 1 of new_pools is the newest birth cohort — that freshness is
+    the whole point of the feed, so depth there buys less than it costs; deeper
+    pages of the *rankings* buy older, larger pools instead of earlier ones, so
+    raise them only with the mcap ceiling in mind. All of it shares the
+    GT_MIN_INTERVAL_S budget with holder lookups.
     """
     global _gt_client
     sources = get_gt_sources(network)
-    source_pages = {
-        "new_pools": max(1, int(os.getenv("GT_PAGES_NEW", "1") or 1)),
-        "trending": max(1, int(os.getenv("GT_PAGES_TRENDING", "2") or 2)),
-        "top_volume": max(1, int(os.getenv("GT_PAGES_TOP", "1") or 1)),
-    }
-    list_ttls = {
-        "new_pools": float(os.getenv("GT_LIST_TTL_NEW", "30") or 30),
-        "trending": float(os.getenv("GT_LIST_TTL_TRENDING", "60") or 60),
-        "top_volume": float(os.getenv("GT_LIST_TTL_TOP", "180") or 180),
-    }
+    source_pages = _gt_source_pages()
+    list_ttls = _gt_source_ttls()
     fetcher = lambda url: gt_fetch_json(session, url)  # noqa: E731
     if _gt_client is None:
         # min_interval_s=0: gt_fetch_json already applies the shared budget, and
@@ -1659,7 +1934,8 @@ async def get_all_pairs(session, network):
     used to be an either/or switch (``USE_GECKOTERMINAL``), which meant turning on
     the early feed silently turned off the curated one.
 
-    Enable with ``DEXSCREENER_SOURCES=boosts,profiles`` (empty disables it).
+    Enable with ``DEXSCREENER_SOURCES=boosts,boosts_top,profiles`` (empty
+    disables it; unknown names are logged and skipped).
     """
     pairs: list = []
     seen: set = set()
@@ -1686,8 +1962,11 @@ async def get_all_pairs(session, network):
         for pair in await get_dexscreener_pairs(session, network):
             await add_pair(pair)
 
-    # Neither source enabled: keep the historical paid-list behaviour rather than
-    # returning nothing.
+    # Neither source enabled. This is the LAST-RESORT path, and the endpoint it
+    # calls is the one discovery.py's docstring documents as HTTP 404 — so with
+    # both sources off the honest outcome is "no candidates", not "the paid list".
+    # Kept only so a deployment that deliberately disabled both sees the attempt
+    # in the logs rather than an empty cycle with no explanation.
     if not USE_GECKOTERMINAL and not DEXSCREENER_SOURCES:
         data = await fetch_json(
             session,
@@ -1697,7 +1976,14 @@ async def get_all_pairs(session, network):
             for pair in data["pairs"]:
                 await add_pair(pair)
 
-    pairs.sort(key=lambda x: float(x.get("volume", {}).get("m5", 0) or 0), reverse=True)
+    pairs.sort(key=lambda x: float((x.get("volume") or {}).get("m5", 0) or 0), reverse=True)
+    # One row per TOKEN, not per pool. The two sources are deduped separately —
+    # GeckoTerminal inside candidates(), DexScreener not at all, since
+    # /tokens/v1 answers with every pool the token has — so their union could
+    # hand the same contract to evaluate_token twice in one cycle and produce
+    # two alerts seconds apart. Deepest pool wins, which is also the tradeable
+    # one.
+    pairs = discovery.dedupe_best_pool(pairs)
     return pairs[:300]
 
 
@@ -2178,7 +2464,7 @@ async def get_cex_listings(session, chain, token):
     now = time.time()
     if coin_id in coingecko_ticker_cache:
         cached, ts = coingecko_ticker_cache[coin_id]
-        if now - ts < 3600:
+        if now - ts < TICKER_TTL:
             return cached.get("cex_count", 0), cached.get("has_perps", False), cached.get("tier1_count", 0)
     headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/tickers"
@@ -2258,7 +2544,7 @@ def score_holder(top10, top50, top100, age_minutes):
 
     ``top100`` may be ``None`` when the provider publishes no 51-100 band (as
     GeckoTerminal does not). That block is then skipped rather than scored as if
-    concentration were zero — ``_max_possible_score`` compensates by lowering the
+    concentration were zero — ``max_possible_score`` compensates by lowering the
     alert gate for the points that were genuinely unmeasurable.
     """
     pts = 0
@@ -2313,8 +2599,9 @@ def max_possible_score(chain, age_minutes, *, has_top100=True, has_cex=True):
       51-100 band, so 4 of those 20 points stay unmeasurable (``has_top100``).
     * **CEX listings (5 pts)** are unreachable for Robinhood: no Robinhood token
       is listed on CoinGecko, so ``get_cex_listings`` can never return anything.
-    * **Age gates** cap the long-window branches: a 1-hour-old pool cannot score
-      the 1h/6h or 6h/24h tiers at all.
+    * **Age gates** cap the long-window branches: a 1-hour-old pool can only
+      reach the 0.3x partial tier of the 1h/6h and 6h/24h branches (see
+      ``score_1h_6h`` / ``score_6h_24h``), never the full points.
 
     This mirrors the real scorers by calling them with ideal inputs, so it cannot
     drift out of sync with them. It is used to scale the alert threshold down to
@@ -2338,9 +2625,16 @@ def max_possible_score(chain, age_minutes, *, has_top100=True, has_cex=True):
 
 
 def has_cex_data(chain) -> bool:
-    """Whether CEX-listing scoring can ever fire for this chain."""
+    """Whether CEX-listing scoring can ever fire for this chain.
+
+    Both preconditions, not one: no CoinGecko coverage on Robinhood, and no
+    data without an API key — ``get_cex_listings`` returns zeros when the key
+    is absent (``.env.example`` ships it empty), so counting the 5 CEX points
+    anyway set the scaled bar ~3 points above what a candidate could reach on
+    eth/bsc/base.
+    """
     platform = CHAIN_TO_COINGECKO_PLATFORM.get(chain)
-    return bool(platform and platform != "robinhood")
+    return bool(platform and platform != "robinhood" and COINGECKO_API_KEY)
 
 
 def effective_threshold(chain, age_minutes, *, has_top100=True, has_cex=None):
@@ -2364,7 +2658,7 @@ def effective_threshold(chain, age_minutes, *, has_top100=True, has_cex=None):
     # genuinely strong, not merely "best of a bad batch". The floor is itself
     # capped by ``base`` so an explicit MIN_SCORE below the floor (e.g. 0, to
     # alert on everything while tuning) still means what it says.
-    floor = min(base, float(os.getenv("MIN_EFFECTIVE_SCORE", "35")))
+    floor = min(base, _env_float("MIN_EFFECTIVE_SCORE", 35.0))
     return max(floor, min(base, scaled))
 
 
@@ -2404,7 +2698,10 @@ async def evaluate_token(session, pair):
     global tokens_evaluated, security_unknown_rejects, unsupported_venue_rejects
     chain = pair.get("chainId")
     base_token = pair.get("baseToken", {}) or {}
-    token = base_token.get("address")
+    # Lower-cased at the source: every consumer below keys on this address
+    # (alerts dedupe, watchlist PK, feature-row joins) and feeds disagree about
+    # checksum casing, so the same contract must not become two identities.
+    token = str(base_token.get("address") or "").lower()
     pair_id = pair.get("pairAddress")
     symbol = base_token.get("symbol", "???")
     name = base_token.get("name", "Unknown")
@@ -2452,7 +2749,7 @@ async def evaluate_token(session, pair):
     # early-entry bot needs the other bound too. 0 (the default) disables it,
     # so behaviour is unchanged unless MAX_MARKET_CAP_USD is set explicitly.
     max_mcap = _chain_floor(
-        chain, "MAX_MARKET_CAP_USD", float(os.getenv("MAX_MARKET_CAP_USD", "0") or 0)
+        chain, "MAX_MARKET_CAP_USD", _env_float("MAX_MARKET_CAP_USD", 0.0)
     )
 
     # ── Raw metrics are read *before* the floors ────────────────────────────
@@ -2552,7 +2849,18 @@ async def evaluate_token(session, pair):
     if liquidity < min_liq: return reject("liquidity")
     if price < MIN_PRICE: return reject("price_too_low")
     if market_cap < min_mcap: return reject("market_cap")
+    # The ceiling is applied to BOTH size numbers. `market_cap` is the
+    # circulating figure the alert prints; `fdv` is what the charts show and
+    # the honest answer to "has this already run". Feeds disagree about which
+    # one they bother to publish — GeckoTerminal substitutes fdv only when the
+    # circulating cap is missing, DexScreener publishes both — so a token
+    # quoting a small circulating cap next to a multi-million FDV used to clear
+    # the gate and alert as "in the millions". signals.py already rejects
+    # dilution (fdv/mcap > 8 with fdv > 250k); this closes the same gap for the
+    # size bound itself. Unknown fdv (0) never triggers it.
     if max_mcap and market_cap > max_mcap: return reject("mcap_too_high")
+    fdv_value = float(pair.get("fdv") or 0)
+    if max_mcap and fdv_value > max_mcap: return reject("fdv_too_high")
     if vol_5m < min_vol_5m: return reject("vol_5m")
     if chain == "robinhood" and age_minutes is not None and age_minutes < ROBINHOOD_MIN_PAIR_AGE_MIN:
         return reject("robinhood_too_new")
@@ -2643,7 +2951,11 @@ async def evaluate_token(session, pair):
     # score had already deducted (sell pressure, low tx counts, unverified).
     feat["penalties_total"] = penalties
     if USE_SIGNALS:
-        verdict = signals.evaluate(pair, security=security,
+        # history= is what unlocks the documented momentum bonuses (vol_accel,
+        # score_rising, holder_delta, vol_rising). It was omitted, so with
+        # SIGNAL_BONUS_WEIGHT=0.5 the weight was multiplied by a bonus that
+        # could never be earned — only the surge lane ever saw the history.
+        verdict = signals.evaluate(pair, security=security, history=PAIR_HISTORY,
                                    filters=_filters_for_chain(chain))
         PAIR_HISTORY.observe(pair, security=security, score=score - penalties)
         feat["signal_bonus"] = verdict.bonus
@@ -2716,7 +3028,10 @@ async def evaluate_token(session, pair):
     # never reach the threshold, so allow an AND-gated exception. This is what
     # makes USE_GECKOTERMINAL=new_pools useful rather than just noisy.
     early_ok = False
-    if EARLY_RUNNER_MODE and total_score < threshold:
+    # USE_SIGNALS is a real prerequisite, not a comment: without it the rug /
+    # wash-trade hard rejects never ran, so this lane would promote candidates
+    # past gates the docs (and config_warnings) claim are still on.
+    if EARLY_RUNNER_MODE and USE_SIGNALS and total_score < threshold:
         early_reasons = signals.early_runner_reasons(pair, security=security,
                                                      filters=_filters_for_chain(chain))
         if not early_reasons:
@@ -2758,7 +3073,7 @@ async def evaluate_token(session, pair):
     # spam" — full score lines are emitted only for tokens that alerted, took the
     # early lane, or came within NEAR_MISS_POINTS of the bar. Everything else is
     # still a queryable row in the features table when LOG_FEATURES=true.
-    near_miss_gap = float(os.getenv("NEAR_MISS_POINTS", "15") or 15)
+    near_miss_gap = _env_float("NEAR_MISS_POINTS", 15.0)
     is_near_miss = (threshold - total_score) <= near_miss_gap
     if VERBOSE_LOGGING and (early_ok or is_near_miss or total_score >= threshold):
         logger.info(
@@ -3237,6 +3552,21 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd, 
         amount_native, trailing_stop, tp_levels, tx_hash,
         paper=1 if PAPER_TRADING else 0
     )
+    if pos_id is None:
+        # The buy DID execute — only the bookkeeping failed (typically a WAL
+        # lock held by the feature-writer's own connection). Announcing
+        # "Position Opened" here would leave an untracked position with no
+        # trailing stop, no take-profit and no monitoring.
+        await tg_send(
+            f"⚠️ <b>BUY EXECUTED but NOT TRACKED</b>\n"
+            f"{esc(symbol)} on {chain.upper()}\n"
+            f"Spent: {amount_native} {NATIVE_SYMBOL[chain]}\n"
+            f"Tx: <code>{esc(tx_hash)}</code>\n"
+            f"<i>The positions table rejected the insert, so no trailing stop "
+            f"or take-profit will run. Sell manually or restart and re-add.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return None
     mode = "📄 PAPER" if PAPER_TRADING else "💰 LIVE"
     await tg_send(
         f"{mode} <b>Position Opened</b>\n"
@@ -4156,15 +4486,20 @@ async def send_alert(alert):
         # Mark the feature row as actually alerted (Phase 2 labelling).
         FEATURE_LOGGER.mark_alert_sent(alert['chain'], alert['token_address'])
         logger.info(f"ALERT #{alerts_sent} sent → {alert['symbol']}@{alert['chain']} score={alert['total_score']}")
+        return True
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
+        # False, not "nothing": the dispatcher must not write dedupe state for a
+        # message the user never received, or a transient outage would mark the
+        # token as reported and (RE_ALERTS=false) silence it permanently.
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def dispatch_alerts(results) -> int:
+async def dispatch_alerts(results, batch: Optional[set] = None) -> int:
     """Send alerts for evaluation results that cleared the gate.
 
     Extracted from the scan loop so the watchlist lane shares exactly the same
@@ -4172,24 +4507,76 @@ async def dispatch_alerts(results) -> int:
     fails to build or send must never take down the cycle — that failure mode
     looked exactly like "the bot found nothing" while it was in fact finding
     candidates and dying on every send.
+
+    De-duplication is layered because the failure modes are layered. One scan
+    can bring the same token in twice (GeckoTerminal lists pool A, DexScreener's
+    ``/tokens/v1`` answers with pool B of the same contract), the two lanes run
+    as separate dispatch calls in the same cycle, the alerts table can lose a
+    write, and — with ``RE_ALERTS=true`` — an old alert can be due for a repeat.
+    So:
+
+    * ``batch`` — at most one message per (chain, token) for the whole cycle,
+      always, regardless of how far apart the two scores are. The scan loop
+      passes one shared set to both lanes; without it a ≥12-point gap between
+      the discovery and watchlist readings would send twice seconds apart.
+    * the ``alerts`` table — durable, across batches and restarts;
+    * ``ALERTED_THIS_RUN`` — in-memory fallback when the table has no record
+      for a token we already pushed (a failed upsert is only a warning).
+
+    Dedupe state is written **only after a delivered message**: a failed send
+    is still added to ``batch`` (so one cycle never double-attempts it) but
+    leaves no record, so the next cycle tries again instead of treating a
+    Telegram outage as "the user was told".
     """
     sent = 0
+    if batch is None:
+        batch = set()
     for result in results:
-        if not result or isinstance(result, Exception):
+        if not result:
+            continue
+        if isinstance(result, Exception):
+            # Previously dropped in silence, which made a systematic failure
+            # (a bad env value parsed per candidate, say) look like "no
+            # candidates" — the exact diagnosis this repo keeps warning about.
+            logger.warning(f"Evaluator raised; candidate skipped: {result!r}")
             continue
         try:
+            key = (str(result["chain"]).lower(), str(result["token_address"]).lower())
+            if key in batch:
+                logger.debug(
+                    f"Duplicate in batch for {result['symbol']}@{result['chain']} — suppressed"
+                )
+                continue
             last_alert = db_get_last_alert(result["chain"], result["token_address"])
-            should_alert = True
             if last_alert:
-                hours_since = (time.time() - last_alert["alert_time"]) / 3600
-                if hours_since < RE_ALERT_COOLDOWN_HOURS:
-                    if (result["total_score"] - last_alert["total_score"]) < SCORE_IMPROVEMENT_THRESHOLD:
-                        should_alert = False
-            if should_alert:
-                await send_alert(result)
-                db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
-                sent += 1
-                await asyncio.sleep(1)
+                if not RE_ALERTS_ENABLED:
+                    should_alert = False
+                else:
+                    hours_since = (time.time() - last_alert["alert_time"]) / 3600
+                    improved = (
+                        result["total_score"] - last_alert["total_score"]
+                    ) >= SCORE_IMPROVEMENT_THRESHOLD
+                    should_alert = hours_since >= RE_ALERT_COOLDOWN_HOURS or improved
+            elif key in ALERTED_THIS_RUN:
+                # No durable record although we sent this run: the upsert failed.
+                should_alert = False
+            else:
+                should_alert = True
+            if not should_alert:
+                logger.debug(
+                    f"Re-alert suppressed for {result['symbol']}@{result['chain']} "
+                    f"(RE_ALERTS={RE_ALERTS_ENABLED})"
+                )
+                continue
+            delivered = bool(await send_alert(result))
+            batch.add(key)
+            if not delivered:
+                # Nothing recorded: the next cycle may legitimately retry.
+                continue
+            db_record_alert(result["chain"], result["token_address"], result["symbol"], result["total_score"])
+            ALERTED_THIS_RUN.add(key)
+            sent += 1
+            await asyncio.sleep(1)
         except Exception:
             logger.error(
                 f"Alert pipeline failed for {result.get('symbol')}@{result.get('chain')}",
@@ -4220,12 +4607,20 @@ async def bot_task():
                 f"Wallet: <code>{WALLET_ADDRESS or 'Not set'}</code>\n"
                 f"Scan interval: {SCAN_INTERVAL}s\n"
                 f"Alert threshold: {ALERT_THRESHOLD}/100\n"
+                f"Mcap ceiling: {_fmt_ceilings(effective_mcap_ceilings())}\n"
                 f"Feature logging: {'ON' if LOG_FEATURES else 'off'}\n"
+                f"Config: <code>{esc(ENV_FILE_LOADED)}</code>\n"
                 + (
                     "\n⚠️ <b>CONFIG WARNINGS</b>\n"
                     + "\n".join(f"• {esc(w)}" for w in config_warnings())
                     + "\n"
                     if config_warnings() else ""
+                )
+                + (
+                    "\nℹ️ <b>NOTES</b>\n"
+                    + "\n".join(f"• {esc(n)}" for n in config_notes())
+                    + "\n"
+                    if config_notes() else ""
                 )
                 + "\n<b>Paste any CA to buy instantly!</b>",
                 parse_mode=ParseMode.HTML,
@@ -4237,6 +4632,11 @@ async def bot_task():
             try:
                 cycle_start = time.time()
                 cycle_alerts = 0
+                # One dedupe set for the whole cycle: discovery (per network)
+                # and the watchlist lane both dispatch through the same set, so
+                # one token can produce at most one message per cycle even when
+                # RE_ALERTS=true lets a score jump beat the cooldown.
+                cycle_batch: set = set()
                 prune_caches()
                 watchlist_cycle_start()
                 if WATCHLIST_ENABLED and int(time.time()) % 600 < SCAN_INTERVAL:
@@ -4270,7 +4670,16 @@ async def bot_task():
                 for network in NETWORKS:
                     if shutdown_flag:
                         break
-                    pairs = await get_all_pairs(session, network)
+                    # Per-chain isolation: an exception here used to skip
+                    # discovery for the remaining chains AND every evaluation
+                    # that cycle, then surface as a "bot cycle crashed" retry a
+                    # minute later — one flaky feed looked like the whole bot
+                    # was down while three healthy chains went unscanned.
+                    try:
+                        pairs = await get_all_pairs(session, network)
+                    except Exception as e:
+                        logger.error(f"Discovery failed for {network}: {e}")
+                        pairs = []
                     discovered[network] = pairs
                     total_pairs_scanned += len(pairs)
                     logger.info(f"{network}: {len(pairs)} pairs discovered")
@@ -4284,7 +4693,7 @@ async def bot_task():
                         continue
                     tasks = [evaluate_token(session, p) for p in pairs]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    cycle_alerts += await dispatch_alerts(results)
+                    cycle_alerts += await dispatch_alerts(results, cycle_batch)
 
                 # ── Ignition watchlist ──────────────────────────────────────
                 # Pools that dropped out of the feeds get re-priced here. See
@@ -4300,7 +4709,7 @@ async def bot_task():
                             *[evaluate_token(session, p) for p in watch_pairs],
                             return_exceptions=True,
                         )
-                        cycle_alerts += await dispatch_alerts(watch_results)
+                        cycle_alerts += await dispatch_alerts(watch_results, cycle_batch)
 
                 cycle_duration = time.time() - cycle_start
                 logger.info(f"Cycle complete in {cycle_duration:.1f}s. Alerts: {cycle_alerts}. Sleeping {SCAN_INTERVAL}s...")
@@ -4359,8 +4768,22 @@ async def health_check():
         "pairs_scanned": total_pairs_scanned,
         "tokens_evaluated": tokens_evaluated,
         "open_positions": len(positions),
+        # `threshold` is the raw bar; `threshold_by_chain` is what evaluate_token
+        # actually starts from before scaling (the gate itself is age-scaled on
+        # top — see effective_threshold). Reporting both stops the "why did this
+        # alert at 47?" question from needing a log dive.
         "threshold": ALERT_THRESHOLD,
+        "threshold_by_chain": {
+            chain: _chain_floor(chain, "MIN_SCORE", float(ALERT_THRESHOLD))
+            for chain in NETWORKS
+        },
         "paper_trading": PAPER_TRADING,
+        # Which config file this process actually loaded, and the ceiling it is
+        # actually enforcing. Both answer "I set it in .env, why is the bot
+        # behaving differently?" without shell access to the host.
+        "env_file": ENV_FILE_LOADED,
+        "mcap_ceiling_usd": effective_mcap_ceilings(),
+        "re_alerts": RE_ALERTS_ENABLED,
         # Why the bot was quiet, as numbers rather than a log grep:
         # security_unknown = GoPlus had no record yet (common minutes after a
         # pool is born); unsupported_venue = no router for that DEX (V4 etc.);

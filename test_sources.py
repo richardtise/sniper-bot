@@ -26,6 +26,53 @@ import discovery  # noqa: E402
 import signals  # noqa: E402
 
 
+def _code_default(name, env_keys=()):
+    """The value bot.py's own top-level assignment produces for ``name``.
+
+    The assignment is re-executed from source (in a copy of the module globals,
+    with ``env_keys`` popped from the environment first) rather than reading
+    ``bot.<NAME>``: that attribute reflects the operator's ``.env``, not the
+    code default. ``importlib.reload(bot)`` would give the same answer but
+    re-runs every module-level side effect for the rest of the suite.
+    """
+    import ast
+
+    with open(bot.__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            continue
+        segment = ast.get_source_segment(src, node)
+        saved = {k: os.environ.pop(k, None) for k in env_keys}
+        try:
+            namespace = dict(vars(bot))          # a copy: bot itself is untouched
+            exec(compile(segment, bot.__file__, "exec"), namespace)
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+        return namespace[name]
+    raise AssertionError(f"no top-level assignment to {name} in {bot.__file__}")
+
+
+class _FeatureRecorder:
+    """Stands in for FeatureLogger so a test can read the rows as logged."""
+
+    def __init__(self):
+        self.rows = []
+
+    def log_row(self, row):
+        self.rows.append(dict(row))
+
+    def mark_alert_sent(self, *a, **k):
+        pass
+
+    def stats(self):
+        return {}
+
+
 # A trimmed but structurally faithful GeckoTerminal /tokens/{addr}/info payload.
 GT_INFO = {
     "data": {
@@ -223,15 +270,37 @@ class TestEtherscanChainMap(unittest.TestCase):
             self.assertIn(chain, bot.ETHERSCAN_CHAIN_ID)
 
     def test_scanner_api_key_is_accepted_as_etherscan_alias(self):
-        """Deployments already carry an Etherscan key under SCANNER_API_KEY."""
-        import importlib
-        os.environ["SCANNER_API_KEY"] = "TESTKEY123"
-        os.environ.pop("ETHERSCAN_API_KEY", None)
-        reloaded = importlib.reload(bot)
-        self.assertEqual(reloaded.ETHERSCAN_API_KEY, "TESTKEY123")
-        # restore module state for the rest of the suite
-        os.environ.pop("SCANNER_API_KEY", None)
-        importlib.reload(bot)
+        """Deployments already carry an Etherscan key under SCANNER_API_KEY.
+
+        bot.py resolves the key once at import, so a fresh import used to be
+        how this was checked — but ``importlib.reload(bot)`` re-ran every
+        module-level side effect for the rest of the suite, and the cleanup
+        popped ``ETHERSCAN_API_KEY`` without putting it back. The same code
+        path is now exercised by re-running bot.py's own assignment with this
+        test in charge of both keys.
+        """
+        saved = {k: os.environ.get(k) for k in
+                 ("ETHERSCAN_API_KEY", "SCANNER_API_KEY")}
+        try:
+            os.environ["SCANNER_API_KEY"] = "TESTKEY123"
+            os.environ.pop("ETHERSCAN_API_KEY", None)
+            self.assertEqual(_code_default("ETHERSCAN_API_KEY"), "TESTKEY123",
+                             "SCANNER_API_KEY must be accepted as the alias")
+
+            # The real key still wins when a deployment carries both.
+            os.environ["ETHERSCAN_API_KEY"] = "PRIMARY456"
+            self.assertEqual(_code_default("ETHERSCAN_API_KEY"), "PRIMARY456")
+
+            # With neither set the resolved key is empty, not a stale module value.
+            os.environ.pop("ETHERSCAN_API_KEY", None)
+            os.environ.pop("SCANNER_API_KEY", None)
+            self.assertEqual(_code_default("ETHERSCAN_API_KEY"), "")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 class TestOpenSourceRequirement(unittest.TestCase):
@@ -595,11 +664,23 @@ class TestAlertFormatting(unittest.TestCase):
         saved_kb = bot.build_alert_keyboard
         bot.tg_send = boom
         bot.build_alert_keyboard = lambda *a, **k: None
+        sent_before = bot.alerts_sent
         try:
-            asyncio.run(bot.send_alert(self._alert(None)))  # must not raise
+            with self.assertLogs("pump_bot_v5", level="ERROR") as cm:
+                outcome = asyncio.run(bot.send_alert(self._alert(None)))  # must not raise
         finally:
             bot.tg_send = saved_tg
             bot.build_alert_keyboard = saved_kb
+
+        # Logged — the operator can see why nothing arrived...
+        text = "\n".join(cm.output)
+        self.assertIn("Telegram send failed", text)
+        self.assertIn("telegram down", text)
+        # ...reported as not sent, so the dispatcher does not write dedupe
+        # state for a message nobody received, and not counted as an alert.
+        self.assertFalse(outcome, "a failed send must return False, not None")
+        self.assertEqual(bot.alerts_sent, sent_before,
+                         "a failed send must not be counted as sent")
 
 
     def test_etherscan_alert_shows_verification_not_goplus(self):
@@ -628,10 +709,6 @@ class TestAlertFormatting(unittest.TestCase):
         self.assertIn("Security (Etherscan)", sent[0])
         self.assertIn("Verified source: ✅ Yes", sent[0])
         self.assertNotIn("GoPlus", sent[0])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestPerChainGtSources(unittest.TestCase):
@@ -769,21 +846,122 @@ class TestVenueSupport(unittest.TestCase):
         the moment a deployment (correctly) enabled it — a test that breaks when
         the operator configures the feature is testing the wrong thing. What
         matters is that the gate is off unless asked for, and that asking for it
-        works, so both are exercised explicitly.
+        works, so both are exercised explicitly: bot.py's own assignment is
+        re-evaluated without the operator's ``.env``, and the gate itself is
+        then driven through ``evaluate_token`` with an unroutable pool.
         """
-        import inspect
-        src = inspect.getsource(bot)
-        self.assertIn('REQUIRE_TRADEABLE_VENUE = os.getenv("REQUIRE_TRADEABLE_VENUE", "false")',
-                      src, "the code default must stay opt-in")
+        import asyncio
+        import tempfile
 
-        saved = bot.REQUIRE_TRADEABLE_VENUE
+        # 1. Off unless asked for: the code's own default, .env removed.
+        self.assertFalse(
+            _code_default("REQUIRE_TRADEABLE_VENUE",
+                          env_keys=("REQUIRE_TRADEABLE_VENUE",)),
+            "the code default must stay opt-in",
+        )
+
+        # 2. Asking for it works.
+        os.environ["REQUIRE_TRADEABLE_VENUE"] = "true"
         try:
-            bot.REQUIRE_TRADEABLE_VENUE = False
-            self.assertFalse(bot.REQUIRE_TRADEABLE_VENUE)
-            bot.REQUIRE_TRADEABLE_VENUE = True
-            self.assertTrue(bot.REQUIRE_TRADEABLE_VENUE)
+            self.assertTrue(_code_default("REQUIRE_TRADEABLE_VENUE"),
+                            "REQUIRE_TRADEABLE_VENUE=true must switch the gate on")
         finally:
-            bot.REQUIRE_TRADEABLE_VENUE = saved
+            os.environ.pop("REQUIRE_TRADEABLE_VENUE", None)
+
+        # 3. And the gate gates: with an unroutable pool, off means scored,
+        #    on means dropped before any enrichment budget is spent.
+        pair = {
+            "chainId": "base",
+            "dexId": "uniswap-v4-base",     # no router reaches V4 on any chain
+            "pairAddress": "0x" + "ab" * 20,
+            "baseToken": {"address": "0x" + "cd" * 20, "symbol": "VENUE",
+                          "name": "Venue"},
+            "quoteToken": {"symbol": "WETH", "address": "0x" + "ef" * 20},
+            "priceUsd": "0.001", "liquidity": {"usd": 50_000.0},
+            "marketCap": 45_000.0,
+            "volume": {"m5": 5_000.0, "h1": 9_000.0, "h6": 20_000.0,
+                       "h24": 40_000.0},
+            "txns": {"m5": {"buys": 90, "sells": 40, "buyers": 80, "sellers": 40},
+                     "h1": {"buys": 300, "sells": 100}},
+            "priceChange": {"m5": 5.0, "h1": 10.0, "h6": 20.0, "h24": 30.0},
+            "pairCreatedAt": (time.time() - 3600) * 1000,
+            "source": "test:venue_gate",
+        }
+        self.assertIs(bot.dex_is_supported("base", pair["dexId"]), False,
+                      "fixture: the venue must be a known-unroutable one")
+
+        async def fake_security(session, chain, token):
+            sec = bot._security_placeholder("test")
+            sec.update({"is_open_source": True, "lp_locked": True})
+            return sec
+
+        async def fake_holders(session, chain, token):
+            return bot.HolderData(top10=60.0, top50=80.0, top100=None, source="test")
+
+        async def fake_cex(session, chain, token):
+            return (1, False, 0)
+
+        recorder = _FeatureRecorder()
+        saved = {
+            "REQUIRE_TRADEABLE_VENUE": bot.REQUIRE_TRADEABLE_VENUE,
+            "FEATURE_LOGGER": bot.FEATURE_LOGGER,
+            "get_token_security": bot.get_token_security,
+            "get_holder_concentration": bot.get_holder_concentration,
+            "get_cex_listings": bot.get_cex_listings,
+            "unsupported_venue_rejects": bot.unsupported_venue_rejects,
+        }
+        # Isolate from the operator's .env: a $100k ceiling (or a per-chain
+        # one) would reject this fixture on size before the venue gate ran.
+        saved_gate_env = {k: os.environ.get(k) for k in (
+            "MAX_MARKET_CAP_USD", "BASE_MAX_MARKET_CAP_USD",
+            "ROBINHOOD_MAX_MARKET_CAP_USD",
+        )}
+        tmpdir = tempfile.mkdtemp()
+        saved_db = (bot.DB_PATH, bot.db_conn)
+        bot.FEATURE_LOGGER = recorder
+        bot.get_token_security = fake_security
+        bot.get_holder_concentration = fake_holders
+        bot.get_cex_listings = fake_cex
+        bot.DB_PATH = os.path.join(tmpdir, "venue.db")
+        bot.db_conn = bot.init_db()
+        for k in saved_gate_env:
+            os.environ.pop(k, None)
+        bot.security_cache.clear()
+        try:
+            # Gate off: the pool is scored — the row carries component scores.
+            bot.REQUIRE_TRADEABLE_VENUE = False
+            asyncio.run(bot.evaluate_token(None, dict(pair)))
+            off_row = recorder.rows[-1]
+            off_reason = off_row["reject_reasons"]
+            off_rejects = bot.unsupported_venue_rejects
+
+            # Gate on: the same pool is dropped at the venue gate.
+            bot.REQUIRE_TRADEABLE_VENUE = True
+            asyncio.run(bot.evaluate_token(None, dict(pair)))
+            on_row = recorder.rows[-1]
+            on_rejects = bot.unsupported_venue_rejects
+        finally:
+            for key, value in saved.items():
+                setattr(bot, key, value)
+            for key, value in saved_gate_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            try:
+                bot.db_conn.close()
+            except Exception:
+                pass
+            bot.DB_PATH, bot.db_conn = saved_db
+            bot.security_cache.clear()
+
+        self.assertNotEqual(off_reason, "unsupported_venue",
+                            "gate off: an unroutable pool must still be evaluated")
+        self.assertIsNotNone(off_row["score_vol_liq"],
+                             "gate off: the pool must have reached scoring")
+        self.assertEqual(on_row["reject_reasons"], "unsupported_venue")
+        self.assertGreater(on_rejects, off_rejects,
+                           "the gate must count what it drops")
 
 
 class TestPerChainEarlyFloors(unittest.TestCase):
@@ -982,7 +1160,14 @@ class TestDexScreenerAsSecondSource(unittest.TestCase):
         self.assertEqual(discovery.chunked([], 30), [])
 
     def _pair(self, addr, chain="bsc"):
+        # baseToken is not decoration: every real pair carries one (DexScreener
+        # and pool_to_pair both refuse to emit a pair without it) and
+        # get_all_pairs now collapses its union to one pool PER TOKEN, so a
+        # fixture without a token address describes a pair that cannot exist
+        # and would be dropped before evaluation anyway.
+        token = "0xtok" + addr[3:] if addr.startswith("0x") else "0xtok" + addr
         return {"pairAddress": addr, "chainId": chain,
+                "baseToken": {"address": token, "symbol": "T", "name": "T"},
                 "volume": {"m5": 1.0}, "liquidity": {"usd": 1.0}}
 
     def test_union_contains_candidates_from_both_sources(self):
@@ -1049,3 +1234,7 @@ class TestDexScreenerAsSecondSource(unittest.TestCase):
 
         pairs = asyncio.run(bot.get_all_pairs(None, "bsc"))
         self.assertEqual({p["pairAddress"] for p in pairs}, {"0xpaid"})
+
+
+if __name__ == "__main__":
+    unittest.main()

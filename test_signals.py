@@ -324,10 +324,6 @@ class TestPairHistory(unittest.TestCase):
         self.assertEqual(tr["vol_accel"], 0.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestVolumeSurgeLane(unittest.TestCase):
     """Abnormal volume relative to the pool's OWN baseline, AND-gated.
 
@@ -437,3 +433,7 @@ class TestVolumeSurgeLane(unittest.TestCase):
         os.environ["SIG_SURGE_MIN_ACCEL"] = "9.5"
         self.addCleanup(lambda: os.environ.pop("SIG_SURGE_MIN_ACCEL", None))
         self.assertEqual(signals.Filters.from_env().surge_min_accel, 9.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

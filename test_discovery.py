@@ -180,10 +180,6 @@ class TestDexScreenerSearch(unittest.TestCase):
         self.assertEqual(out[0]["source"], "dexscreener_search")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestPaginationAndSplitTTL(unittest.TestCase):
     """2026-09-29 recall fix: page-1-only discovery never sees a runner on
     page 2, and a blanket 90s TTL skips whole new_pools birth cohorts."""
@@ -206,8 +202,16 @@ class TestPaginationAndSplitTTL(unittest.TestCase):
         self.assertEqual(symbols, {"RUN", "MOON"})
 
     def test_short_last_page_stops_early(self):
+        """A *short* (non-empty) page ends the walk, not an empty one.
+
+        The empty-batch stop breaks the loop just as well, so a fixture where
+        page 2 404s would pass without proving anything: page 2 is answerable
+        here, and the walk still has to stop on the length of page 1.
+        """
         fetch = FakeFetch({
             "new_pools?page=1": payload([gt_pool(address="0xp1", token="0xt1")]),
+            "new_pools?page=2": payload([gt_pool(address="0xp2", token="0xt2",
+                                                 symbol="MOON")]),
         })
         gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=60,
                            max_pages=5, page_size=20)
@@ -216,18 +220,44 @@ class TestPaginationAndSplitTTL(unittest.TestCase):
             return await gt.candidates("bsc", kinds=("new_pools",))
 
         cands = asyncio.run(run())
-        self.assertEqual(len(cands), 1)
-        # Only page 1 fetched: page 2 would 404 -> FakeFetch returns None ->
-        # empty batch breaks the loop anyway. Assert no page=3 call happened.
-        self.assertFalse(any("page=3" in url for url in fetch.calls))
+        symbols = {p["baseToken"]["symbol"] for p in cands}
+        self.assertEqual(symbols, {"RUN"},
+                         "page 1 returned 1 of 20 slots: short, so the walk stops")
+        # Exactly one call, and page 2 — which the fake would have answered —
+        # was never requested. That is the short-page rule, not the empty one.
+        self.assertEqual(len(fetch.calls), 1)
+        self.assertFalse(any("page=2" in url for url in fetch.calls))
 
     def test_new_pools_ttl_shorter_than_top_volume(self):
+        """The blanket 90s TTL must not survive for new_pools.
+
+        ``new_pools`` churns a whole birth cohort every ~2-4 minutes, so its
+        cache entry has to expire before ``top_volume``'s. A client that fell
+        back to one TTL for both sources would still cache both for the
+        immediate re-reads below, so the per-source resolutions themselves are
+        asserted: with and without an explicit override they must differ, with
+        new_pools the shorter of the two.
+        """
         fetch = FakeFetch({
             "new_pools": payload([gt_pool()]),
             "sort=h24_volume_usd_desc": payload([gt_pool()]),
         })
         gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=90,
                            list_ttls={"new_pools": 30.0, "top_volume": 180.0})
+
+        # Per-source override is resolved per kind, not flattened to cache_ttl_s.
+        self.assertEqual(gt._ttl_for("new_pools"), 30.0)
+        self.assertEqual(gt._ttl_for("top_volume"), 180.0)
+        self.assertLess(gt._ttl_for("new_pools"), gt._ttl_for("top_volume"))
+        # The shipped defaults carry the same invariant without an override.
+        default_gt = GeckoTerminal(FakeFetch({}), min_interval_s=0.0, cache_ttl_s=90)
+        self.assertLess(default_gt._ttl_for("new_pools"),
+                        default_gt._ttl_for("top_volume"),
+                        "DEFAULT_LIST_TTLS must keep new_pools the freshest list")
+        # A source with no per-kind entry (token_info is not a pool list) still
+        # falls back to the blanket TTL.
+        self.assertEqual(gt._ttl_for("token_info"), 90.0)
+        self.assertEqual(gt._ttl_for(None), 90.0)
 
         async def run():
             await gt.list_pools("bsc", kind="new_pools")
@@ -238,6 +268,44 @@ class TestPaginationAndSplitTTL(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(len(fetch.calls), 2)
+
+    def test_list_pools_honours_the_per_kind_ttl(self):
+        """`kind` must actually reach the cache.
+
+        Pins a real regression: ``list_pools`` called ``_get(path)`` **without**
+        ``kind``, so ``_ttl_for`` saw ``None``, returned the blanket
+        ``cache_ttl_s``, and every ``GT_LIST_TTL_*`` knob — plus this module's
+        own ``DEFAULT_LIST_TTLS`` — was inert for pool lists. The resolution is
+        asserted from both directions: a zero per-kind TTL must force a refetch
+        (the blanket 90s would serve it from cache), and a non-zero per-kind TTL
+        must be honoured even when the blanket TTL is 0 (the blanket would
+        refetch).
+        """
+        # Under-wiring: kind ignored -> blanket 90s caches a ttl=0 entry.
+        fetch = FakeFetch({"new_pools": payload([gt_pool()])})
+        gt = GeckoTerminal(fetch, min_interval_s=0.0, cache_ttl_s=90,
+                           list_ttls={"new_pools": 0.0})
+
+        async def run_zero():
+            await gt.list_pools("bsc", kind="new_pools")
+            await gt.list_pools("bsc", kind="new_pools")
+
+        asyncio.run(run_zero())
+        self.assertEqual(len(fetch.calls), 2,
+                         "ttl=0 for new_pools must not be served from cache")
+
+        # Over-wiring: blanket 0 must not override the per-kind 60.
+        fetch2 = FakeFetch({"new_pools": payload([gt_pool()])})
+        gt2 = GeckoTerminal(fetch2, min_interval_s=0.0, cache_ttl_s=0.0,
+                            list_ttls={"new_pools": 60.0})
+
+        async def run_sixty():
+            await gt2.list_pools("bsc", kind="new_pools")
+            await gt2.list_pools("bsc", kind="new_pools")
+
+        asyncio.run(run_sixty())
+        self.assertEqual(len(fetch2.calls), 1,
+                         "the per-kind TTL must win over the blanket one")
 
     def test_explicit_pages_kwarg_overrides_client_default(self):
         fetch = FakeFetch({
@@ -301,3 +369,7 @@ class TestPerSourcePages(unittest.TestCase):
         cands = asyncio.run(run())
         self.assertEqual({p["baseToken"]["symbol"] for p in cands}, {"RUN", "TREND1"})
         self.assertFalse(any("page=2" in u for u in fetch.calls))
+
+
+if __name__ == "__main__":
+    unittest.main()
