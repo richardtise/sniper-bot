@@ -960,6 +960,9 @@ Send `/start` in the chat, then paste a contract address to buy.
 | `/setamounts <chain> <a,b,c>` | Set preset buy sizes (independent per chain). |
 | `/debug` | Log per-chain config and contract status. |
 | `/features` | Feature-logging counters. |
+| `/export [N] [alerts]` | DM the features table as CSV (N newest rows; `alerts` = only alerted rows). No shell needed. |
+| `/late [N]` | Worst alert delays vs first sight — separates discovery latency from gate latency. |
+| `/health` | In-chat health: counters, config file, ceilings, and why the bot was quiet. |
 
 Alerts, token cards and positions all carry inline buttons: preset/custom buy,
 sell 25/50/100%, buy more, and set trailing stop.

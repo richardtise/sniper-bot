@@ -19,7 +19,9 @@ Fixes in v5.4:
 
 import asyncio
 import aiohttp
+import csv
 import time
+import io
 import os
 import json
 import logging
@@ -35,7 +37,7 @@ from datetime import datetime, timezone
 from html import escape as html_escape
 from typing import Dict, List, NamedTuple, Optional, Tuple, Any
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 from fastapi import FastAPI
@@ -179,6 +181,12 @@ SEED_ONLY_SOURCES = tuple(
 ALLOWED_USER_IDS = {
     int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
 }
+
+# /export guardrails: exporting the features table off-host is powerful but the
+# CSV grows without bound, and a 30 MB document send can take minutes on a free
+# host (or fail outright). Both knobs are env-tunable.
+EXPORT_MAX_ROWS = int(os.getenv("EXPORT_MAX_ROWS", "20000"))
+EXPORT_CHUNK_ROWS = int(os.getenv("EXPORT_CHUNK_ROWS", "5000"))
 
 # ── Ignition watchlist ───────────────────────────────────────────────────────
 # Discovery is event-based: GeckoTerminal's `new_pools` only carries pools from
@@ -4176,6 +4184,15 @@ async def handle_command(message):
             parse_mode=ParseMode.HTML
         )
 
+    elif cmd == "/export":
+        await handle_export_command(message, args)
+
+    elif cmd == "/late":
+        await handle_late_command(args)
+
+    elif cmd == "/health":
+        await handle_health_command()
+
     elif cmd == "/risk" and args:
         try:
             usd = float(args[0])
@@ -4206,6 +4223,199 @@ async def handle_command(message):
             )
         except ValueError:
             await bot.send_message(chat_id=CHAT_ID, text="Usage: /setamounts <chain> <amt1,amt2,amt3>", parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA EXPORT (/export, /late, /health) — data out without shell access
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Free hosts give no shell and wipe local state, so the features table is only
+# reachable through Telegram. These commands dump it as documents plus answer
+# the two diagnostic questions every operator asks: "how late am I being
+# alerted?" (/late) and "what is this process actually running?" (/health).
+
+
+def _export_db_path() -> str:
+    """The SQLite file the feature logger is actually writing to."""
+    return FEATURE_DB_PATH or DB_PATH
+
+
+def build_features_csv(limit: int = 20000, alerts_only: bool = False,
+                       db_path: Optional[str] = None) -> Tuple[bytes, int, int]:
+    """Dump the features table to CSV bytes (newest rows first).
+
+    Returns (csv_bytes, rows_included, total_rows). Rows are capped at ``limit``
+    so a long-running bot cannot produce a document Telegram refuses to send.
+    Pure function over the DB file: safe to unit-test without a bot instance.
+    """
+    path = db_path or _export_db_path()
+    limit = max(1, min(int(limit), EXPORT_MAX_ROWS))
+    conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "features" not in tables:
+            return b"", 0, 0
+        total = conn.execute("SELECT COUNT(*) FROM features").fetchone()[0]
+        where = "WHERE alert_sent = 1" if alerts_only else ""
+        cur = conn.execute(
+            f"SELECT * FROM features {where} ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        columns = [d[0] for d in cur.description]
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        n = 0
+        for row in cur:
+            writer.writerow(row)
+            n += 1
+    finally:
+        conn.close()
+    return buf.getvalue().encode("utf-8"), n, total
+
+
+def build_late_report(limit: int = 20, db_path: Optional[str] = None) -> str:
+    """How long after first sight each alerted token fired, worst offenders first.
+
+    Uses the first_sight_* columns the bot already records (see _first_sight_note):
+    delay + mcap multiple at alert time separates "discovery was late" from
+    "the gate held a good call back". Pure function: testable without Telegram.
+    """
+    path = db_path or _export_db_path()
+    conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "features" not in tables:
+            return "No features table (is LOG_FEATURES=true?)."
+        rows = conn.execute(
+            """SELECT symbol, chain, ts_epoch, first_sight_ts, first_sight_mcap,
+                      market_cap_usd, hand_score
+               FROM features WHERE alert_sent = 1 AND first_sight_ts IS NOT NULL
+               ORDER BY (ts_epoch - first_sight_ts) DESC LIMIT ?""",
+            (max(1, min(int(limit), 50)),),
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM features WHERE alert_sent = 1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    if not rows:
+        return f"Alerted rows: {total}, but none carry first-sight data."
+    lines = [f"🐢 <b>Lateness report</b> ({len(rows)} latest shown, {total} alerts total)"]
+    for sym, chain, ts, fs_ts, fs_mcap, mcap, score in rows:
+        delay_m = (ts - fs_ts) / 60.0 if ts and fs_ts else 0
+        mult = (mcap / fs_mcap) if fs_mcap else 0
+        lines.append(
+            f"• {esc(sym or '?')}@{esc(chain or '?')}: "
+            f"alerted {delay_m:.0f}m after first sight, "
+            f"${(fs_mcap or 0):,.0f} → ${(mcap or 0):,.0f} ({mult:.1f}x), score {score}"
+        )
+    return "\n".join(lines)
+
+
+async def handle_export_command(message, args):
+    """Send the features table as one or more CSV documents.
+
+    Usage: /export [N] [alerts] — N newest rows (default 20000, capped by
+    EXPORT_MAX_ROWS), or only alert_sent=1 rows with the `alerts` flag.
+    Runs the SQLite read in a thread so a large dump cannot stall the scan loop.
+    """
+    n = EXPORT_MAX_ROWS
+    alerts_only = False
+    for a in args:
+        if a.lower() in ("alerts", "alerted"):
+            alerts_only = True
+        else:
+            try:
+                n = int(a)
+            except ValueError:
+                pass
+    n = max(1, min(n, EXPORT_MAX_ROWS))
+    if not LOG_FEATURES:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="⚠️ LOG_FEATURES is off, so the features table may be thin or empty. "
+                 "Set LOG_FEATURES=true and restart to start collecting rows.",
+            parse_mode=ParseMode.HTML,
+        )
+    await bot.send_message(chat_id=CHAT_ID, text="⏳ Building CSV export…")
+    try:
+        csv_bytes, included, total = await asyncio.to_thread(
+            build_features_csv, n, alerts_only
+        )
+    except Exception as e:
+        logger.error(f"/export failed: {e}", exc_info=True)
+        await bot.send_message(chat_id=CHAT_ID, text=f"❌ Export failed: {esc(str(e))}",
+                               parse_mode=ParseMode.HTML)
+        return
+    if included == 0:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"Empty export (table holds {total} rows). "
+                 "If 0, the logger isn't writing — check LOG_FEATURES=true in Render env.",
+        )
+        return
+    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    kind = "alerts" if alerts_only else "features"
+    # Telegram caps a single document at 50 MB; chunk so a big table still lands.
+    chunks = max(1, (included + EXPORT_CHUNK_ROWS - 1) // EXPORT_CHUNK_ROWS)
+    lines = list(csv_bytes.decode("utf-8").splitlines())
+    header, body = lines[0], lines[1:]
+    for i in range(chunks):
+        part = body[i * EXPORT_CHUNK_ROWS:(i + 1) * EXPORT_CHUNK_ROWS]
+        data = ("\n".join([header] + part) + "\n").encode("utf-8")
+        fname = f"{kind}_{date}_p{i + 1}of{chunks}.csv" if chunks > 1 else f"{kind}_{date}.csv"
+        try:
+            await bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(data, filename=fname),
+                caption=(f"📦 <b>{kind}.csv</b>: rows {i * EXPORT_CHUNK_ROWS + 1}–"
+                         f"{i * EXPORT_CHUNK_ROWS + len(part)} of {included} "
+                         f"(table: {total})" if chunks > 1 else
+                         f"📦 <b>{kind}.csv</b>: {included} rows (table holds {total})"),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError as e:
+            logger.error(f"/export send failed: {e}")
+            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Send failed: {esc(str(e))}",
+                                   parse_mode=ParseMode.HTML)
+            return
+
+
+async def handle_late_command(args):
+    """Answer 'how late am I being alerted?' from first-sight columns."""
+    n = 20
+    for a in args:
+        try:
+            n = int(a)
+        except ValueError:
+            pass
+    try:
+        report = await asyncio.to_thread(build_late_report, n)
+    except Exception as e:
+        logger.error(f"/late failed: {e}", exc_info=True)
+        await bot.send_message(chat_id=CHAT_ID, text=f"❌ /late failed: {esc(str(e))}",
+                               parse_mode=ParseMode.HTML)
+        return
+    await bot.send_message(chat_id=CHAT_ID, text=report, parse_mode=ParseMode.HTML)
+
+
+async def handle_health_command():
+    """In-chat version of /health: what this process is actually running."""
+    stats = FEATURE_LOGGER.stats()
+    warns = config_warnings()
+    lines = [
+        "💓 <b>Bot health</b>",
+        f"Scanned pairs: {total_pairs_scanned} | evaluated: {tokens_evaluated} | alerts: {alerts_sent}",
+        f"Feature logging: {'✅ ON' if LOG_FEATURES else '❌ OFF'} "
+        f"(logged {stats['logged']}, written {stats['written_batches']}, dropped {stats['dropped']})",
+        f"Feature DB: <code>{esc(_export_db_path())}</code>",
+        f"Config: <code>{esc(ENV_FILE_LOADED)}</code>",
+        f"Ceilings: {esc(str(effective_mcap_ceilings()))} | re_alerts={RE_ALERTS_ENABLED}",
+        f"Quiet because: security_unknown={security_unknown_rejects} "
+        f"unsupported_venue={unsupported_venue_rejects} untradeable={untradeable_alerts}",
+    ]
+    if warns:
+        lines.append("⚠️ <b>Config warnings:</b>\n" + "\n".join(f"• {esc(w)}" for w in warns))
+    await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG DEBUG
@@ -4280,7 +4490,10 @@ async def send_start_menu():
         f"/debug — Log config to console\n"
         f"/risk <usd> — Set $ risk per trade (adds a Risk buy button)\n"
         f"/setamounts <chain> <a,b,c> — Custom buy sizes (per chain)\n"
-        f"/features — Feature-logging stats"
+        f"/features — Feature-logging stats\n"
+        f"/export [N] [alerts] — DM the features table as CSV (N newest rows)\n"
+        f"/late [N] — Worst alert delays vs first sight\n"
+        f"/health — What this process is running, why it's quiet"
     )
     await tg_send(text, parse_mode=ParseMode.HTML)
 
