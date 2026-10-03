@@ -515,5 +515,52 @@ class TestMcapCeilings(_EnvTestCase):
                          "a blank override must not mean 'ceiling off'")
 
 
+class TestV4Knobs(_EnvTestCase):
+    """V4 execution stays off unless explicitly enabled with a codec present."""
+
+    def test_v4_trading_defaults_off(self):
+        self.save_global("V4_TRADING")
+        bot.V4_TRADING = False
+        self.assertFalse(bot.V4_TRADING)
+
+    def test_universal_router_resolves_robinhood(self):
+        self.clear_env("ROBINHOOD_UNIVERSAL_ROUTER")
+        self.assertEqual(bot.get_universal_router("robinhood"),
+                         "0x8876789976DEcbFcBbBE364623c63652db8C0904")
+
+    def test_universal_router_env_override_wins(self):
+        self.set_env("ROBINHOOD_UNIVERSAL_ROUTER", "0x" + "ab" * 20)
+        self.assertEqual(bot.get_universal_router("robinhood"), "0x" + "ab" * 20)
+
+    def test_v4_pool_id_to_bytes25(self):
+        raw = bot.v4_pool_id_to_bytes25(
+            "0x749ea25eb98e9b802fbb7ea07167353976dc0936040d8b604f601c1b2a71e96a")
+        self.assertEqual(len(raw), 25)
+        self.assertEqual(raw.hex(), "749ea25eb98e9b802fbb7ea07167353976dc0936040d8b604f")
+
+    def test_v4_label_unroutable_while_flag_off(self):
+        self.save_global("V4_TRADING")
+        bot.V4_TRADING = False
+        self.assertFalse(bot.dex_is_supported("robinhood", "uniswap-v4"))
+
+    def test_venue_requirement_names_v4(self):
+        self.assertIn("Universal Router",
+                      bot.venue_requirement("robinhood", "uniswap-v4"))
+
+    def test_build_v4_swap_calldata_is_execute(self):
+        if not bot.V4_CODEC_AVAILABLE:
+            self.skipTest("decoder lib not installed")
+        key = {"currency0": "0x0000000000000000000000000000000000000000",
+               "currency1": "0x38CdC65B82C66Fc206d09192e6B123FDABF21cfe",
+               "fee": 0, "tickSpacing": 200,
+               "hooks": "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"}
+        data = bot.build_v4_swap_calldata(
+            key, True, 10**15, 15000 * 10**18,
+            "0x38CdC65B82C66Fc206d09192e6B123FDABF21cfe",
+            "0xc5d71e5F93E3C5FB0203e2e9F705363A9f63Bd1f", 4663)
+        self.assertTrue(data.startswith("0x3593564c"),
+                        "must be UniversalRouter.execute(bytes,bytes[],uint256)")
+
+
 if __name__ == "__main__":
     unittest.main()

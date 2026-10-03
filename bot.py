@@ -51,6 +51,13 @@ except ImportError:
     WEB3_AVAILABLE = False
     print("WARNING: web3 not installed. Run: pip install web3")
 
+try:
+    from uniswap_universal_router_decoder.router_codec import RouterCodec as _V4RouterCodec
+    V4_CODEC_AVAILABLE = True
+except ImportError:
+    _V4RouterCodec = None
+    V4_CODEC_AVAILABLE = False
+
 # Load the .env that sits NEXT TO this file, never "whichever directory the
 # process happened to start in". `load_dotenv()` with no argument resolves
 # relative to the caller's working directory, so `python /path/to/bot.py`, a
@@ -611,9 +618,21 @@ def dex_is_supported(chain: str, dex_id) -> Optional[bool]:
     if override is not None:
         if not any(re.search(p, dex) for p in override):
             return False
-        # A user-supplied list does not say which router, so accept it if either
-        # is configured (execute_buy tries V3 first, then the V2 fallback).
-        return bool(get_router_v3(chain) or get_v2_router(chain))
+        # A user-supplied list does not say which router, so accept it if any
+        # path is configured (V3, then V2, then V4 when V4_TRADING is on).
+        return bool(get_router_v3(chain) or get_v2_router(chain)
+                    or (V4_TRADING and get_universal_router(chain)))
+
+    # V4 pools route through the Universal Router, not the V2/V3 routers — but
+    # only once V4_TRADING is on. Until then a v4 label stays unroutable so no
+    # buy button is offered for a pool the bot cannot execute (the UPAY case).
+    # Note DexScreener labels V4 pools as plain `uniswap` (the v4 badge is in
+    # `labels`, which the tokens endpoint does not return), so a bare `uniswap`
+    # dexId on a V4-enabled chain is treated as "covered by V3 router or UR".
+    if re.search(r"uniswap[-_]?v4", dex):
+        return bool(V4_TRADING and get_universal_router(chain))
+    if dex == "uniswap" and V4_TRADING and get_universal_router(chain):
+        return True
 
     v3_patterns, v2_patterns = _TRADEABLE_DEX_PATTERNS.get(chain, ((), ()))
     if any(re.search(p, dex) for p in v3_patterns):
@@ -645,6 +664,93 @@ V2_HOP_STABLES = {
     "base": ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"],
     "robinhood": [],
 }
+
+# ── Uniswap V4 execution ─────────────────────────────────────────────────────
+# V4 pools live in the singleton PoolManager, so the V2/V3 quoter+router path can
+# never see them — a V4 pool always failed with "No V3 pool found" even though
+# the Uniswap app showed liquidity (measured on UPAY@robinhood, 2026-10-03).
+# V4 execution goes through the Universal Router with calldata encoded by the
+# `uniswap-universal-router-decoder` package (RouterCodec). OFF by default:
+# set V4_TRADING=true once a quote+simulation has been verified for the chain.
+V4_TRADING = os.getenv("V4_TRADING", "false").lower() == "true" and V4_CODEC_AVAILABLE
+
+# Canonical deployments (Uniswap docs → v4 deployments). Env overrides win at
+# runtime via <CHAIN>_UNIVERSAL_ROUTER / <CHAIN>_V4_POSITION_MANAGER.
+_HARD_UNIVERSAL_ROUTERS = {
+    "ethereum": "0x66a9893cc07d91d95644aedd05d03f95e1dba8af",
+    "base": "0x6ff5693b99212da76ad316178a184ab56d299b43",
+    "bsc": "",
+    "robinhood": "0x8876789976DEcbFcBbBE364623c63652db8C0904",
+}
+_HARD_V4_POSITION_MANAGERS = {
+    "ethereum": "0x4529A01c7fF8d87a10C4000Bfc73987edcA87d82",
+    "base": "0x7c5f5a4bbd8fd63184577525326123b519429bdc",
+    "bsc": "",
+    "robinhood": "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+}
+
+# Native currency sentinel for V4 pool keys (currency0 == address(0) means the
+# pool's token0 side is native ETH, not WETH).
+V4_NATIVE_SENTINEL = "0x0000000000000000000000000000000000000000"
+
+_POSITION_MANAGER_POOLKEYS_ABI = [
+    {"inputs": [{"internalType": "bytes25", "name": "poolId", "type": "bytes25"}],
+     "name": "poolKeys",
+     "outputs": [{"internalType": "address", "name": "currency0", "type": "address"},
+                 {"internalType": "address", "name": "currency1", "type": "address"},
+                 {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                 {"internalType": "int24", "name": "tickSpacing", "type": "int24"},
+                 {"internalType": "address", "name": "hooks", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+
+def get_universal_router(chain: str) -> str:
+    env_key = _env_key(chain, "UNIVERSAL_ROUTER")
+    return os.getenv(env_key, "").strip() or _HARD_UNIVERSAL_ROUTERS.get(chain, "")
+
+
+def get_v4_position_manager(chain: str) -> str:
+    env_key = _env_key(chain, "V4_POSITION_MANAGER")
+    return os.getenv(env_key, "").strip() or _HARD_V4_POSITION_MANAGERS.get(chain, "")
+
+
+def v4_pool_id_to_bytes25(pool_id: str) -> bytes:
+    """PoolManager pool ids are bytes32; PositionManager.poolKeys takes bytes25."""
+    raw = pool_id.strip()
+    if raw.startswith(("0x", "0X")):
+        raw = raw[2:]
+    return bytes.fromhex(raw[:50].ljust(50, "0"))
+
+
+async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
+    """PoolKey for a V4 pool id via PositionManager.poolKeys (read-only).
+
+    Returns {currency0, currency1, fee, tickSpacing, hooks} or None. Pure
+    on-chain read: no gas, safe to call from the alert path.
+    """
+    if not WEB3_AVAILABLE:
+        return None
+    w3 = w3_instances.get(chain)
+    posm = get_v4_position_manager(chain)
+    if not w3 or not posm or not Web3.is_address(posm):
+        logger.warning(f"V4 pool-key resolve skipped for {chain}: no w3/position manager")
+        return None
+    try:
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(posm),
+            abi=_POSITION_MANAGER_POOLKEYS_ABI,
+        )
+        res = await asyncio.to_thread(
+            contract.functions.poolKeys(v4_pool_id_to_bytes25(pool_id)).call
+        )
+        return {
+            "currency0": res[0], "currency1": res[1], "fee": int(res[2]),
+            "tickSpacing": int(res[3]), "hooks": res[4],
+        }
+    except Exception as e:
+        logger.warning(f"V4 pool-key resolve failed for {chain} {pool_id[:10]}...: {e}")
+        return None
 
 SCAN_INTERVAL = max(5, int(_env_float("SCAN_INTERVAL", 30.0)))  # seconds between cycles
 HEARTBEAT_INTERVAL = 3600
@@ -3429,6 +3535,281 @@ async def try_v2_swap(w3, chain, token_in, token_out, amount_in, is_eth_input, s
         logger.error(f"V2 swap exception: {e}")
         return False, str(e), 0
 
+
+async def v4_quote_min_out(chain: str, token_address: str, amount_native: float,
+                           slippage: float, session=None) -> Tuple[Optional[int], Optional[dict]]:
+    """Minimum acceptable output for a V4 buy, from the DexScreener native price.
+
+    The on-chain V4Quoter cannot be simulated through public RPCs (its
+    unlock+callback+revert pattern returns empty revert data via eth_call, on
+    every chain tested), so the quote comes from the same price feed the bot
+    already trusts for alerts. Returns (min_out_raw, pool_key) or (None, None).
+    hookData is always empty: V2MemeHook-style hooks need none for vanilla swaps.
+    """
+    key = await v4_pool_key_for_token(chain, token_address)
+    if not key:
+        return None, None
+    try:
+        price_native = await get_token_price_native(session, chain, token_address)
+    except Exception as e:
+        logger.warning(f"V4 quote price lookup failed for {chain} {token_address[:10]}...: {e}")
+        return None, None
+    if not price_native or price_native <= 0:
+        return None, None
+    try:
+        decimals = await get_token_decimals(chain, token_address)
+    except Exception:
+        decimals = 18
+    expected_tokens = amount_native / price_native
+    min_tokens = expected_tokens * max(0.0, 1 - slippage / 100)
+    min_out_raw = int(min_tokens * (10 ** decimals))
+    if min_out_raw <= 0:
+        return None, None
+    return min_out_raw, key
+
+
+async def v4_pool_key_for_token(chain: str, token_address: str) -> Optional[dict]:
+    """PoolKey for the token's deepest V4 pool, via DexScreener + PositionManager.
+
+    DexScreener's /tokens/v1/{chain}/{address} response carries each pool's
+    address; the deepest-liquidity pool wins (same rule as _deepest_pair). The
+    pool id resolves to a PoolKey on-chain. Returns None when no V4 pool exists.
+    """
+    pair_address = None
+    try:
+        async with aiohttp.ClientSession() as temp_session:
+            data = await fetch_json(
+                temp_session,
+                f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}",
+            )
+        pair = _deepest_pair(data)
+        if pair:
+            pair_address = pair.get("pairAddress")
+    except Exception as e:
+        logger.debug(f"V4 pool discovery failed for {chain} {token_address[:10]}...: {e}")
+    if not pair_address:
+        return None
+    return await resolve_v4_pool_key(chain, pair_address)
+
+
+def build_v4_swap_calldata(pool_key: dict, zero_for_one: bool, amount_in: int,
+                           amount_out_min: int, token_out: str,
+                           sender: str, chain_id: int) -> str:
+    """Universal Router execute() calldata for a V4 exact-input single swap."""
+    codec = _V4RouterCodec()
+    checksum = Web3.to_checksum_address
+    key = codec.encode.v4_pool_key(
+        checksum(pool_key["currency0"]), checksum(pool_key["currency1"]),
+        int(pool_key["fee"]), int(pool_key["tickSpacing"]),
+        checksum(pool_key["hooks"]),
+    )
+    native_in = checksum(pool_key["currency0"]) == checksum(V4_NATIVE_SENTINEL) if zero_for_one else False
+    chain = (codec.encode.chain()
+             .v4_swap()
+             .swap_exact_in_single(pool_key=key, zero_for_one=zero_for_one,
+                                   amount_in=int(amount_in),
+                                   amount_out_min=int(amount_out_min))
+             .take_all(checksum(token_out), 0)
+             .settle_all(checksum(pool_key["currency0"] if zero_for_one else pool_key["currency1"]),
+                         int(amount_in))
+             .build_v4_swap())
+    deadline = int(time.time()) + 300
+    return chain.build(deadline)
+
+
+async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
+                      is_eth_input: bool, slippage: float,
+                      price_native: float = 0.0) -> Tuple[bool, str, int]:
+    """V4 swap via the Universal Router (third fallback after V3, V2).
+
+    Quote-first like the other paths: DexScreener native price sets
+    amount_out_min, so an empty/thin pool fails before any transaction. Native
+    input settles currency0 == address(0); token input needs a Permit2 approval
+    to the Universal Router first (sells).
+    """
+    if not V4_TRADING or not V4_CODEC_AVAILABLE:
+        return False, "V4 trading disabled (V4_TRADING=true to enable)", 0
+    ur_addr = get_universal_router(chain)
+    if not ur_addr or not Web3.is_address(ur_addr):
+        return False, f"No Universal Router configured for {chain}", 0
+    if not WALLET_ADDRESS:
+        return False, "No wallet loaded", 0
+
+    key = await v4_pool_key_for_token(chain, token_address)
+    if not key:
+        return False, f"No V4 pool found for {chain} {token_address[:10]}...", 0
+
+    c0 = Web3.to_checksum_address(key["currency0"])
+    c1 = Web3.to_checksum_address(key["currency1"])
+    token_ck = Web3.to_checksum_address(token_address)
+    weth = get_weth_address(chain)
+    if is_eth_input:
+        # Native in: pool must take native on one side. zeroForOne when the
+        # native sentinel is currency0 (the common layout).
+        if c0 == Web3.to_checksum_address(V4_NATIVE_SENTINEL):
+            zero_for_one, settle_ccy = True, c0
+        elif c1 == Web3.to_checksum_address(V4_NATIVE_SENTINEL):
+            zero_for_one, settle_ccy = False, c1
+        else:
+            # WNATIVE-routed pool: fall back to wrapped path via currency match.
+            if weth and (c0.lower() == weth.lower() or c1.lower() == weth.lower()):
+                zero_for_one = (c0.lower() == weth.lower())
+                settle_ccy = c0 if zero_for_one else c1
+            else:
+                return False, "V4 pool takes neither native nor WNATIVE input", 0
+    else:
+        if token_ck.lower() == c0.lower():
+            zero_for_one, settle_ccy = True, c1
+        elif token_ck.lower() == c1.lower():
+            zero_for_one, settle_ccy = False, c0
+        else:
+            return False, "V4 pool does not contain the sell token", 0
+
+    amount_native = float(w3.from_wei(amount_in, 'ether')) if is_eth_input else 0.0
+    if is_eth_input:
+        min_out, _ = await v4_quote_min_out(
+            chain, token_address, amount_native, slippage)
+    else:
+        # Sell side: price the output (native) from the token price.
+        try:
+            px = price_native or await get_token_price_native(None, chain, token_address)
+            decimals = await get_token_decimals(chain, token_address)
+            tokens_in = amount_in / (10 ** decimals)
+            min_out = int(tokens_in * (px or 0) * max(0.0, 1 - slippage / 100) * 1e18)
+            if min_out <= 0:
+                return False, "V4 sell quote has no price", 0
+        except Exception as e:
+            return False, f"V4 sell quote failed: {e}", 0
+    if not min_out or min_out <= 0:
+        return False, "V4 quote has no price (DexScreener)", 0
+
+    try:
+        token_out = token_address if is_eth_input else (
+            get_weth_address(chain) or V4_NATIVE_SENTINEL)
+        calldata = await asyncio.to_thread(
+            build_v4_swap_calldata, key, zero_for_one, int(amount_in),
+            int(min_out), token_out, WALLET_ADDRESS, w3.eth.chain_id,
+        )
+    except Exception as e:
+        logger.error(f"V4 calldata build failed: {e}")
+        return False, f"V4 calldata build failed: {e}", 0
+
+    # Sells move ERC20s through the router: Permit2 approval first.
+    if not is_eth_input:
+        try:
+            ok = await ensure_permit2_approval(chain, token_address, ur_addr, int(amount_in))
+            if not ok:
+                return False, "Permit2 approval for Universal Router failed", 0
+        except Exception as e:
+            return False, f"Permit2 approval failed: {e}", 0
+
+    try:
+        gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
+        async with tx_lock(chain):
+            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            tx_dict = {
+                'from': WALLET_ADDRESS,
+                'to': Web3.to_checksum_address(ur_addr),
+                'data': calldata,
+                'nonce': nonce,
+                'gas': 600000,
+                **gas_fields,
+            }
+            if is_eth_input:
+                tx_dict['value'] = int(amount_in)
+            try:
+                estimated = await asyncio.to_thread(
+                    w3.eth.estimate_gas, {k: v for k, v in tx_dict.items() if k != 'gas'})
+                tx_dict['gas'] = int(estimated * 1.3)
+            except Exception as gas_err:
+                logger.warning(f"V4 gas estimation failed for {chain}, using fallback 600k: {gas_err}")
+            tx_hash = await asyncio.to_thread(
+                w3.eth.send_raw_transaction,
+                getattr(w3.eth.account.sign_transaction(tx_dict, PRIVATE_KEY),
+                        'raw_transaction', None)
+                or w3.eth.account.sign_transaction(tx_dict, PRIVATE_KEY).rawTransaction,
+            )
+        logger.info(f"V4 swap tx sent: {tx_hash.hex()} | minOut={min_out} | gas={tx_dict['gas']}")
+        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+        if receipt.status != 1:
+            return False, f"V4 tx reverted: {tx_hash.hex()}", 0
+        # Return the quoted floor as tokens received (receipt has no decoding
+        # without the pool events; monitor_positions re-prices live anyway).
+        return True, tx_hash.hex(), int(min_out)
+    except Exception as e:
+        logger.error(f"V4 swap exception: {e}")
+        return False, str(e), 0
+
+
+async def ensure_permit2_approval(chain: str, token_address: str,
+                                  spender: str, amount: int) -> bool:
+    """Approve the Universal Router via Permit2's approve (one-time per token).
+
+    Standard ERC20 approve(token -> Permit2) then Permit2.approve(token ->
+    router). Returns True when allowance already covers amount.
+    """
+    w3 = w3_instances.get(chain)
+    if not w3 or not WALLET_ADDRESS:
+        return False
+    permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+    try:
+        allowance = await asyncio.to_thread(
+            token.functions.allowance(WALLET_ADDRESS, permit2).call)
+        if int(allowance) < int(amount):
+            gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
+            async with tx_lock(chain):
+                nonce = await asyncio.to_thread(
+                    w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+                tx = token.functions.approve(
+                    Web3.to_checksum_address(permit2), 2**256 - 1
+                ).build_transaction({'from': WALLET_ADDRESS, 'nonce': nonce, **gas_fields})
+                signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+                raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+                tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw)
+                await asyncio.to_thread(
+                    w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+    except Exception as e:
+        logger.warning(f"ERC20->Permit2 approve failed: {e}")
+        return False
+    permit2_abi = [{"inputs": [{"internalType": "address", "name": "token", "type": "address"},
+                               {"internalType": "address", "name": "spender", "type": "address"},
+                               {"internalType": "uint160", "name": "amount", "type": "uint160"},
+                               {"internalType": "uint48", "name": "expiration", "type": "uint48"}],
+                    "name": "approve", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+                   {"inputs": [{"internalType": "address", "name": "owner", "type": "address"},
+                               {"internalType": "address", "name": "token", "type": "address"},
+                               {"internalType": "address", "name": "spender", "type": "address"}],
+                    "name": "allowance",
+                    "outputs": [{"internalType": "uint160", "name": "amount", "type": "uint160"},
+                                {"internalType": "uint48", "name": "expiration", "type": "uint48"},
+                                {"internalType": "uint48", "name": "nonce", "type": "uint48"}],
+                    "stateMutability": "view", "type": "function"}]
+    try:
+        p2 = w3.eth.contract(address=Web3.to_checksum_address(permit2), abi=permit2_abi)
+        allowed, _, _ = await asyncio.to_thread(
+            p2.functions.allowance(WALLET_ADDRESS, token_address, spender).call)
+        if int(allowed) >= int(amount):
+            return True
+        gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
+        async with tx_lock(chain):
+            nonce = await asyncio.to_thread(
+                w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            tx = p2.functions.approve(
+                Web3.to_checksum_address(token_address),
+                Web3.to_checksum_address(spender),
+                2**160 - 1, 2**48 - 1,
+            ).build_transaction({'from': WALLET_ADDRESS, 'nonce': nonce, **gas_fields})
+            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw)
+            receipt = await asyncio.to_thread(
+                w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+            return receipt.status == 1
+    except Exception as e:
+        logger.warning(f"Permit2->router approve failed: {e}")
+        return False
+
 def paper_fill_tokens(amount_native: float, price_native: float, slippage_pct: float) -> Optional[float]:
     """Model a paper fill at the observed native price minus fee/slippage (4.16).
 
@@ -3484,6 +3865,20 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
             human_tokens = tokens_received2 / (10 ** decimals) if tokens_received2 > 0 else 0
             logger.info(f"V2 Buy confirmed: {human_tokens} tokens for {amount_native} {NATIVE_SYMBOL[chain]}")
             return True, tx_hash2, human_tokens
+        if V4_TRADING:
+            # V4 pools are invisible to V2/V3 quoters by construction (singleton
+            # PoolManager, not standalone pool contracts) — most new Robinhood
+            # launches live there now.
+            logger.info(f"V2 failed, trying V4 fallback for {chain} {token_address[:10]}...")
+            success4, tx_hash4, tokens_received4 = await try_v4_swap(
+                w3, chain, token_address, amount_in_wei,
+                is_eth_input=True, slippage=slippage, price_native=price_native or 0.0,
+            )
+            if success4:
+                human_tokens = tokens_received4 / (10 ** decimals) if tokens_received4 > 0 else 0
+                logger.info(f"V4 Buy confirmed: {human_tokens} tokens for {amount_native} {NATIVE_SYMBOL[chain]}")
+                return True, tx_hash4, human_tokens
+            return False, f"V3: {tx_hash} | V2: {tx_hash2} | V4: {tx_hash4}", 0.0
         return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
 async def execute_sell(chain: str, token_address: str, percentage: float = 100.0, slippage: float = None):
@@ -3545,6 +3940,17 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
             native_received = w3.from_wei(weth_received2, 'ether') if weth_received2 > 0 else 0
             logger.info(f"V2 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
             return True, tx_hash2, float(native_received)
+        if V4_TRADING:
+            logger.info(f"V2 sell failed, trying V4 fallback for {chain} {token_address[:10]}...")
+            success4, tx_hash4, weth_received4 = await try_v4_swap(
+                w3, chain, token_address, sell_amount,
+                is_eth_input=False, slippage=slippage,
+            )
+            if success4:
+                native_received = w3.from_wei(weth_received4, 'ether') if weth_received4 > 0 else 0
+                logger.info(f"V4 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
+                return True, tx_hash4, float(native_received)
+            return False, f"V3: {tx_hash} | V2: {tx_hash2} | V4: {tx_hash4}", 0.0
         return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
 async def open_position(chain, token_address, symbol, amount_native, price_usd, price_native=None):

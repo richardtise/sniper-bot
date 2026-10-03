@@ -158,9 +158,14 @@ Uniswap V3 router + V2 router on Ethereum/Base, a PancakeSwap V3 + V2 router on
 BSC, and only a V3 router on Robinhood. A router can only route pools created by
 its *own* factory, so:
 
-* **Uniswap V4 is not reachable at all.** V4 swaps go through the Universal
-  Router + Permit2, which this bot does not implement. No fee-tier setting makes
-  a V4 pool quotable through a V3 router.
+* **Uniswap V4 routes through the Universal Router** (set `V4_TRADING=true`;
+  requires `pip install uniswap-universal-router-decoder`). V4 pools live in the
+  singleton PoolManager, so no V2/V3 quoter can ever see them — the bot tries
+  V3 → V2 → V4 in order at buy/sell time. Verified on UPAY@robinhood (V4,
+  V2MemeHook, 0% fee): pool-key resolution, calldata build, on-chain
+  `eth_call` simulation and DexScreener-price quote all pass. The on-chain
+  V4Quoter is deliberately *not* used: its unlock+callback pattern returns
+  empty revert data through public RPCs on every chain tested.
 * **Every V3 fork needs its own router.** Aerodrome (Base), Pons, `up-v3`,
   Ramses and PancakeSwap-Infinity pools are not routable through a Uniswap or
   PancakeSwap router.
@@ -1122,9 +1127,9 @@ token at different times) — split by token, not by row, when validating.
   in code) because the DexScreener "all pairs" endpoint is dead (404) — but that
   path only ever sees paid shills, so set `USE_GECKOTERMINAL=true` for real
   discovery.
-- Only Uniswap/Pancake-style V3 + V2 routes are supported for swaps. Uniswap V4,
-  Aerodrome (Base), Pons and other V3 forks are **not** routable — the alert says
-  so and withholds the buy buttons. See
+- Swaps route V3 → V2 → V4 (Universal Router, `V4_TRADING=true`) on buy and
+  sell. Aerodrome (Base), Pons and other V3 forks are still **not** routable —
+  the alert says so and withholds the buy buttons. See
   [Tradeable venues](#tradeable-venues--do-you-need-uniswap-v4) for the measured
   coverage and what to add first.
 - `/health` reports why the bot was quiet as counters, not just a log:
