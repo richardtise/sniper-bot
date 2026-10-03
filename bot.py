@@ -723,11 +723,25 @@ def v4_pool_id_to_bytes25(pool_id: str) -> bytes:
     return bytes.fromhex(raw[:50].ljust(50, "0"))
 
 
+# How many times a V4 pool-key read is retried, and the worst-case added
+# latency per swap attempt. Public RPCs 429/timeout single reads regularly; one
+# failed read used to kill the whole V4 leg with "No V4 pool found" (the BAG
+# miss, 2026-10-03). Reads are idempotent, so retrying is safe.
+V4_RESOLVE_RETRIES = int(os.getenv("V4_RESOLVE_RETRIES", "3"))
+V4_RESOLVE_RETRY_DELAY_S = float(os.getenv("V4_RESOLVE_RETRY_DELAY_S", "1.5"))
+
+# DexScreener-price quotes go stale on fast moves. A quote older than this is
+# refused rather than widening slippage silently — the swap fails with a clear
+# message instead of filling at a dead price.
+V4_QUOTE_MAX_AGE_S = float(os.getenv("V4_QUOTE_MAX_AGE_S", "120"))
+
+
 async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
     """PoolKey for a V4 pool id via PositionManager.poolKeys (read-only).
 
     Returns {currency0, currency1, fee, tickSpacing, hooks} or None. Pure
-    on-chain read: no gas, safe to call from the alert path.
+    on-chain read: no gas, safe to call from the alert path. Retried because a
+    single public-RPC timeout used to read as "no V4 pool exists".
     """
     if not WEB3_AVAILABLE:
         return None
@@ -736,21 +750,37 @@ async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
     if not w3 or not posm or not Web3.is_address(posm):
         logger.warning(f"V4 pool-key resolve skipped for {chain}: no w3/position manager")
         return None
-    try:
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(posm),
-            abi=_POSITION_MANAGER_POOLKEYS_ABI,
-        )
-        res = await asyncio.to_thread(
-            contract.functions.poolKeys(v4_pool_id_to_bytes25(pool_id)).call
-        )
-        return {
-            "currency0": res[0], "currency1": res[1], "fee": int(res[2]),
-            "tickSpacing": int(res[3]), "hooks": res[4],
-        }
-    except Exception as e:
-        logger.warning(f"V4 pool-key resolve failed for {chain} {pool_id[:10]}...: {e}")
-        return None
+    last_err = None
+    for attempt in range(1, max(1, V4_RESOLVE_RETRIES) + 1):
+        try:
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(posm),
+                abi=_POSITION_MANAGER_POOLKEYS_ABI,
+            )
+            res = await asyncio.to_thread(
+                contract.functions.poolKeys(v4_pool_id_to_bytes25(pool_id)).call
+            )
+            # A zero-hooks zero-fee zero-address key is "no such pool", not a
+            # pool — poolKeys returns defaults for unknown ids instead of
+            # reverting, so distinguish "not a V4 pool" from "RPC failed".
+            if (res[0] == "0x0000000000000000000000000000000000000000"
+                    and res[1] == "0x0000000000000000000000000000000000000000"):
+                logger.info(f"V4 poolKeys empty for {chain} {pool_id[:10]}... (not a V4 pool)")
+                return None
+            return {
+                "currency0": res[0], "currency1": res[1], "fee": int(res[2]),
+                "tickSpacing": int(res[3]), "hooks": res[4],
+            }
+        except Exception as e:
+            last_err = e
+            if attempt < V4_RESOLVE_RETRIES:
+                logger.warning(
+                    f"V4 pool-key resolve attempt {attempt}/{V4_RESOLVE_RETRIES} "
+                    f"failed for {chain} {pool_id[:10]}...: {e} — retrying")
+                await asyncio.sleep(V4_RESOLVE_RETRY_DELAY_S * attempt)
+    logger.warning(f"V4 pool-key resolve failed for {chain} {pool_id[:10]}... "
+                   f"after {V4_RESOLVE_RETRIES} attempts: {last_err}")
+    return None
 
 SCAN_INTERVAL = max(5, int(_env_float("SCAN_INTERVAL", 30.0)))  # seconds between cycles
 HEARTBEAT_INTERVAL = 3600
@@ -3545,16 +3575,20 @@ async def v4_quote_min_out(chain: str, token_address: str, amount_native: float,
     every chain tested), so the quote comes from the same price feed the bot
     already trusts for alerts. Returns (min_out_raw, pool_key) or (None, None).
     hookData is always empty: V2MemeHook-style hooks need none for vanilla swaps.
+
+    The quote is refused when the price itself is stale: DexScreener updates
+    `priceNative` per trade, so a price older than V4_QUOTE_MAX_AGE_S means the
+    pool has gone quiet and the number no longer describes the market.
     """
     key = await v4_pool_key_for_token(chain, token_address)
     if not key:
         return None, None
-    try:
-        price_native = await get_token_price_native(session, chain, token_address)
-    except Exception as e:
-        logger.warning(f"V4 quote price lookup failed for {chain} {token_address[:10]}...: {e}")
-        return None, None
+    price_native, price_ts = await v4_quote_price(session, chain, token_address)
     if not price_native or price_native <= 0:
+        return None, None
+    if price_ts and (time.time() - price_ts) > V4_QUOTE_MAX_AGE_S:
+        logger.warning(f"V4 quote refused for {chain} {token_address[:10]}...: "
+                       f"price is {time.time() - price_ts:.0f}s old (max {V4_QUOTE_MAX_AGE_S:.0f}s)")
         return None, None
     try:
         decimals = await get_token_decimals(chain, token_address)
@@ -3568,26 +3602,51 @@ async def v4_quote_min_out(chain: str, token_address: str, amount_native: float,
     return min_out_raw, key
 
 
+async def v4_quote_price(session, chain: str, token_address: str) -> Tuple[float, Optional[float]]:
+    """(price_native, observed_at_epoch) from the token's deepest DexScreener pair."""
+    try:
+        data = await _fetch_token_pairs(session, chain, token_address)
+        pair = _deepest_pair(data)
+        if pair:
+            price = float(pair.get("priceNative") or 0)
+            if price > 0:
+                return price, time.time()
+    except Exception as e:
+        logger.warning(f"V4 quote price lookup failed for {chain} {token_address[:10]}...: {e}")
+    return 0.0, None
+
+
 async def v4_pool_key_for_token(chain: str, token_address: str) -> Optional[dict]:
     """PoolKey for the token's deepest V4 pool, via DexScreener + PositionManager.
 
     DexScreener's /tokens/v1/{chain}/{address} response carries each pool's
     address; the deepest-liquidity pool wins (same rule as _deepest_pair). The
     pool id resolves to a PoolKey on-chain. Returns None when no V4 pool exists.
+
+    Retried like the resolution itself: one DexScreener 429 used to read as
+    "token has no pool".
     """
     pair_address = None
-    try:
-        async with aiohttp.ClientSession() as temp_session:
-            data = await fetch_json(
-                temp_session,
-                f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}",
-            )
-        pair = _deepest_pair(data)
-        if pair:
-            pair_address = pair.get("pairAddress")
-    except Exception as e:
-        logger.debug(f"V4 pool discovery failed for {chain} {token_address[:10]}...: {e}")
+    last_err = None
+    for attempt in range(1, max(1, V4_RESOLVE_RETRIES) + 1):
+        try:
+            async with aiohttp.ClientSession() as temp_session:
+                data = await fetch_json(
+                    temp_session,
+                    f"https://api.dexscreener.com/tokens/v1/{chain}/{token_address}",
+                )
+            pair = _deepest_pair(data)
+            if pair and pair.get("pairAddress"):
+                pair_address = pair.get("pairAddress")
+                break
+            last_err = "empty pair list"
+        except Exception as e:
+            last_err = e
+        if attempt < V4_RESOLVE_RETRIES:
+            await asyncio.sleep(V4_RESOLVE_RETRY_DELAY_S * attempt)
     if not pair_address:
+        logger.warning(f"V4 pool discovery failed for {chain} {token_address[:10]}... "
+                       f"after {V4_RESOLVE_RETRIES} attempts: {last_err}")
         return None
     return await resolve_v4_pool_key(chain, pair_address)
 

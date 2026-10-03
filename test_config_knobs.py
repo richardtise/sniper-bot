@@ -561,6 +561,16 @@ class TestV4Knobs(_EnvTestCase):
         self.assertTrue(data.startswith("0x3593564c"),
                         "must be UniversalRouter.execute(bytes,bytes[],uint256)")
 
+    def test_v4_retry_and_staleness_knobs_have_sane_defaults(self):
+        self.assertGreaterEqual(bot.V4_RESOLVE_RETRIES, 2,
+                                "single-attempt resolution caused the BAG miss")
+        self.assertGreater(bot.V4_RESOLVE_RETRY_DELAY_S, 0)
+        self.assertGreater(bot.V4_QUOTE_MAX_AGE_S, 0)
+
+    def test_v4_pool_id_to_bytes25_rejects_garbage(self):
+        with self.assertRaises(Exception):
+            bot.v4_pool_id_to_bytes25("not-a-hex-pool-id")
+
 
 if __name__ == "__main__":
     unittest.main()
