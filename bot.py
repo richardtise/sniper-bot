@@ -3772,6 +3772,10 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
                 'data': calldata,
                 'nonce': nonce,
                 'gas': 600000,
+                # Hand-built dicts do not get web3's automatic chainId fill
+                # (contract build_transaction does) — without this the node
+                # rejects with "invalid chain id for signer: have 0".
+                'chainId': w3.eth.chain_id,
                 **gas_fields,
             }
             if is_eth_input:
