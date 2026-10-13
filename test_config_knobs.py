@@ -543,6 +543,36 @@ class TestV4Knobs(_EnvTestCase):
         bot.V4_TRADING = False
         self.assertFalse(bot.dex_is_supported("robinhood", "uniswap-v4"))
 
+    def test_v4_calldata_derives_currencies_from_the_pool_key(self):
+        """A native-out SELL must take native, never WETH.
+
+        Regression: take_all() was passed the caller's token_out (WETH for every
+        sell), so a sell on a native-side pool told the router to collect a
+        currency the pool held no balance of. Every V4 sell reverted while its
+        quote looked perfectly healthy.
+        """
+        native = "0x0000000000000000000000000000000000000000"
+        token = "0x38cdc65b82c66fc206d09192e6b123fdabf21cfe"
+        weth = bot.get_weth_address("robinhood")
+        sender = "0x" + "11" * 20
+
+        # UPAY-shaped pool: currency0 native, currency1 the token
+        key = {"currency0": native, "currency1": token, "fee": 3000,
+               "tickSpacing": 60, "hooks": native}
+        sell = bot.build_v4_swap_calldata(key, False, 10 ** 18, 10 ** 15,
+                                          token, sender, 4663)
+        self.assertTrue(sell.startswith("0x3593564c"))
+        self.assertNotIn(weth[2:].lower(), sell.lower(),
+                         "a native-out sell must not reference WETH")
+
+        # WETH-side pool: the wrapped address belongs in the calldata
+        key_w = {"currency0": weth, "currency1": token, "fee": 3000,
+                 "tickSpacing": 60, "hooks": native}
+        buy = bot.build_v4_swap_calldata(key_w, True, 10 ** 15, 10 ** 6,
+                                         token, sender, 4663)
+        self.assertIn(weth[2:].lower(), buy.lower(),
+                      "a WETH-side pool must settle WETH")
+
     def test_venue_requirement_names_v4(self):
         self.assertIn("Universal Router",
                       bot.venue_requirement("robinhood", "uniswap-v4"))

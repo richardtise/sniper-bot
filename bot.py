@@ -3327,16 +3327,24 @@ async def build_gas_fields(w3, chain: str, multiplier: float = 1.2) -> dict:
         gas_price = ceiling
     return {'gasPrice': gas_price}
 
-async def ensure_token_approval(chain: str, token_address: str, spender: str, amount: int):
+async def ensure_token_approval(chain: str, token_address: str, spender: str, amount: int) -> bool:
+    """Make sure ``spender`` can pull ``amount`` of the token. True = safe to swap.
+
+    Returns a real status, because the caller used to ignore the old None-means-
+    both-"already approved"-and-"approval failed" return value and proceeded to
+    swap regardless. The router then reverted with Uniswap's ``STF``
+    (safeTransferFrom failed), which reads like a mystery but is just "no
+    allowance" — a guaranteed failure that still cost gas.
+    """
     w3 = w3_instances.get(chain)
-    if not w3 or not PRIVATE_KEY: return None
+    if not w3 or not PRIVATE_KEY: return False
     try:
         token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         async with web3_semaphore:
             allowance = await asyncio.to_thread(
                 token.functions.allowance(WALLET_ADDRESS, Web3.to_checksum_address(spender)).call
             )
-        if allowance >= amount: return None
+        if allowance >= amount: return True
         # Approve only what this sell needs (issue 2.5) instead of 2**256-1.
         # APPROVAL_MULTIPLIER > 1 reduces approval transactions but leaves a
         # larger standing allowance that a router bug could drain — keep it at
@@ -3354,18 +3362,17 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
             raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
             if raw_tx is None:
                 logger.error("Approval failed: could not get raw transaction bytes")
-                return None
+                return False
             tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
         receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
         if receipt.status == 1:
             logger.info(f"Approval confirmed: {tx_hash.hex()} (allowance {approve_amount})")
-            return tx_hash.hex()
-        else:
-            logger.error(f"Approval failed: {tx_hash.hex()}")
-            return None
+            return True
+        logger.error(f"Approval tx REVERTED: {tx_hash.hex()}")
+        return False
     except Exception as e:
         logger.error(f"Approval failed: {e}")
-        return None
+        return False
 
 async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_tier):
     quoter_addr = get_quoter_v2(chain)
@@ -3666,15 +3673,21 @@ def build_v4_swap_calldata(pool_key: dict, zero_for_one: bool, amount_in: int,
         int(pool_key["fee"]), int(pool_key["tickSpacing"]),
         checksum(pool_key["hooks"]),
     )
-    native_in = checksum(pool_key["currency0"]) == checksum(V4_NATIVE_SENTINEL) if zero_for_one else False
+    # Both sides are derived from the pool key, never from the caller: a
+    # single-pool swap always pays out the pool's OTHER currency, and for a
+    # native pool that is address(0) — not WETH. Passing WETH as take_all() for a
+    # native-out pool told the router to collect a currency the pool held no
+    # balance of, so every V4 SELL reverted while its quote looked healthy.
+    # token_out is therefore ignored (kept in the signature for callers).
+    ccy_in = checksum(pool_key["currency0"] if zero_for_one else pool_key["currency1"])
+    ccy_out = checksum(pool_key["currency1"] if zero_for_one else pool_key["currency0"])
     chain = (codec.encode.chain()
              .v4_swap()
              .swap_exact_in_single(pool_key=key, zero_for_one=zero_for_one,
                                    amount_in=int(amount_in),
                                    amount_out_min=int(amount_out_min))
-             .take_all(checksum(token_out), 0)
-             .settle_all(checksum(pool_key["currency0"] if zero_for_one else pool_key["currency1"]),
-                         int(amount_in))
+             .take_all(ccy_out, 0)
+             .settle_all(ccy_in, int(amount_in))
              .build_v4_swap())
     deadline = int(time.time()) + 300
     return chain.build(deadline)
@@ -3819,7 +3832,12 @@ async def ensure_permit2_approval(chain: str, token_address: str,
     if not w3 or not WALLET_ADDRESS:
         return False
     permit2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-    token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+    # web3.py rejects non-checksummed arguments, and these came in from a lower-
+    # cased feed value: every Permit2 allowance read raised, so no V4 sell ever
+    # got past its approval step.
+    token_ck = Web3.to_checksum_address(token_address)
+    spender_ck = Web3.to_checksum_address(spender)
+    token = w3.eth.contract(address=token_ck, abi=ERC20_ABI)
     try:
         allowance = await asyncio.to_thread(
             token.functions.allowance(WALLET_ADDRESS, permit2).call)
@@ -3834,8 +3852,11 @@ async def ensure_permit2_approval(chain: str, token_address: str,
                 signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
                 raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
                 tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw)
-                await asyncio.to_thread(
+                rcpt = await asyncio.to_thread(
                     w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+                if rcpt.status != 1:
+                    logger.warning(f"ERC20->Permit2 approve reverted: {tx_hash.hex()}")
+                    return False
     except Exception as e:
         logger.warning(f"ERC20->Permit2 approve failed: {e}")
         return False
@@ -3855,7 +3876,7 @@ async def ensure_permit2_approval(chain: str, token_address: str,
     try:
         p2 = w3.eth.contract(address=Web3.to_checksum_address(permit2), abi=permit2_abi)
         allowed, _, _ = await asyncio.to_thread(
-            p2.functions.allowance(WALLET_ADDRESS, token_address, spender).call)
+            p2.functions.allowance(WALLET_ADDRESS, token_ck, spender_ck).call)
         if int(allowed) >= int(amount):
             return True
         gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
@@ -3863,9 +3884,7 @@ async def ensure_permit2_approval(chain: str, token_address: str,
             nonce = await asyncio.to_thread(
                 w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
             tx = p2.functions.approve(
-                Web3.to_checksum_address(token_address),
-                Web3.to_checksum_address(spender),
-                2**160 - 1, 2**48 - 1,
+                token_ck, spender_ck, 2**160 - 1, 2**48 - 1,
             ).build_transaction({'from': WALLET_ADDRESS, 'nonce': nonce, **gas_fields})
             signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
             raw = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
@@ -3987,7 +4006,12 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
     if bal == 0: return False, "Zero balance", 0.0
     sell_amount = int(bal * (percentage / 100))
     if sell_amount == 0: return False, "Sell amount too small", 0.0
-    await ensure_token_approval(chain, token_address, router_addr, sell_amount)
+    if not await ensure_token_approval(chain, token_address, router_addr, sell_amount):
+        # Stop here: without an allowance the router can only revert with STF,
+        # which burns gas and tells you nothing.
+        return False, (f"Approval to the {chain} V3 router did not land, so the "
+                       f"sell would revert (STF). Check the token's approve() "
+                       f"behaviour and the wallet's allowance."), 0.0
     success, tx_hash, weth_received = await try_v3_swap(
         w3, chain, token_address, weth_address, sell_amount,
         is_eth_input=False, slippage=slippage
@@ -4167,13 +4191,48 @@ async def get_native_usd_price(session, chain: str) -> float:
         logger.debug(f"Native price fetch failed for {chain}: {e}")
     return cached[0] if cached else 0.0
 
+# A stop that cannot sell must never be silent: the same failure repeats every
+# POSITION_CHECK_INTERVAL seconds, so notify with a throttle instead of flooding.
+SELL_FAIL_NOTIFY_INTERVAL_S = float(os.getenv("SELL_FAIL_NOTIFY_INTERVAL_S", "900"))
+_sell_alert_sent: Dict[str, float] = {}
+
+
+async def _notify_positions_problem(pos, kind: str, reason: str) -> None:
+    """Throttled Telegram warning for a position the bot cannot act on."""
+    key = f"{pos['id']}:{kind}"
+    now = time.time()
+    if now - _sell_alert_sent.get(key, 0.0) < SELL_FAIL_NOTIFY_INTERVAL_S:
+        return
+    _sell_alert_sent[key] = now
+    mode = "📄 PAPER" if pos.get("paper_trade") else "💰 LIVE"
+    await tg_send(
+        f"⚠️ <b>{esc(kind)}</b> — {mode}\n"
+        f"{esc(pos.get('symbol') or '?')} on {esc(str(pos.get('chain')).upper())}\n"
+        f"<code>{esc(reason)}</code>\n"
+        f"<i>Position is still open and being retried every "
+        f"{POSITION_CHECK_INTERVAL}s. This warning repeats at most every "
+        f"{SELL_FAIL_NOTIFY_INTERVAL_S / 60:.0f} min.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def monitor_positions(session):
     while not shutdown_flag:
         try:
             positions = db_get_open_positions()
             for pos in positions:
                 current_price = await get_token_price_usd(session, pos['chain'], pos['token_address'])
-                if current_price <= 0: continue
+                if current_price <= 0:
+                    # Previously a bare `continue`: a position the price feed
+                    # cannot see was never evaluated for a stop at all — no log,
+                    # no alert, the stop simply never fired.
+                    logger.warning(
+                        f"position {pos['id']} {pos.get('symbol')}@{pos['chain']}: "
+                        f"no price from DexScreener, stop not evaluated")
+                    await _notify_positions_problem(
+                        pos, "No price — stop cannot be evaluated",
+                        "DexScreener returned no price for this token")
+                    continue
                 entry_price = pos['entry_price']
                 highest_price = pos['highest_price']
                 if current_price > highest_price:
@@ -4192,6 +4251,10 @@ async def monitor_positions(session):
                         actual_sell = min(sell_pct, remaining)
                         if actual_sell > 0:
                             success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], actual_sell)
+                            if not success:
+                                logger.error(f"take-profit sell FAILED for {pos['id']}: {tx_hash}")
+                                await _notify_positions_problem(
+                                    pos, "Take profit could not sell", str(tx_hash))
                             if success:
                                 level['executed'] = True
                                 db_reduce_position(pos['id'], actual_sell, pnl_pct, tx_hash)
@@ -4212,6 +4275,10 @@ async def monitor_positions(session):
                 if tp_triggered: continue
                 if drop_from_peak >= trailing_stop and pos['remaining_pct'] > 0:
                     success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], 100.0)
+                    if not success:
+                        logger.error(f"trailing stop sell FAILED for {pos['id']}: {tx_hash}")
+                        await _notify_positions_problem(
+                            pos, "Trailing stop could not sell", str(tx_hash))
                     if success:
                         db_close_position(pos['id'], pnl_pct, tx_hash)
                         mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
