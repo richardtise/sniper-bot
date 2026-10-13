@@ -3327,6 +3327,78 @@ async def build_gas_fields(w3, chain: str, multiplier: float = 1.2) -> dict:
         gas_price = ceiling
     return {'gasPrice': gas_price}
 
+NONCE_SEND_RETRIES = int(os.getenv("NONCE_SEND_RETRIES", "3"))
+
+
+async def sign_and_send(w3, chain: str, tx_dict: dict):
+    """Sign and broadcast ``tx_dict``, retrying when the nonce is stale.
+
+    Public RPCs are load-balanced, so ``eth_getTransactionCount(..., 'pending')``
+    can be answered by a node that is behind: the swap then signs a nonce the
+    chain has already consumed and the node answers
+
+        nonce too low: address 0x..., tx: 966 state: 967
+
+    which reads like a wallet problem but is just a stale read. Swaps are already
+    serialised per chain by ``tx_lock``, so re-reading the nonce and retrying is
+    enough. Returns (tx_hash, tx_dict). Callers must NOT hold tx_lock.
+    """
+    last_error = None
+    for attempt in range(1, max(1, NONCE_SEND_RETRIES) + 1):
+        async with tx_lock(chain):
+            tx_dict['nonce'] = await asyncio.to_thread(
+                w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
+            signed = w3.eth.account.sign_transaction(tx_dict, PRIVATE_KEY)
+            raw = getattr(signed, 'raw_transaction',
+                          getattr(signed, 'rawTransaction', None))
+            if raw is None:
+                raise RuntimeError("could not get raw transaction bytes from signed tx")
+            try:
+                tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw)
+                return tx_hash, tx_dict
+            except Exception as e:
+                last_error = e
+                if "nonce" not in str(e).lower() or attempt == NONCE_SEND_RETRIES:
+                    raise
+                logger.warning(f"stale nonce on {chain} (attempt {attempt}/{NONCE_SEND_RETRIES}): "
+                               f"{e} — re-reading the nonce and retrying")
+        await asyncio.sleep(1.0)
+    raise last_error
+
+
+# Selectors of the failures a Universal Router V4 swap actually produces, so the
+# alert says "slippage" instead of an opaque tx hash.
+_V4_REVERT_SELECTORS = {
+    "0x" + Web3.keccak(text="V4TooLittleReceived(uint256,uint256)")[:4].hex():
+        "V4TooLittleReceived — the pool gave less than amount_out_min (slippage)",
+    "0x" + Web3.keccak(text="V4TooMuchRequested(uint256,uint256)")[:4].hex():
+        "V4TooMuchRequested — input exceeded the amount allowed",
+    "0x" + Web3.keccak(text="InsufficientToken()")[:4].hex():
+        "InsufficientToken — the wallet (or allowance) was short of the token",
+    "0x" + Web3.keccak(text="TransactionDeadlinePassed()")[:4].hex():
+        "TransactionDeadlinePassed — the 300s deadline expired before mining",
+    "0x" + Web3.keccak(text="ExecutionFailed(uint256,bytes)")[:4].hex():
+        "ExecutionFailed — a Universal Router command failed",
+} if WEB3_AVAILABLE else {}
+
+
+async def explain_v4_revert(w3, tx_dict: dict, block) -> str:
+    """Best-effort reason for a reverted V4 swap, replayed at its own block."""
+    call = {k: v for k, v in tx_dict.items() if k not in ("gas", "nonce")}
+    try:
+        await asyncio.to_thread(w3.eth.call, call, block)
+        return ("the call succeeds at that block — the pool price moved between "
+                "simulation and mining, which is a slippage problem, not a bug")
+    except Exception as e:
+        text = str(e)
+        data = getattr(e, "data", None)
+        if isinstance(data, str) and len(data) >= 10:
+            known = _V4_REVERT_SELECTORS.get(data[:10].lower())
+            if known:
+                return known
+        return text[:200]
+
+
 async def ensure_token_approval(chain: str, token_address: str, spender: str, amount: int) -> bool:
     """Make sure ``spender`` can pull ``amount`` of the token. True = safe to swap.
 
@@ -3781,38 +3853,34 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
 
     try:
         gas_fields = await build_gas_fields(w3, chain, multiplier=1.2)
-        async with tx_lock(chain):
-            nonce = await asyncio.to_thread(w3.eth.get_transaction_count, WALLET_ADDRESS, 'pending')
-            tx_dict = {
-                'from': WALLET_ADDRESS,
-                'to': Web3.to_checksum_address(ur_addr),
-                'data': calldata,
-                'nonce': nonce,
-                'gas': 600000,
-                # Hand-built dicts do not get web3's automatic chainId fill
-                # (contract build_transaction does) — without this the node
-                # rejects with "invalid chain id for signer: have 0".
-                'chainId': w3.eth.chain_id,
-                **gas_fields,
-            }
-            if is_eth_input:
-                tx_dict['value'] = int(amount_in)
-            try:
-                estimated = await asyncio.to_thread(
-                    w3.eth.estimate_gas, {k: v for k, v in tx_dict.items() if k != 'gas'})
-                tx_dict['gas'] = int(estimated * 1.3)
-            except Exception as gas_err:
-                logger.warning(f"V4 gas estimation failed for {chain}, using fallback 600k: {gas_err}")
-            tx_hash = await asyncio.to_thread(
-                w3.eth.send_raw_transaction,
-                getattr(w3.eth.account.sign_transaction(tx_dict, PRIVATE_KEY),
-                        'raw_transaction', None)
-                or w3.eth.account.sign_transaction(tx_dict, PRIVATE_KEY).rawTransaction,
-            )
-        logger.info(f"V4 swap tx sent: {tx_hash.hex()} | minOut={min_out} | gas={tx_dict['gas']}")
+        tx_dict = {
+            'from': WALLET_ADDRESS,
+            'to': Web3.to_checksum_address(ur_addr),
+            'data': calldata,
+            'gas': 600000,
+            # Hand-built dicts do not get web3's automatic chainId fill
+            # (contract build_transaction does) — without this the node
+            # rejects with "invalid chain id for signer: have 0".
+            'chainId': w3.eth.chain_id,
+            **gas_fields,
+        }
+        if is_eth_input:
+            tx_dict['value'] = int(amount_in)
+        # Estimation needs no lock; sign_and_send takes it (and is not reentrant).
+        try:
+            estimated = await asyncio.to_thread(
+                w3.eth.estimate_gas, {k: v for k, v in tx_dict.items() if k != 'gas'})
+            tx_dict['gas'] = int(estimated * 1.3)
+        except Exception as gas_err:
+            logger.warning(f"V4 gas estimation failed for {chain}, using fallback 600k: {gas_err}")
+        tx_hash, tx_dict = await sign_and_send(w3, chain, tx_dict)
+        logger.info(f"V4 swap tx sent: {tx_hash.hex()} | nonce={tx_dict.get('nonce')} "
+                    f"| minOut={min_out} | gas={tx_dict['gas']}")
         receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
         if receipt.status != 1:
-            return False, f"V4 tx reverted: {tx_hash.hex()}", 0
+            reason = await explain_v4_revert(w3, tx_dict, receipt.blockNumber)
+            logger.error(f"V4 tx reverted: {tx_hash.hex()} at block {receipt.blockNumber}: {reason}")
+            return False, f"V4 tx reverted: {tx_hash.hex()} — {reason}", 0
         # Return the quoted floor as tokens received (receipt has no decoding
         # without the pool events; monitor_positions re-prices live anyway).
         return True, tx_hash.hex(), int(min_out)
