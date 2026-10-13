@@ -80,7 +80,9 @@ import numpy as np
 import pandas as pd
 
 # ── config ───────────────────────────────────────────────────────────────────
-HORIZON_H = 24.0            # label window (hours)
+HORIZON_H = 24.0            # label window (hours); overridden by --horizon / auto
+HORIZON_SWEEP = (0.5, 1, 2, 3, 6, 12, 24)   # candidates for the automatic pick
+TARGET_LABELED = 0.30       # stop shortening once this share of rows labels
 RUNNER_MULT = 2.0           # "runner" = reached this multiple within the window
 MIN_WINDOW_COVERAGE = 0.90  # forward window must be >= this fraction observed
 GT_OHLCV_AGGREGATE = 5      # minutes per candle
@@ -237,20 +239,31 @@ def prefetch_ohlcv(df: pd.DataFrame, cache_dir: str, max_tokens: int,
     return total
 
 
-def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = False) -> pd.DataFrame:
+def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = False,
+               horizon_h: Optional[float] = None,
+               min_coverage: Optional[float] = None) -> pd.DataFrame:
     """Forward max multiple per row, coverage-gated, scan series by default.
 
     For each row at time t with price p:
-        max_mult = max(high in (t, t+HORIZON]) / p
-    A row is labeled only when the window is >= MIN_WINDOW_COVERAGE observed.
+        max_mult = max(high in (t, t+horizon]) / p
+    A row is labeled only when the window is >= ``min_coverage`` observed.
 
     ``use_gt=False`` labels from the bot's own scan series: no network, instant,
     and still coverage-gated. ``use_gt=True`` prefers GeckoTerminal candles for
     the tokens already warmed by :func:`prefetch_ohlcv` and falls back to the
     scan series for the rest, so it never *loses* rows — it only improves the
     ones it covers.
+
+    WHY THE COVERAGE GATE IS THE WHOLE BALLGAME
+    -------------------------------------------
+    The bot only logs a row while it is scanning a token, and it stops when the
+    token leaves the feeds. Measured span per token is typically ~1.5h. So a
+    6h/24h window is *never* observed for most rows, and labeling them anyway
+    would call every future runner a dud. The horizon must fit the data, which
+    is what :func:`horizon_sweep` decides.
     """
-    span = int(HORIZON_H * 3600)
+    span = int((horizon_h if horizon_h is not None else HORIZON_H) * 3600)
+    min_cov = MIN_WINDOW_COVERAGE if min_coverage is None else min_coverage
     now = time.time()
     # Keyed by row index, NOT appended in group order: this function ends with a
     # re-sort, so a positional list would silently misalign labels whenever the
@@ -599,6 +612,57 @@ def exit_shape(all_rows: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 5b. WHAT HORIZON CAN THIS DATA ACTUALLY SUPPORT?
+# ═════════════════════════════════════════════════════════════════════════════
+
+def observation_spans(df: pd.DataFrame) -> pd.Series:
+    """Hours of scan history per token.
+
+    This is the binding constraint. The bot logs rows only while it is scanning
+    a token, and it stops when the token leaves the feeds — measured ~1.5h
+    median on a real export. A forward window longer than a token's span can
+    never be fully observed, so every row is (correctly) left unlabeled.
+    """
+    g = df.groupby(["chain", "token_address"])["ts_epoch"].agg(["min", "max"])
+    return ((g["max"] - g["min"]) / 3600).rename("span_h")
+
+
+def horizon_sweep(df: pd.DataFrame, cache_dir: str, use_gt: bool,
+                  horizons=HORIZON_SWEEP,
+                  min_coverage: Optional[float] = None) -> pd.DataFrame:
+    """Share of rows labelable at each candidate horizon, and the runner rate.
+
+    Picking the horizon is a data question, not a modelling preference: too long
+    and nothing labels (the failure this exists to prevent), too short and you
+    only measure a brief pop. The sweep makes the trade-off visible instead of
+    hiding it behind a default.
+    """
+    rows = []
+    for h in horizons:
+        mm = label_rows(df, cache_dir, use_gt=use_gt, horizon_h=h,
+                        min_coverage=min_coverage)["max_mult"]
+        lab = mm.notna()
+        rows.append({
+            "horizon_h": h,
+            "labeled_pct": 100.0 * float(lab.mean()),
+            "runner_rate_pct": float((mm[lab] >= RUNNER_MULT).mean() * 100) if lab.any() else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def pick_horizon(sweep: pd.DataFrame, target: float = TARGET_LABELED) -> float:
+    """Shortest horizon that labels at least ``target`` of rows and finds runners.
+
+    Falls back to the most-labelable horizon so the run still does something
+    useful, and lets the operator override with an explicit --horizon.
+    """
+    ok = sweep[(sweep["labeled_pct"] >= 100.0 * target) & sweep["runner_rate_pct"].gt(0)]
+    if len(ok):
+        return float(ok.iloc[0]["horizon_h"])
+    return float(sweep.sort_values("labeled_pct", ascending=False).iloc[0]["horizon_h"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # main
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -607,10 +671,15 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--horizon", type=float, default=HORIZON_H,
-                    help=f"label window in hours (default {HORIZON_H:g}). At 24h only "
-                         "rows whose whole day is observed can be labeled; a long "
-                         "export usually labels far more at 6h.")
+    ap.add_argument("--horizon", default="auto",
+                    help="label window: 'auto' (default) sweeps %.1g-%.0gh and "
+                         "picks the shortest that labels enough rows, or give a "
+                         "number of hours." % (HORIZON_SWEEP[0], HORIZON_SWEEP[-1]))
+    ap.add_argument("--min-coverage", type=float, default=MIN_WINDOW_COVERAGE,
+                    help=f"fraction of the forward window that must be observed "
+                         f"for a row to be labeled (default {MIN_WINDOW_COVERAGE}). "
+                         "Lower it to label more rows at the cost of measuring "
+                         "truncated windows as if they were complete.")
     ap.add_argument("--csv", default="features_*.csv", help="glob of /export files")
     ap.add_argument("--outdir", default="runner_results")
     ap.add_argument("--gt-ohlcv", action="store_true",
@@ -639,9 +708,6 @@ def main() -> int:
     if unknown:
         log(f"(ignoring interpreter arguments: {unknown[:3]})")
     use_gt = bool(args.gt_ohlcv) and not args.no_gt
-    HORIZON_H = float(args.horizon)
-    if HORIZON_H <= 0:
-        raise SystemExit("--horizon must be > 0 hours")
 
     os.makedirs(args.outdir, exist_ok=True)
     cache_dir = os.path.join(args.outdir, ".cache")
@@ -650,27 +716,51 @@ def main() -> int:
     df = load_exports(args.csv)
 
     log("── 1. labeling (coverage-gated) " + "─" * 35)
-    log(f"  horizon: {HORIZON_H:g}h, runner bar: {RUNNER_MULT:g}x")
+    # How long does the bot actually watch a token? This decides the horizon, so
+    # print it before anything else: a window longer than a token's span can
+    # never be observed, and labeling it anyway would call runners duds.
+    spans = observation_spans(df)
+    log("  observation span per token (hours):")
+    log("    " + spans.describe(percentiles=[.5, .75, .9, .95])
+        .round(2).to_string().replace("\n", "\n    "))
     if use_gt:
         prefetch_ohlcv(df, cache_dir, args.max_tokens)
-    df = label_rows(df, cache_dir, use_gt=use_gt)
+
+    if str(args.horizon).lower() == "auto":
+        log("\n  horizon sweep (share of rows labelable, and the runner rate):")
+        sweep = horizon_sweep(df, cache_dir, use_gt,
+                              min_coverage=args.min_coverage)
+        for _, r in sweep.iterrows():
+            extra = (f", runner rate {r['runner_rate_pct']:.1f}%"
+                     if pd.notna(r["runner_rate_pct"]) else "")
+            log(f"    {r['horizon_h']:>5g}h : {r['labeled_pct']:>6.1f}% labelable{extra}")
+        HORIZON_H = pick_horizon(sweep)
+        sweep.to_csv(os.path.join(args.outdir, "horizon_sweep.csv"), index=False)
+        log(f"  → using HORIZON={HORIZON_H:g}h (shortest horizon reaching "
+            f"{100 * TARGET_LABELED:.0f}% of rows; pass --horizon N to override)")
+    else:
+        HORIZON_H = float(args.horizon)
+    if HORIZON_H <= 0:
+        raise SystemExit("--horizon must be > 0 hours or the word 'auto'")
+
+    df = label_rows(df, cache_dir, use_gt=use_gt, horizon_h=HORIZON_H,
+                    min_coverage=args.min_coverage)
     have = df["max_mult"].notna()
+    log(f"\n  horizon {HORIZON_H:g}h, runner bar {RUNNER_MULT:g}x")
     log(f"  labeled {have.sum():,} / {len(df):,} rows "
         f"({100 * have.mean():.1f}%)")
     if len(df):
         log("  label source:\n" + df["label_source"].value_counts().to_string())
     d = df[have].copy()
-    if d.empty:
-        log("  no labeled rows — widen the export or enable OHLCV; stopping")
+    if d.empty or d["runner"].nunique() < 2:
+        log("\n  Nothing modelable: no labeled rows, or only one class present.")
+        log("  Try --horizon auto, a lower --min-coverage, a longer scan history, "
+            "or a lower runner bar. Stopping cleanly.")
         return 1
     log(f"  runner rate among labeled rows: {d['runner'].mean():.3f} "
         f"({int(d['runner'].sum()):,} positives)")
-    if have.mean() < 0.5:
-        log(f"  NOTE: only {100 * have.mean():.0f}% of rows are labelable at a "
-            f"{HORIZON_H:.0f}h horizon — the rest are censored (window not yet "
-            f"elapsed) or truncated (the bot stopped scanning that token).")
-        log("  Lower HORIZON_H (e.g. 4 or 6) to label far more rows, at the cost "
-            "of measuring a shorter pump window.")
+    log("  NOTE: the horizon above is the honest limit of how long the bot "
+        "watched each token — not a property of the token.")
 
     # Optional collapse to one row per token (best hand_score) — the entry
     # decision, rather than the per-scan series.
@@ -690,6 +780,8 @@ def main() -> int:
     uni.to_csv(os.path.join(args.outdir, "univariate.csv"), index=False)
     if len(uni):
         log(uni.head(20).to_string(index=False))
+    else:
+        log("  no feature has >=5 labeled rows in each class")
         log("\n  read: diff_over_sd > 0 means runners are HIGHER on that feature.")
         log("  p_value is per-feature and unadjusted — treat it as a hint, not proof.")
 

@@ -92,7 +92,22 @@ def fetch_current_price(chain, token_address, timeout=10):
         return None
 
 
-def label(conn, horizons, fetch_current=False, verbose=True):
+def label(conn, horizons, fetch_current=False, verbose=True, min_coverage=0.0,
+          stats=None):
+    """Write forward-multiple labels for every row.
+
+    ``min_coverage`` (0.0 = off, the historical behaviour) refuses to label a
+    row whose forward window was not observed to at least that fraction of its
+    length. It matters because the price series comes from the bot's own scan
+    rows and the bot STOPS logging a token when it leaves the feeds: measured
+    span per token is ~1.5h, so a 24h window is usually truncated. Labelling a
+    truncated window computes the max from whatever happened to be observed and
+    calls every later runner a dud.
+
+    ``stats`` (optional dict) is filled with row/window counters so a caller can
+    warn about truncation. Passing ``min_coverage=0`` keeps the old behaviour
+    and only *reports* the problem.
+    """
     max_cols, hit_cols = horizon_columns(horizons)
     added = ensure_columns(conn, max_cols, hit_cols)
     if verbose:
@@ -113,6 +128,8 @@ def label(conn, horizons, fetch_current=False, verbose=True):
 
     now = time.time()
     labeled = 0
+    windows = 0
+    truncated = 0
     live_cache = {}
     for (chain, token), items in groups.items():
         items.sort()
@@ -131,14 +148,28 @@ def label(conn, horizons, fetch_current=False, verbose=True):
             updates = {}
             for col, span in max_cols.items():
                 best = None
+                last_seen = None
                 for j in range(idx + 1, len(items)):
                     if timestamps[j] > ts + span:
                         break
+                    last_seen = timestamps[j]
                     if prices[j] > (best or 0):
                         best = prices[j]
                 if best is None and live_price and (now - ts) <= span:
                     best = live_price
+                    last_seen = now
                 if best is None:
+                    updates[col] = None
+                    continue
+                windows += 1
+                # How much of the window was actually observed? An open window
+                # (still running) is legitimately partial, so only count a
+                # finished-but-short window as truncated.
+                coverage = min(1.0, max(0.0, (last_seen - ts) / span))
+                finished = (now - ts) > span
+                if finished and coverage < 0.9:
+                    truncated += 1
+                if min_coverage > 0 and coverage < min_coverage:
                     updates[col] = None
                 else:
                     updates[col] = best / price
@@ -156,6 +187,9 @@ def label(conn, horizons, fetch_current=False, verbose=True):
             labeled += 1
         conn.commit()
 
+    if stats is not None:
+        stats.update({"rows": len(rows), "tokens": len(groups), "labeled": labeled,
+                      "windows": windows, "truncated": truncated})
     if verbose:
         print(f"Labeled {labeled} rows")
     return labeled
@@ -198,6 +232,13 @@ def main(argv=None):
                         help="comma-separated horizons in hours (default 1,6,24)")
     parser.add_argument("--fetch-current", action="store_true",
                         help="use live DexScreener prices to label the newest rows")
+    parser.add_argument("--min-coverage", type=float, default=0.0,
+                        help="refuse to label a row whose forward window was "
+                             "observed for less than this fraction of its length "
+                             "(0.0 = label anyway, the historical behaviour). The "
+                             "bot stops logging a token when it leaves the feeds, "
+                             "so long horizons are usually truncated — 0.9 is the "
+                             "honest setting for training data.")
     parser.add_argument("--export", metavar="CSV", help="export all feature rows to CSV")
     parser.add_argument("--no-summary", action="store_true")
     args = parser.parse_args(argv)
@@ -218,7 +259,20 @@ def main(argv=None):
         print("No 'features' table found. Run the bot with LOG_FEATURES=true first.", file=sys.stderr)
         return 1
 
-    label(conn, horizons, fetch_current=args.fetch_current)
+    stats = {}
+    label(conn, horizons, fetch_current=args.fetch_current,
+          min_coverage=args.min_coverage, stats=stats)
+    # Truncation is the failure mode that silently poisons a training set, so it
+    # is reported even when min_coverage is off.
+    if stats.get("windows") and stats["truncated"]:
+        pct = 100.0 * stats["truncated"] / stats["windows"]
+        print(f"\n! {stats['truncated']:,} of {stats['windows']:,} windows "
+              f"({pct:.0f}%) were TRUNCATED: the bot stopped scanning the token "
+              f"before the horizon elapsed, so their max is computed from a short "
+              f"slice of time.")
+        print("  Those rows understate the runner rate. Re-run with "
+              "--min-coverage 0.9 to leave them unlabeled, use a shorter "
+              "--horizons, or label from OHLCV instead (colab_runner_analysis.py).")
     if not args.no_summary:
         summarize(conn, horizons)
     if args.export:

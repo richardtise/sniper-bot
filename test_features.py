@@ -206,6 +206,34 @@ class TestLabelOutcomes(unittest.TestCase):
         ).fetchone()[0]
         self.assertIsNone(value)
 
+    def test_min_coverage_refuses_a_truncated_window(self):
+        """The fixture only spans 2h, so a 6h window is 33% observed.
+
+        The coverage gate is what stops a truncated window being labeled from a
+        short slice of time — the failure mode that calls future runners duds.
+        A fully-observed 1h window must still label.
+        """
+        label_outcomes.label(self.conn, [6], verbose=False, min_coverage=0.9)
+        truncated = self.conn.execute(
+            "SELECT max_mult_6h FROM features WHERE ts_epoch=?", (self.base,)
+        ).fetchone()[0]
+        self.assertIsNone(truncated, "a 33%-observed 6h window must not be labeled")
+
+        label_outcomes.label(self.conn, [1], verbose=False, min_coverage=0.9)
+        covered = self.conn.execute(
+            "SELECT max_mult_1h FROM features WHERE ts_epoch=?", (self.base,)
+        ).fetchone()[0]
+        self.assertAlmostEqual(covered, 3.0, msg="a fully-observed 1h window still labels")
+
+    def test_truncation_is_counted_for_the_warning(self):
+        """min_coverage=0 keeps old behaviour but must still report the problem."""
+        stats = {}
+        label_outcomes.label(self.conn, [6], verbose=False, min_coverage=0.0,
+                             stats=stats)
+        self.assertGreater(stats["truncated"], 0,
+                           "the 2h fixture must report a truncated 6h window")
+        self.assertGreaterEqual(stats["windows"], stats["truncated"])
+
     def test_export_csv(self):
         label_outcomes.label(self.conn, [1], verbose=False)
         out = os.path.join(self.tmpdir, "export.csv")

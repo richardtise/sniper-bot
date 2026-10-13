@@ -1046,7 +1046,8 @@ python colab_runner_analysis.py --csv 'features_*.csv' --outdir results \
 
 | Flag | Why |
 |---|---|
-| `--horizon H` | Label window in hours (default 24). At 24h only rows whose **entire day** was observed can be labeled — on a 16h-long export that is 0% of rows. 6h typically labels most of them. |
+| `--horizon auto\|H` | Label window. **Default `auto`** reports the per-token observation span, sweeps `0.5–24h`, and picks the shortest that labels enough rows — because the bot stops logging a token when it leaves the feeds (measured median span **~1.5h**), so a fixed 6h/24h window is usually truncated and labels almost nothing. Pass a number to force it. |
+| `--min-coverage F` | Fraction of the forward window that must be observed before a row may be labeled (default 0.90). Lower it to label more rows at the cost of measuring truncated windows as if complete. |
 | `--gt-ohlcv` / `--max-tokens N` | Opt-in GeckoTerminal candle enrichment. Rate-limited to ~30 calls/min (~2.2s per token), so it is capped at the N most-scanned tokens. **Off by default**: an uncapped pass over a long export is a multi-hour cell. |
 | `--max-creators N` | Cap on Etherscan lookups (default 200), highest multiple first. Also ~0.8s per uncached token. |
 | `--token-level` | One row per token (best `hand_score`) instead of every scan row. |
@@ -1112,8 +1113,19 @@ maximum price each token reached (the repeated scans act as the price series):
 ```bash
 python label_outcomes.py                      # writes max_mult_1h/6h/24h + hit_Nx_* labels
 python label_outcomes.py --fetch-current      # also label the newest rows from live prices
+python label_outcomes.py --min-coverage 0.9   # skip rows whose window was truncated
 python label_outcomes.py --export training.csv
 ```
+
+**Know the truncation trap.** The price series is the bot's own scan rows, and
+the bot stops logging a token once it leaves the feeds — measured median span
+per token is **~1.5h**. A 6h or 24h window is therefore usually truncated, and
+labelling it computes the max from a short slice of time, so a token that 5x'd
+after the bot stopped watching is recorded as a dud. `label_outcomes.py` now
+**counts and reports** such windows on every run; `--min-coverage 0.9` refuses
+to label them at all (rows stay NULL, `diag/fit_thresholds.py` ignores them).
+`colab_runner_analysis.py` goes further: it sweeps horizons and picks one the
+data can actually support. Prefer it for training data.
 
 To see the exact row the bot would write for any token, without running a scan:
 
