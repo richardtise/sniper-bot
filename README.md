@@ -965,7 +965,8 @@ Send `/start` in the chat, then paste a contract address to buy.
 | `/setamounts <chain> <a,b,c>` | Set preset buy sizes (independent per chain). |
 | `/debug` | Log per-chain config and contract status. |
 | `/features` | Feature-logging counters. |
-| `/export [N] [alerts]` | DM the features table as CSV (N newest rows; `alerts` = only alerted rows). No shell needed. |
+| `/export [N] [alerts]` | DM the features table as CSV (N newest rows; `alerts` = only alerted rows). Files target `EXPORT_MAX_MB` each, streamed one at a time so a large cap cannot OOM the host. |
+| `/data` | DB size, feature/token counts, date span, **observation span per token**, and the *live* config (WATCHLIST_*, EXPORT_*, LOG_FEATURES, V4_TRADING). Answers "is my export truncating history?" and "what is this process actually running?" without a shell. |
 | `/late [N]` | Worst alert delays vs first sight — separates discovery latency from gate latency. |
 | `/health` | In-chat health: counters, config file, ceilings, and why the bot was quiet. |
 

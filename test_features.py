@@ -1110,3 +1110,80 @@ class TestSeedOnlySources(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExportChunks(unittest.TestCase):
+    """The streamed /export reader: chunking, headers, byte budget, /data stats."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmpdir, "features.db")
+        self.conn = sqlite3.connect(self.db)
+        self.conn.executescript(bot._feature_schema_sql())
+        self.base = 1_700_000_000
+        # 6 tokens x 10 rows, 5 minutes apart
+        for t in range(6):
+            for k in range(10):
+                _insert_feature(
+                    self.conn, ts_utc=f"t{t}-{k}", ts_epoch=self.base + t * 60 + k * 300,
+                    chain="robinhood", token_address=f"0x{t:040x}", symbol=f"T{t}",
+                    price_usd=1.0 + 0.1 * k, hand_score=50 + t,
+                    alert_sent=1 if t == 0 else 0,
+                )
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_count_and_alerts_filter(self):
+        self.assertEqual(bot.count_export_rows(db_path=self.db), (60, True))
+        self.assertEqual(bot.count_export_rows(alerts_only=True, db_path=self.db), (10, True))
+
+    def test_count_reports_missing_table(self):
+        empty = os.path.join(self.tmpdir, "empty.db")
+        sqlite3.connect(empty).close()
+        self.assertEqual(bot.count_export_rows(db_path=empty), (0, False))
+
+    def test_pagination_covers_every_row_exactly_once(self):
+        seen, after, parts = [], 2 ** 63 - 1, 0
+        while True:
+            data, rows, after = bot.fetch_feature_csv_chunk(
+                after, False, 7, 10 ** 7, self.db)
+            if rows == 0:
+                break
+            parts += 1
+            lines = data.decode("utf-8").splitlines()
+            self.assertEqual(lines[0].split(",")[0], "id",
+                             "each document must carry its own header")
+            self.assertEqual(len(lines), rows + 1)
+            # SELECT * puts id first, then FEATURE_FIELDS: 0=id, 1=ts_utc,
+            # 2=ts_epoch, 3=chain, 4=token_address
+            seen.extend(l.split(",")[4] for l in lines[1:])
+        self.assertEqual(len(seen), 60, "pagination must not drop or duplicate rows")
+        self.assertEqual(len(set(seen)), 6)
+        self.assertGreater(parts, 1, "60 rows at 7 per chunk is several parts")
+
+    def test_byte_budget_stops_a_chunk_early(self):
+        data, rows, _ = bot.fetch_feature_csv_chunk(
+            2 ** 63 - 1, False, 10 ** 6, 2048, self.db)
+        self.assertLess(rows, 60, "the byte budget must cut the chunk short")
+        self.assertLess(len(data), 60 * 2000, "and the result must stay near it")
+
+    def test_data_stats_reports_counts_spans_and_live_config(self):
+        os.environ["FEATURE_DB_PATH"] = self.db
+        saved = bot.FEATURE_DB_PATH
+        bot.FEATURE_DB_PATH = self.db
+        try:
+            txt = bot.collect_data_stats(db_path=self.db)
+        finally:
+            bot.FEATURE_DB_PATH = saved
+            os.environ.pop("FEATURE_DB_PATH", None)
+        self.assertIn("60 rows", txt)
+        self.assertIn("6 tokens", txt)
+        # each token spans 9 intervals of 300s = 0.75h
+        self.assertIn("observation span per token", txt)
+        self.assertIn("0.75", txt)
+        # the point of /data: the LIVE config, not the local .env file
+        self.assertIn("WATCHLIST_MAX=", txt)          # live value, not .env
+        self.assertIn("EXPORT_MAX_ROWS=", txt)
+        self.assertIn("EXPORT_MAX_MB=", txt)

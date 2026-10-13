@@ -189,11 +189,15 @@ ALLOWED_USER_IDS = {
     int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
 }
 
-# /export guardrails: exporting the features table off-host is powerful but the
-# CSV grows without bound, and a 30 MB document send can take minutes on a free
-# host (or fail outright). Both knobs are env-tunable.
-EXPORT_MAX_ROWS = int(os.getenv("EXPORT_MAX_ROWS", "20000"))
-EXPORT_CHUNK_ROWS = int(os.getenv("EXPORT_CHUNK_ROWS", "5000"))
+# /export guardrails. Telegram's Bot API caps ONE document at 50MB, so files
+# target EXPORT_MAX_MB (40MB default) and chunk by BYTES — a row-count cap
+# alone can still emit a document Telegram refuses when rows are wide.
+EXPORT_MAX_MB = max(1.0, float(os.getenv("EXPORT_MAX_MB", "40")))
+EXPORT_MAX_ROWS = int(os.getenv("EXPORT_MAX_ROWS", "200000"))
+EXPORT_CHUNK_ROWS = int(os.getenv("EXPORT_CHUNK_ROWS", "50000"))
+# Bounded window for the /data span statistics, so the query stays cheap on a
+# table with millions of rows.
+DATA_SPAN_SAMPLE_ROWS = int(os.getenv("DATA_SPAN_SAMPLE_ROWS", "500000"))
 
 # ── Ignition watchlist ───────────────────────────────────────────────────────
 # Discovery is event-based: GeckoTerminal's `new_pools` only carries pools from
@@ -4656,6 +4660,9 @@ async def handle_command(message):
     elif cmd == "/export":
         await handle_export_command(message, args)
 
+    elif cmd == "/data":
+        await handle_data_command()
+
     elif cmd == "/late":
         await handle_late_command(args)
 
@@ -4708,37 +4715,69 @@ def _export_db_path() -> str:
     return FEATURE_DB_PATH or DB_PATH
 
 
-def build_features_csv(limit: int = 20000, alerts_only: bool = False,
-                       db_path: Optional[str] = None) -> Tuple[bytes, int, int]:
-    """Dump the features table to CSV bytes (newest rows first).
+def count_export_rows(alerts_only: bool = False,
+                      db_path: Optional[str] = None) -> Tuple[int, bool]:
+    """(rows matching the filter, features table exists).
 
-    Returns (csv_bytes, rows_included, total_rows). Rows are capped at ``limit``
-    so a long-running bot cannot produce a document Telegram refuses to send.
-    Pure function over the DB file: safe to unit-test without a bot instance.
+    Cheap COUNT used before an export so the caption can report the real table
+    size — the number that tells you whether an export is truncating history.
     """
     path = db_path or _export_db_path()
-    limit = max(1, min(int(limit), EXPORT_MAX_ROWS))
     conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
         if "features" not in tables:
-            return b"", 0, 0
-        total = conn.execute("SELECT COUNT(*) FROM features").fetchone()[0]
+            return 0, False
         where = "WHERE alert_sent = 1" if alerts_only else ""
+        return int(conn.execute(
+            f"SELECT COUNT(*) FROM features {where}").fetchone()[0]), True
+    finally:
+        conn.close()
+
+
+def fetch_feature_csv_chunk(after_id: int, alerts_only: bool = False,
+                            max_rows: Optional[int] = None,
+                            max_bytes: Optional[int] = None,
+                            db_path: Optional[str] = None) -> Tuple[bytes, int, int]:
+    """One Telegram-sized CSV document, newest first. Returns (csv, rows, last_id).
+
+    Two reasons this is paged instead of built in one shot:
+
+    * **Memory.** Building a 200k-row CSV as one blob (plus `.decode()` and
+      `.splitlines()`) needs several hundred MB and OOMs a free Render
+      instance. This holds one document at a time.
+    * **Byte budget, not row budget.** Row width varies with symbol and
+      `signal_notes` length, so a fixed row count can still produce a file over
+      Telegram's 50MB document cap. The budget is enforced while writing.
+
+    Keyset pagination on ``id`` (``WHERE id < after_id``) avoids OFFSET scans.
+    """
+    max_rows = EXPORT_CHUNK_ROWS if max_rows is None else max(1, int(max_rows))
+    budget = int(EXPORT_MAX_MB * 1024 * 1024) if max_bytes is None else int(max_bytes)
+    path = db_path or _export_db_path()
+    conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    try:
+        where = "alert_sent = 1 AND " if alerts_only else ""
         cur = conn.execute(
-            f"SELECT * FROM features {where} ORDER BY id DESC LIMIT ?", (limit,)
+            f"SELECT * FROM features WHERE {where}id < ? ORDER BY id DESC LIMIT ?",
+            (int(after_id), max_rows),
         )
         columns = [d[0] for d in cur.description]
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(columns)
-        n = 0
+        writer.writerow(columns)          # every document carries its own header
+        rows = 0
+        last_id = int(after_id)
         for row in cur:
             writer.writerow(row)
-            n += 1
+            rows += 1
+            last_id = int(row[0])
+            if buf.tell() >= budget:      # close enough on bytes for a wide CSV
+                break
+        return buf.getvalue().encode("utf-8"), rows, last_id
     finally:
         conn.close()
-    return buf.getvalue().encode("utf-8"), n, total
 
 
 def build_late_report(limit: int = 20, db_path: Optional[str] = None) -> str:
@@ -4805,48 +4844,201 @@ async def handle_export_command(message, args):
                  "Set LOG_FEATURES=true and restart to start collecting rows.",
             parse_mode=ParseMode.HTML,
         )
-    await bot.send_message(chat_id=CHAT_ID, text="⏳ Building CSV export…")
     try:
-        csv_bytes, included, total = await asyncio.to_thread(
-            build_features_csv, n, alerts_only
-        )
+        total, exists = await asyncio.to_thread(count_export_rows, alerts_only)
     except Exception as e:
-        logger.error(f"/export failed: {e}", exc_info=True)
+        logger.error(f"/export count failed: {e}", exc_info=True)
         await bot.send_message(chat_id=CHAT_ID, text=f"❌ Export failed: {esc(str(e))}",
                                parse_mode=ParseMode.HTML)
         return
-    if included == 0:
+    if not exists:
+        await bot.send_message(chat_id=CHAT_ID, text="No features table (is LOG_FEATURES=true?).")
+        return
+    if total == 0:
         await bot.send_message(
             chat_id=CHAT_ID,
-            text=f"Empty export (table holds {total} rows). "
-                 "If 0, the logger isn't writing — check LOG_FEATURES=true in Render env.",
+            text="Empty export (table holds 0 rows). If that is unexpected, check "
+                 "LOG_FEATURES=true in the Render environment.",
         )
         return
+
+    target = min(n, total)
     date = datetime.now(timezone.utc).strftime("%Y%m%d")
     kind = "alerts" if alerts_only else "features"
-    # Telegram caps a single document at 50 MB; chunk so a big table still lands.
-    chunks = max(1, (included + EXPORT_CHUNK_ROWS - 1) // EXPORT_CHUNK_ROWS)
-    lines = list(csv_bytes.decode("utf-8").splitlines())
-    header, body = lines[0], lines[1:]
-    for i in range(chunks):
-        part = body[i * EXPORT_CHUNK_ROWS:(i + 1) * EXPORT_CHUNK_ROWS]
-        data = ("\n".join([header] + part) + "\n").encode("utf-8")
-        fname = f"{kind}_{date}_p{i + 1}of{chunks}.csv" if chunks > 1 else f"{kind}_{date}.csv"
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text=(f"⏳ Exporting up to <b>{target:,}</b> of <b>{total:,}</b> table rows, "
+              f"≈{EXPORT_MAX_MB:g}MB per file. "
+              f"<i>Table total is the number that shows whether an export is "
+              f"truncating history.</i>"),
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Streamed: one document is built, sent, then released. Nothing holds the
+    # whole export in memory, which is what makes a large cap safe on a small host.
+    after_id = 2 ** 63 - 1
+    sent = 0
+    part = 1
+    while sent < target:
+        want = min(EXPORT_CHUNK_ROWS, target - sent)
+        try:
+            data, rows, after_id = await asyncio.to_thread(
+                fetch_feature_csv_chunk, after_id, alerts_only, want, None)
+        except Exception as e:
+            logger.error(f"/export read failed: {e}", exc_info=True)
+            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Export failed: {esc(str(e))}",
+                                   parse_mode=ParseMode.HTML)
+            return
+        if rows == 0:
+            break
+        fname = f"{kind}_{date}_p{part}.csv"
+        first, last = sent + 1, sent + rows
         try:
             await bot.send_document(
                 chat_id=CHAT_ID,
                 document=InputFile(data, filename=fname),
-                caption=(f"📦 <b>{kind}.csv</b>: rows {i * EXPORT_CHUNK_ROWS + 1}–"
-                         f"{i * EXPORT_CHUNK_ROWS + len(part)} of {included} "
-                         f"(table: {total})" if chunks > 1 else
-                         f"📦 <b>{kind}.csv</b>: {included} rows (table holds {total})"),
+                caption=(f"📦 <b>{fname}</b> — rows {first:,}–{last:,} of {target:,} "
+                         f"| {len(data) / 1e6:.1f}MB | table: {total:,}"),
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError as e:
             logger.error(f"/export send failed: {e}")
-            await bot.send_message(chat_id=CHAT_ID, text=f"❌ Send failed: {esc(str(e))}",
-                                   parse_mode=ParseMode.HTML)
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=(f"❌ Send failed on part {part}: {esc(str(e))}\n"
+                      f"<i>If this is a size error, lower EXPORT_MAX_MB.</i>"),
+                parse_mode=ParseMode.HTML)
             return
+        sent += rows
+        part += 1
+
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text=(f"✅ Export done: <b>{sent:,}</b> rows in <b>{part - 1}</b> file(s). "
+              f"Table holds <b>{total:,}</b>"
+              + ("" if sent >= total else f"; the rest is older than the {target:,}-row cap")
+              + ".\n<i>Merge with:</i>\n"
+                "<code>head -n1 *_p1.csv &gt; all.csv; tail -n +2 -q *_p*.csv &gt;&gt; all.csv</code>"),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def collect_data_stats(db_path: Optional[str] = None,
+                       span_sample: Optional[int] = None) -> str:
+    """What is actually in the DB, and which config the bot is really running.
+
+    Exists because a free host gives no shell: every question about table size,
+    history depth and observation span was previously unanswerable from chat,
+    which is how a stale local `.env` value got mistaken for live config.
+    """
+    path = db_path or _export_db_path()
+    span_sample = DATA_SPAN_SAMPLE_ROWS if span_sample is None else int(span_sample)
+    out: List[str] = ["🗄 <b>Data &amp; live config</b>"]
+    try:
+        size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0.0
+    except Exception:
+        size_mb = 0.0
+    out.append(f"DB: <code>{esc(path)}</code> ({size_mb:.1f}MB)")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "features" in tables:
+            total = int(conn.execute("SELECT COUNT(*) FROM features").fetchone()[0])
+            tokens = int(conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM features "
+                "GROUP BY chain, token_address)").fetchone()[0])
+            newest = conn.execute("SELECT MAX(ts_utc) FROM features").fetchone()[0]
+            oldest = conn.execute("SELECT MIN(ts_utc) FROM features").fetchone()[0]
+            last24 = int(conn.execute(
+                "SELECT COUNT(*) FROM features WHERE ts_epoch >= ?",
+                (time.time() - 86400,)).fetchone()[0])
+            out.append(f"<b>features</b>: {total:,} rows | {tokens:,} tokens | "
+                       f"{last24:,} rows in last 24h")
+            out.append(f"  span: {esc(str(oldest))} → {esc(str(newest))}")
+
+            # Observation span per token — the number that decides what label
+            # horizon is even answerable. Bounded to recent rows for speed.
+            rows = conn.execute(
+                "SELECT MIN(ts_epoch), MAX(ts_epoch) FROM ("
+                "  SELECT id, chain, token_address, ts_epoch FROM features"
+                "  ORDER BY id DESC LIMIT ?"
+                ") GROUP BY chain, token_address", (span_sample,)).fetchall()
+            spans = sorted((b - a) / 3600.0 for a, b in rows if a and b and b > a)
+            if spans:
+                def pct(p):
+                    i = min(len(spans) - 1, int(len(spans) * p))
+                    return spans[i]
+                out.append(
+                    f"  <b>observation span per token (hours)</b>: "
+                    f"p25 {pct(.25):.2f} | median {pct(.5):.2f} | "
+                    f"p75 {pct(.75):.2f} | p90 {pct(.9):.2f} | max {spans[-1]:.2f}")
+                out.append(
+                    f"  <i>a forward label window longer than the median span "
+                    f"({pct(.5):.2f}h) can never be fully observed</i>")
+
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+            if "max_mult_24h" in cols:
+                labeled = int(conn.execute(
+                    "SELECT COUNT(*) FROM features WHERE max_mult_24h IS NOT NULL"
+                ).fetchone()[0])
+                out.append(f"  labels present: {labeled:,} rows (label_outcomes.py has run)")
+            else:
+                out.append("  labels present: none (label_outcomes.py has not run here)")
+        else:
+            out.append("no features table — set LOG_FEATURES=true")
+
+        if "alerts" in tables:
+            out.append(f"<b>alerts</b>: "
+                       f"{int(conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]):,} rows")
+        if "watchlist" in tables:
+            out.append(f"<b>watchlist</b>: "
+                       f"{int(conn.execute('SELECT COUNT(*) FROM watchlist').fetchone()[0]):,} pools")
+        if "positions" in tables:
+            open_pos = int(conn.execute(
+                "SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0])
+            out.append(f"<b>open positions</b>: {open_pos:,}")
+    except Exception as e:
+        out.append(f"⚠️ stats error: {esc(str(e))}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if db_conn is not None:      # None outside a running bot; avoid a bogus warning
+        try:
+            out.append(f"watchlist due this cycle: {len(db_watchlist_due())} "
+                       f"(cap {WATCHLIST_MAX})")
+        except Exception:
+            pass
+
+    out.append(
+        "<b>live config</b> (what this process is using):\n"
+        f"  LOG_FEATURES={LOG_FEATURES} | V4_TRADING={V4_TRADING} | "
+        f"SCAN_INTERVAL={SCAN_INTERVAL}s\n"
+        f"  WATCHLIST_ENABLED={WATCHLIST_ENABLED} | WATCHLIST_MAX={WATCHLIST_MAX} "
+        f"| WATCHLIST_TTL_HOURS={WATCHLIST_TTL_HOURS:g} | "
+        f"WATCHLIST_RECHECK_MINUTES={WATCHLIST_RECHECK_MINUTES:g} | "
+        f"WATCHLIST_MIN_BEST_SCORE={WATCHLIST_MIN_BEST_SCORE:g}\n"
+        f"  EXPORT_MAX_ROWS={EXPORT_MAX_ROWS:,} | "
+        f"EXPORT_CHUNK_ROWS={EXPORT_CHUNK_ROWS:,} | EXPORT_MAX_MB={EXPORT_MAX_MB:g}\n"
+        f"  env file: <code>{esc(ENV_FILE_LOADED)}</code>")
+    return "\n".join(out)
+
+
+async def handle_data_command():
+    try:
+        report = await asyncio.to_thread(collect_data_stats)
+    except Exception as e:
+        logger.error(f"/data failed: {e}", exc_info=True)
+        await bot.send_message(chat_id=CHAT_ID, text=f"❌ /data failed: {esc(str(e))}",
+                               parse_mode=ParseMode.HTML)
+        return
+    await bot.send_message(chat_id=CHAT_ID, text=report, parse_mode=ParseMode.HTML)
 
 
 async def handle_late_command(args):
@@ -4961,6 +5153,7 @@ async def send_start_menu():
         f"/setamounts <chain> <a,b,c> — Custom buy sizes (per chain)\n"
         f"/features — Feature-logging stats\n"
         f"/export [N] [alerts] — DM the features table as CSV (N newest rows)\n"
+        f"/data — DB size, token count, observation spans, live config\n"
         f"/late [N] — Worst alert delays vs first sight\n"
         f"/health — What this process is running, why it's quiet"
     )
