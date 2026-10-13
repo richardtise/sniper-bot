@@ -1187,3 +1187,48 @@ class TestExportChunks(unittest.TestCase):
         self.assertIn("WATCHLIST_MAX=", txt)          # live value, not .env
         self.assertIn("EXPORT_MAX_ROWS=", txt)
         self.assertIn("EXPORT_MAX_MB=", txt)
+
+
+class TestPositionMcap(unittest.TestCase):
+    """entry_mcap is persisted and read back, and migrates onto an old table."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmpdir, "pos.db")
+        self._saved = bot.db_conn
+        bot.db_conn = sqlite3.connect(self.db)
+        bot.db_conn.executescript(bot._feature_schema_sql())
+        # positions table WITHOUT the new column, as an old deployment would have
+        bot.db_conn.execute(
+            "CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "chain TEXT, token_address TEXT, symbol TEXT, entry_price REAL, "
+            "highest_price REAL, amount_tokens REAL, amount_native REAL, "
+            "remaining_pct REAL, trailing_stop_pct REAL, take_profit_levels TEXT, "
+            "status TEXT DEFAULT 'open', entry_time REAL, close_time REAL, "
+            "pnl_pct REAL, tx_hash_buy TEXT, tx_hash_sell TEXT, "
+            "paper_trade INTEGER DEFAULT 0)")
+        bot.db_conn.commit()
+
+    def tearDown(self):
+        bot.db_conn.close()
+        bot.db_conn = self._saved
+
+    def test_migration_adds_the_column_to_an_old_table(self):
+        self.assertNotIn("entry_mcap",
+                         {r[1] for r in bot.db_conn.execute("PRAGMA table_info(positions)")})
+        bot.ensure_position_columns(bot.db_conn)
+        self.assertIn("entry_mcap",
+                      {r[1] for r in bot.db_conn.execute("PRAGMA table_info(positions)")})
+        # idempotent
+        bot.ensure_position_columns(bot.db_conn)
+
+    def test_entry_mcap_round_trips(self):
+        bot.ensure_position_columns(bot.db_conn)
+        pos_id = bot.db_add_position(
+            "bsc", "0xabc", "BUZZO", 0.00002, 111258.0, 0.003, 15.0,
+            [{"pct": 50, "sell_pct": 25}], "0xdead", paper=0, entry_mcap=42_000.0)
+        self.assertIsNotNone(pos_id)
+        row = [p for p in bot.db_get_open_positions() if p["id"] == pos_id][0]
+        self.assertAlmostEqual(row["entry_mcap"], 42_000.0)
+        # and the tiered stop can act on it
+        self.assertEqual(bot.trailing_stop_pct_for(row), 15.0)   # default: no tiering

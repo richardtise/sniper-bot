@@ -840,6 +840,17 @@ DEFAULT_TP_LEVELS = [
 ]
 
 DEFAULT_TRAILING_STOP = 15.0
+
+# ── Tiered trailing stop ─────────────────────────────────────────────────────
+# One stop for every cap size treats two different events as the same: a $40k
+# token retracing 30-40% INSIDE an uptrend (normal, and a 15% stop exits before
+# the move) versus a $5M token dropping 15% off its peak (usually the end).
+# TRAILING_STOP_LOWCAP_PCT applies below TRAILING_STOP_MIN_MCAP_USD.
+#   0 (default)  = one stop for every cap, the historical behaviour
+#   35           = low caps get 35% of room instead of 15%
+#   100          = effectively no stop for low caps (a rug then takes 100%)
+TRAILING_STOP_MIN_MCAP_USD = _env_float("TRAILING_STOP_MIN_MCAP_USD", 150_000.0)
+TRAILING_STOP_LOWCAP_PCT = _env_float("TRAILING_STOP_LOWCAP_PCT", 0.0)
 DEFAULT_SLIPPAGE = 5.0
 DEFAULT_RISK_USD = 10.0
 
@@ -1394,6 +1405,19 @@ def _migrate_address_case(conn: sqlite3.Connection):
         logger.warning(f"watchlist address-case migration failed: {e}")
 
 
+def ensure_position_columns(conn: sqlite3.Connection):
+    """Add columns introduced after a deployment's positions table was created.
+
+    CREATE TABLE IF NOT EXISTS does not alter an existing table, so a bot that
+    has been running since before a column existed would never gain it.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+    for name, coltype in (("entry_mcap", "REAL"),):
+        if name not in existing:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {coltype}")
+    conn.commit()
+
+
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     # WAL lets the feature-writer thread write while the bot thread reads.
@@ -1413,7 +1437,8 @@ def init_db() -> sqlite3.Connection:
             remaining_pct REAL DEFAULT 100.0,
             trailing_stop_pct REAL, take_profit_levels TEXT,
             status TEXT DEFAULT 'open', entry_time REAL, close_time REAL,
-            pnl_pct REAL, tx_hash_buy TEXT, tx_hash_sell TEXT, paper_trade INTEGER DEFAULT 0
+            pnl_pct REAL, tx_hash_buy TEXT, tx_hash_sell TEXT, paper_trade INTEGER DEFAULT 0,
+            entry_mcap REAL
         );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY, value TEXT
@@ -1441,6 +1466,7 @@ def init_db() -> sqlite3.Connection:
     """)
     conn.executescript(_feature_schema_sql())
     ensure_feature_columns(conn)  # migrate older feature tables
+    ensure_position_columns(conn)
     conn.executescript(
         "CREATE INDEX IF NOT EXISTS idx_features_token ON features(chain, token_address);"
         "CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_epoch);"
@@ -1608,14 +1634,16 @@ def db_watchlist_prune(now=None):
 
 
 def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, amount_native,
-                    trailing_stop, tp_levels, tx_hash, paper=0):
+                    trailing_stop, tp_levels, tx_hash, paper=0, entry_mcap=None):
     try:
         db_conn.execute(
             "INSERT INTO positions (chain, token_address, symbol, entry_price, highest_price, "
             "amount_tokens, amount_native, remaining_pct, trailing_stop_pct, take_profit_levels, "
-            "status, entry_time, tx_hash_buy, paper_trade) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status, entry_time, tx_hash_buy, paper_trade, entry_mcap) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (chain, token_address, symbol, entry_price, entry_price, amount_tokens, amount_native,
-             100.0, trailing_stop, json.dumps(tp_levels), "open", time.time(), tx_hash, paper)
+             100.0, trailing_stop, json.dumps(tp_levels), "open", time.time(), tx_hash, paper,
+             entry_mcap)
         )
         db_conn.commit()
         return db_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1626,7 +1654,7 @@ def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, am
 def db_get_open_positions():
     cur = db_conn.execute(
         "SELECT id, chain, token_address, symbol, entry_price, highest_price, amount_tokens, "
-        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade "
+        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
         "FROM positions WHERE status='open' ORDER BY entry_time DESC"
     )
     cols = [c[0] for c in cur.description]
@@ -1635,7 +1663,7 @@ def db_get_open_positions():
 def db_get_position(pos_id):
     cur = db_conn.execute(
         "SELECT id, chain, token_address, symbol, entry_price, highest_price, amount_tokens, "
-        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade "
+        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
         "FROM positions WHERE id=?", (pos_id,)
     )
     cols = [c[0] for c in cur.description]
@@ -4112,7 +4140,8 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
             return False, f"V3: {tx_hash} | V2: {tx_hash2} | V4: {tx_hash4}", 0.0
         return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
-async def open_position(chain, token_address, symbol, amount_native, price_usd, price_native=None):
+async def open_position(chain, token_address, symbol, amount_native, price_usd,
+                        price_native=None, market_cap_usd=None):
     trailing_stop = float(db_get_setting("trailing_stop", DEFAULT_TRAILING_STOP))
     tp_levels_raw = db_get_setting("take_profit_levels", json.dumps(DEFAULT_TP_LEVELS))
     tp_levels = json.loads(tp_levels_raw)
@@ -4123,7 +4152,7 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd, 
     pos_id = db_add_position(
         chain, token_address, symbol, price_usd, tokens_received,
         amount_native, trailing_stop, tp_levels, tx_hash,
-        paper=1 if PAPER_TRADING else 0
+        paper=1 if PAPER_TRADING else 0, entry_mcap=market_cap_usd,
     )
     if pos_id is None:
         # The buy DID execute — only the bookkeeping failed (typically a WAL
@@ -4259,10 +4288,29 @@ async def get_native_usd_price(session, chain: str) -> float:
         logger.debug(f"Native price fetch failed for {chain}: {e}")
     return cached[0] if cached else 0.0
 
+def trailing_stop_pct_for(pos: dict) -> float:
+    """The trailing stop this position should actually use.
+
+    Decided by the market cap AT ENTRY, not the current one: as price moves,
+    a position would otherwise drift across the threshold and change its stop
+    mid-trade. Unknown entry cap (positions opened before this existed) keeps
+    the base stop.
+    """
+    base = float(pos.get("trailing_stop_pct") or DEFAULT_TRAILING_STOP)
+    mcap = pos.get("entry_mcap")
+    if TRAILING_STOP_LOWCAP_PCT <= 0 or mcap is None or float(mcap) <= 0:
+        return base
+    return base if float(mcap) >= TRAILING_STOP_MIN_MCAP_USD else TRAILING_STOP_LOWCAP_PCT
+
+
 # A stop that cannot sell must never be silent: the same failure repeats every
 # POSITION_CHECK_INTERVAL seconds, so notify with a throttle instead of flooding.
 SELL_FAIL_NOTIFY_INTERVAL_S = float(os.getenv("SELL_FAIL_NOTIFY_INTERVAL_S", "900"))
 _sell_alert_sent: Dict[str, float] = {}
+# A single DexScreener 429 is not "this token has no price". Warn only after this
+# many consecutive misses for the same position (~2.5 min at 30s per cycle).
+NO_PRICE_ALERT_AFTER = int(os.getenv("NO_PRICE_ALERT_AFTER", "5"))
+_no_price_strikes: Dict[int, int] = {}
 
 
 async def _notify_positions_problem(pos, kind: str, reason: str) -> None:
@@ -4293,14 +4341,20 @@ async def monitor_positions(session):
                 if current_price <= 0:
                     # Previously a bare `continue`: a position the price feed
                     # cannot see was never evaluated for a stop at all — no log,
-                    # no alert, the stop simply never fired.
-                    logger.warning(
-                        f"position {pos['id']} {pos.get('symbol')}@{pos['chain']}: "
-                        f"no price from DexScreener, stop not evaluated")
-                    await _notify_positions_problem(
-                        pos, "No price — stop cannot be evaluated",
-                        "DexScreener returned no price for this token")
+                    # no alert, the stop simply never fired. Now it counts
+                    # CONSECUTIVE misses, so one API blip is not an alarm.
+                    strikes = _no_price_strikes.get(pos['id'], 0) + 1
+                    _no_price_strikes[pos['id']] = strikes
+                    if strikes >= NO_PRICE_ALERT_AFTER:
+                        logger.warning(
+                            f"position {pos['id']} {pos.get('symbol')}@{pos['chain']}: "
+                            f"no price for {strikes} consecutive checks, stop NOT evaluated")
+                        await _notify_positions_problem(
+                            pos, "No price — stop cannot be evaluated",
+                            f"DexScreener returned no price on {strikes} consecutive "
+                            f"checks, so no stop or take-profit can fire")
                     continue
+                _no_price_strikes.pop(pos['id'], None)
                 entry_price = pos['entry_price']
                 highest_price = pos['highest_price']
                 if current_price > highest_price:
@@ -4308,7 +4362,7 @@ async def monitor_positions(session):
                     highest_price = current_price
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 drop_from_peak = ((highest_price - current_price) / highest_price) * 100 if highest_price > 0 else 0
-                trailing_stop = pos['trailing_stop_pct']
+                trailing_stop = trailing_stop_pct_for(pos)
                 tp_levels = json.loads(pos['take_profit_levels'])
                 tp_triggered = False
                 for level in tp_levels:
@@ -4541,7 +4595,7 @@ def build_position_actions_keyboard(pos_id):
 
 async def fetch_pair_info(chain: str, token_address: str) -> dict:
     """Symbol + price info for a token, shared by every buy path."""
-    info = {"symbol": "???", "price_usd": 0.0, "price_native": 0.0}
+    info = {"symbol": "???", "price_usd": 0.0, "price_native": 0.0, "market_cap_usd": 0.0}
     try:
         async with aiohttp.ClientSession() as temp_session:
             data = await fetch_json(
@@ -4552,6 +4606,7 @@ async def fetch_pair_info(chain: str, token_address: str) -> dict:
             info["symbol"] = (pair.get("baseToken") or {}).get("symbol") or "???"
             info["price_usd"] = float(pair.get("priceUsd") or 0)
             info["price_native"] = float(pair.get("priceNative") or 0)
+            info["market_cap_usd"] = float(pair.get("marketCap") or pair.get("fdv") or 0)
     except Exception as e:
         logger.debug(f"Pair info fetch failed for {chain} {token_address[:10]}...: {e}")
     return info
@@ -4567,7 +4622,8 @@ async def _buy_via_callback(chain, token_address, amount, target=None):
         parse_mode=ParseMode.HTML,
     )
     pos_id = await open_position(
-        chain, token_address, symbol, amount, info["price_usd"], info["price_native"]
+        chain, token_address, symbol, amount, info["price_usd"], info["price_native"],
+        market_cap_usd=info.get("market_cap_usd"),
     )
     if pos_id:
         logger.info(f"Position opened via callback: {symbol} id={pos_id}")
@@ -4706,7 +4762,9 @@ async def handle_text_message(message):
                     text=f"⏳ Buying {amount:g} {NATIVE_SYMBOL[chain]} of {esc(symbol)}...",
                     parse_mode=ParseMode.HTML,
                 )
-                await open_position(chain, token, symbol, amount, info["price_usd"], info["price_native"])
+                await open_position(chain, token, symbol, amount, info["price_usd"],
+                                    info["price_native"],
+                                    market_cap_usd=info.get("market_cap_usd"))
             except ValueError:
                 await bot.send_message(chat_id=chat_id, text="❌ Invalid amount. Please send a number.")
             return

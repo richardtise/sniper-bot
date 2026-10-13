@@ -573,6 +573,33 @@ class TestV4Knobs(_EnvTestCase):
         self.assertIn(weth[2:].lower(), buy.lower(),
                       "a WETH-side pool must settle WETH")
 
+    def test_trailing_stop_tiers_by_entry_mcap(self):
+        """Low caps get a wider stop, decided at entry, off by default."""
+        self.save_global("TRAILING_STOP_LOWCAP_PCT")
+        self.save_global("TRAILING_STOP_MIN_MCAP_USD")
+        small = {"trailing_stop_pct": 15.0, "entry_mcap": 40_000.0}
+        big = {"trailing_stop_pct": 15.0, "entry_mcap": 5_000_000.0}
+
+        # default: one stop for every cap (no behaviour change)
+        bot.TRAILING_STOP_LOWCAP_PCT = 0.0
+        self.assertEqual(bot.trailing_stop_pct_for(small), 15.0)
+        self.assertEqual(bot.trailing_stop_pct_for(big), 15.0)
+
+        # tiering on: only sub-threshold caps change
+        bot.TRAILING_STOP_LOWCAP_PCT = 35.0
+        bot.TRAILING_STOP_MIN_MCAP_USD = 150_000.0
+        self.assertEqual(bot.trailing_stop_pct_for(small), 35.0)
+        self.assertEqual(bot.trailing_stop_pct_for(big), 15.0)
+
+        # exactly at the threshold counts as a major
+        self.assertEqual(
+            bot.trailing_stop_pct_for({"trailing_stop_pct": 15.0, "entry_mcap": 150_000.0}),
+            15.0)
+        # unknown entry cap (pre-existing positions) keeps the base stop
+        self.assertEqual(bot.trailing_stop_pct_for({"trailing_stop_pct": 15.0}), 15.0)
+        self.assertEqual(
+            bot.trailing_stop_pct_for({"trailing_stop_pct": 15.0, "entry_mcap": 0}), 15.0)
+
     def test_venue_requirement_names_v4(self):
         self.assertIn("Universal Router",
                       bot.venue_requirement("robinhood", "uniswap-v4"))
