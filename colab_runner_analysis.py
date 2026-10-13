@@ -47,6 +47,18 @@ Usage
     # colab (after uploading your CSVs)
     !python colab_runner_analysis.py --csv '/content/features_*.csv'
 
+    # optional: enrich labels from GeckoTerminal candles (SLOW, rate-limited)
+    !python colab_runner_analysis.py --csv '/content/features_*.csv' --gt-ohlcv \
+        --max-tokens 200
+
+Speed: the default path is entirely local (no network) and finishes in seconds
+even on a large export. `--gt-ohlcv` adds one rate-limited GeckoTerminal call per
+token (~2.2s each, 30 calls/min ceiling), so it is capped by `--max-tokens` —
+enriching 5,000 tokens would take about three hours.
+
+Running this as a Colab `.py` file works too: it parses with `parse_known_args`,
+so the kernel's own `-f .../kernel-*.json` argument does not abort it.
+
 Outputs (in --outdir): tokens_labeled.csv, univariate.csv,
 model_comparison.csv, coefficients.csv, threshold_picker.csv,
 creator_clusters.csv, and a printed report.
@@ -73,6 +85,7 @@ RUNNER_MULT = 2.0           # "runner" = reached this multiple within the window
 MIN_WINDOW_COVERAGE = 0.90  # forward window must be >= this fraction observed
 GT_OHLCV_AGGREGATE = 5      # minutes per candle
 GT_SLEEP_S = 2.0            # polite delay between GeckoTerminal calls
+GT_MAX_TOKENS_DEFAULT = 200  # cap on OHLCV enrichment (see --gt-ohlcv)
 GT_NETWORK = {"ethereum": "eth", "bsc": "bsc", "base": "base", "robinhood": "robinhood"}
 
 # Features that are outcomes, identifiers, or leak the hand score. Never model these.
@@ -153,8 +166,16 @@ def _get_json(url: str, timeout: int = 25) -> Optional[dict]:
     return None
 
 
-def fetch_ohlcv(chain: str, pool: str, cache_dir: str) -> Optional[pd.DataFrame]:
-    """5-minute OHLCV for one pool, cached on disk. Returns ts/close/high."""
+def fetch_ohlcv(chain: str, pool: str, cache_dir: str,
+                cache_only: bool = False) -> Optional[pd.DataFrame]:
+    """5-minute OHLCV for one pool, cached on disk. Returns ts/close/high.
+
+    ``cache_only=True`` never touches the network: it returns the cached frame
+    or None. Labeling uses that mode so the enrichment cap in
+    :func:`prefetch_ohlcv` actually bounds the work — otherwise every token in
+    the export triggers its own rate-limited call, which is what turned a large
+    export into a multi-hour cell.
+    """
     net = GT_NETWORK.get(chain)
     if not net or not isinstance(pool, str) or not pool:
         return None
@@ -168,6 +189,8 @@ def fetch_ohlcv(chain: str, pool: str, cache_dir: str) -> Optional[pd.DataFrame]
         except Exception:
             data = None
     if data is None:
+        if cache_only:
+            return None
         url = (f"https://api.geckoterminal.com/api/v2/networks/{net}/pools/{pool}"
                f"/ohlcv/minute?aggregate={GT_OHLCV_AGGREGATE}&limit=1000&currency=usd&token=base")
         data = _get_json(url)
@@ -184,12 +207,48 @@ def fetch_ohlcv(chain: str, pool: str, cache_dir: str) -> Optional[pd.DataFrame]
     return df.astype({"ts": "int64", "high": "float64", "close": "float64"}).sort_values("ts")
 
 
-def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = True) -> pd.DataFrame:
-    """Forward max multiple per row, coverage-gated, GT OHLCV first.
+def prefetch_ohlcv(df: pd.DataFrame, cache_dir: str, max_tokens: int,
+                   sort_by: str = "scans") -> int:
+    """Warm the OHLCV cache for the most-observed tokens, with progress + ETA.
+
+    GeckoTerminal's free tier is ~30 calls/min, so this is a strictly serial,
+    rate-limited loop: N tokens costs about 2.2*N seconds. Enriching every token
+    in a long export is therefore an overnight job (5,000 tokens ~ 3 hours),
+    which is why it is capped and opt-in. Cached pools are free on re-run.
+    """
+    have = (df.groupby(["chain", "token_address"])
+              .agg(pool=("pair_address", "last"), scans=("ts_epoch", "size"))
+              .reset_index())
+    have = have[have["pool"].notna()]
+    if not len(have):
+        log("  no pair_address values — cannot enrich")
+        return 0
+    have = have.sort_values(sort_by, ascending=False).head(max_tokens)
+    total = len(have)
+    log(f"  OHLCV enrichment for {total} token(s) "
+        f"(~{total * (GT_SLEEP_S + 0.2) / 60:.1f} min at 30 calls/min)")
+    t0 = time.time()
+    for i, (_, r) in enumerate(have.iterrows(), 1):
+        fetch_ohlcv(r["chain"], r["pool"], cache_dir)
+        if i % 25 == 0 or i == total:
+            el = time.time() - t0
+            log(f"    {i}/{total}  elapsed {el / 60:.1f}m  "
+                f"eta {(el / i) * (total - i) / 60:.1f}m")
+    return total
+
+
+def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = False) -> pd.DataFrame:
+    """Forward max multiple per row, coverage-gated, scan series by default.
 
     For each row at time t with price p:
         max_mult = max(high in (t, t+HORIZON]) / p
     A row is labeled only when the window is >= MIN_WINDOW_COVERAGE observed.
+
+    ``use_gt=False`` labels from the bot's own scan series: no network, instant,
+    and still coverage-gated. ``use_gt=True`` prefers GeckoTerminal candles for
+    the tokens already warmed by :func:`prefetch_ohlcv` and falls back to the
+    scan series for the rest, so it never *loses* rows — it only improves the
+    ones it covers.
     """
     span = int(HORIZON_H * 3600)
     now = time.time()
@@ -203,7 +262,10 @@ def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = True) -> pd.Data
     for (chain, token), g in df.groupby(["chain", "token_address"], sort=False):
         g = g.sort_values("ts_epoch")
         pool = g["pair_address"].dropna().iloc[-1] if "pair_address" in g else None
-        candles = fetch_ohlcv(chain, pool, cache_dir) if (use_gt and pool) else None
+        # cache_only: the network work happens once, in prefetch_ohlcv, bounded
+        # by --max-tokens. Fetching here would ignore that cap entirely.
+        candles = (fetch_ohlcv(chain, pool, cache_dir, cache_only=True)
+                   if (use_gt and pool) else None)
         if candles is not None and len(candles):
             c_ts = candles["ts"].to_numpy()
             c_hi = candles["high"].to_numpy()
@@ -216,14 +278,19 @@ def label_rows(df: pd.DataFrame, cache_dir: str, use_gt: bool = True) -> pd.Data
             t = float(row["ts_epoch"])
             p = float(row["price_usd"]) if pd.notna(row.get("price_usd")) else 0.0
             hi, ts, src = None, None, "none"
+            # searchsorted, not a boolean mask per row: masking the whole candle
+            # array (and the group's own scan array) for every row made this
+            # O(rows^2) per token, which dominated on large exports.
             if c_hi is not None:
-                sel = (c_ts > t) & (c_ts <= t + span)
-                if sel.any():
-                    hi, ts, src = c_hi[sel], c_ts[sel], "gt_ohlcv"
+                lo = int(np.searchsorted(c_ts, t, side="right"))
+                hi_i = int(np.searchsorted(c_ts, t + span, side="right"))
+                if hi_i > lo:
+                    hi, ts, src = c_hi[lo:hi_i], c_ts[lo:hi_i], "gt_ohlcv"
             if hi is None:  # fall back to the scan series
-                sel = (s_ts > t) & (s_ts <= t + span)
-                if sel.any():
-                    hi, ts, src = s_px[sel], s_ts[sel], "scan"
+                lo = int(np.searchsorted(s_ts, t, side="right"))
+                hi_i = int(np.searchsorted(s_ts, t + span, side="right"))
+                if hi_i > lo:
+                    hi, ts, src = s_px[lo:hi_i], s_ts[lo:hi_i], "scan"
             if hi is None or not len(hi) or p <= 0:
                 max_by_idx[idx] = np.nan
                 cov_by_idx[idx] = 0.0
@@ -422,7 +489,9 @@ def fetch_creators(tokens: List[Tuple[str, str]], api_key: str,
         except Exception:
             cache = {}
     rows = []
-    for chain, token in tokens:
+    total = len(tokens)
+    t0 = time.time()
+    for n, (chain, token) in enumerate(tokens, 1):
         cid = {"ethereum": "1", "bsc": "56", "base": "8453", "robinhood": "4663"}.get(chain)
         if not cid:
             continue
@@ -444,6 +513,10 @@ def fetch_creators(tokens: List[Tuple[str, str]], api_key: str,
             "factory": (info.get("contractFactory") or "").lower() or None,
             "created_at": info.get("timestamp"),
         })
+        if n % 25 == 0 or n == total:
+            el = time.time() - t0
+            log(f"    creator lookup {n}/{total}  elapsed {el / 60:.1f}m  "
+                f"eta {(el / n) * (total - n) / 60:.1f}m")
     try:
         with open(cache_path, "w") as fh:
             json.dump(cache, fh)
@@ -454,10 +527,22 @@ def fetch_creators(tokens: List[Tuple[str, str]], api_key: str,
 
 def cluster_creators(tokens_df: pd.DataFrame, links: pd.DataFrame,
                      min_tokens: int = 2) -> pd.DataFrame:
-    """Which creators/factories are behind multiple tokens, and how they ran."""
-    m = tokens_df.merge(links, on=["chain", "token_address"], how="left")
+    """Which creators/factories are behind multiple tokens, and how they ran.
+
+    Tolerates ``tokens_df`` that already carries creator/factory columns: merging
+    those again would produce creator_x/creator_y and silently drop the cluster
+    column, so only genuinely missing columns are merged in.
+    """
+    base = tokens_df.copy()
+    need = [c for c in ("creator", "factory") if c not in base.columns]
+    if need:
+        base = base.merge(links[["chain", "token_address"] + need],
+                          on=["chain", "token_address"], how="left")
+    m = base
     out = []
     for col in ("creator", "factory"):
+        if col not in m.columns:
+            continue
         for key, g in m.dropna(subset=[col]).groupby(col):
             if len(g) < min_tokens:
                 continue
@@ -518,17 +603,45 @@ def exit_shape(all_rows: pd.DataFrame) -> pd.DataFrame:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
+    global HORIZON_H   # must precede any read of HORIZON_H in this scope
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--horizon", type=float, default=HORIZON_H,
+                    help=f"label window in hours (default {HORIZON_H:g}). At 24h only "
+                         "rows whose whole day is observed can be labeled; a long "
+                         "export usually labels far more at 6h.")
     ap.add_argument("--csv", default="features_*.csv", help="glob of /export files")
     ap.add_argument("--outdir", default="runner_results")
+    ap.add_argument("--gt-ohlcv", action="store_true",
+                    help="ALSO enrich labels from GeckoTerminal 5m candles. "
+                         "Rate-limited to ~30 calls/min, so it is capped by "
+                         "--max-tokens and takes ~2.2s per token. Off by default "
+                         "because a long export has thousands of tokens.")
+    ap.add_argument("--max-tokens", type=int, default=GT_MAX_TOKENS_DEFAULT,
+                    help=f"cap on OHLCV enrichment (default {GT_MAX_TOKENS_DEFAULT}); "
+                         "tokens with the most scans are enriched first")
     ap.add_argument("--no-gt", action="store_true",
-                    help="skip GeckoTerminal OHLCV and label from the scan series only")
+                    help="(kept for compatibility; OHLCV is already off by default)")
+    ap.add_argument("--max-creators", type=int, default=200,
+                    help="cap on Etherscan creator lookups (default 200). Tokens "
+                         "with the biggest multiple are looked up first, so the "
+                         "cap lands on the runners. ~0.8s per uncached token.")
     ap.add_argument("--etherscan-key", default=os.getenv("ETHERSCAN_API_KEY", ""),
                     help="for the cabal section (contractCreator/contractFactory)")
     ap.add_argument("--token-level", action="store_true",
                     help="model tokens (best row per token) instead of every scan row")
-    args = ap.parse_args()
+    # parse_known_args, not parse_args: running this file from the Colab file
+    # browser executes it with the KERNEL's argv, which carries Jupyter's own
+    # flags (-f /root/.local/share/jupyter/runtime/kernel-*.json). parse_args
+    # then exits with "unrecognized arguments" before any analysis runs.
+    args, unknown = ap.parse_known_args()
+    if unknown:
+        log(f"(ignoring interpreter arguments: {unknown[:3]})")
+    use_gt = bool(args.gt_ohlcv) and not args.no_gt
+    HORIZON_H = float(args.horizon)
+    if HORIZON_H <= 0:
+        raise SystemExit("--horizon must be > 0 hours")
 
     os.makedirs(args.outdir, exist_ok=True)
     cache_dir = os.path.join(args.outdir, ".cache")
@@ -536,8 +649,11 @@ def main() -> int:
     log("── 0. loading exports " + "─" * 50)
     df = load_exports(args.csv)
 
-    log("── 1. labeling (GT OHLCV, coverage-gated) " + "─" * 28)
-    df = label_rows(df, cache_dir, use_gt=not args.no_gt)
+    log("── 1. labeling (coverage-gated) " + "─" * 35)
+    log(f"  horizon: {HORIZON_H:g}h, runner bar: {RUNNER_MULT:g}x")
+    if use_gt:
+        prefetch_ohlcv(df, cache_dir, args.max_tokens)
+    df = label_rows(df, cache_dir, use_gt=use_gt)
     have = df["max_mult"].notna()
     log(f"  labeled {have.sum():,} / {len(df):,} rows "
         f"({100 * have.mean():.1f}%)")
@@ -623,6 +739,12 @@ def main() -> int:
                  .agg(symbol=("symbol", "last"),
                       max_mult=("max_mult", "max"),
                       is_runner=("runner", "max")))
+        # Cap the lookups, highest multiple first: this is a serial, latency-bound
+        # API loop (~0.8s/token uncached), so an uncapped pass over a long export
+        # is the same multi-hour trap as the OHLCV fetch.
+        tok = tok.head(max(1, args.max_creators))
+        log(f"  looking up creators for {len(tok)} token(s) "
+            f"(highest multiple first; cached results are free on re-run)")
         links = fetch_creators(list(zip(tok["chain"], tok["token_address"])),
                                args.etherscan_key,
                                os.path.join(args.outdir, "creators_cache.json"))

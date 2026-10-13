@@ -1041,8 +1041,22 @@ runner rate must be computed walk-forward before it is used live.
 
 ```bash
 python colab_runner_analysis.py --csv 'features_*.csv' --outdir results \
-    --etherscan-key "$ETHERSCAN_API_KEY"
+    --horizon 6 --etherscan-key "$ETHERSCAN_API_KEY"
 ```
+
+| Flag | Why |
+|---|---|
+| `--horizon H` | Label window in hours (default 24). At 24h only rows whose **entire day** was observed can be labeled — on a 16h-long export that is 0% of rows. 6h typically labels most of them. |
+| `--gt-ohlcv` / `--max-tokens N` | Opt-in GeckoTerminal candle enrichment. Rate-limited to ~30 calls/min (~2.2s per token), so it is capped at the N most-scanned tokens. **Off by default**: an uncapped pass over a long export is a multi-hour cell. |
+| `--max-creators N` | Cap on Etherscan lookups (default 200), highest multiple first. Also ~0.8s per uncached token. |
+| `--token-level` | One row per token (best `hand_score`) instead of every scan row. |
+
+Both network loops log progress with an ETA, and both cache to
+`results/.cache/` and `results/creators_cache.json`, so re-runs are free. The
+default path is entirely local and finishes in seconds even on a 60k-row export.
+
+Running it as a Colab `.py` file is supported: it parses with `parse_known_args`,
+so the kernel's own `-f .../kernel-*.json` argument does not abort it.
 
 ```bash
 bot-env/bin/python diag/component_audit.py --pages 3 --csv diag/.cache/audit.csv
