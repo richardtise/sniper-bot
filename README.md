@@ -1018,6 +1018,32 @@ against public APIs; GeckoTerminal responses are cached under `diag/.cache/`).
 | `diag/launchpad_migration.py` | **Do launchpad tokens reach an AMM, and when?** Reads a launchpad's pool listing, samples tokens evenly across age buckets, then measures each token's migration to an AMM and the lag from its birth pool. Age-stratified so a minutes-old token cannot be scored as a migration failure. |
 | `diag/fit_thresholds.py` | **Outcome-fitted thresholds, or a refusal.** Fits on realised forward returns with a time split *and* a token-grouped split, reports the base rate beside every precision, and **refuses to emit anything** below 30 positives across 30 tokens. Run against an empty `features` table it refuses — the honest answer until labelled data exists. |
 
+### `colab_runner_analysis.py` (repo root)
+
+**What do runners have in common, and should the weights change?** Takes the
+`/export` CSV chunks and answers it end to end: labels, univariate effect sizes,
+`hand_score` vs logistic vs gradient boosting on a token-grouped split,
+a `MIN_SCORE`-style threshold picker, exit shape (pump-then-dump vs hold), and
+creator/factory clustering via Etherscan v2 `getcontractcreation`.
+
+Two things it does differently from `label_outcomes.py`, both deliberate:
+
+* Labels come from **GeckoTerminal 5-minute OHLCV**, not only the scan series.
+  The scan series ends when the bot stops watching a token, so a 24h max
+  computed from it labels late runners as duds.
+* A **coverage gate**: a row is labeled only if its forward window was actually
+  observed. Unobserved windows stay NaN and are excluded rather than counted as
+  negatives.
+
+Designed for Google Colab (pandas + scikit-learn + scipy preinstalled), but runs
+anywhere those exist. The creator/factory section is in-sample — a creator's
+runner rate must be computed walk-forward before it is used live.
+
+```bash
+python colab_runner_analysis.py --csv 'features_*.csv' --outdir results \
+    --etherscan-key "$ETHERSCAN_API_KEY"
+```
+
 ```bash
 bot-env/bin/python diag/component_audit.py --pages 3 --csv diag/.cache/audit.csv
 bot-env/bin/python diag/holders_from_logs.py 0xTokenAddress
