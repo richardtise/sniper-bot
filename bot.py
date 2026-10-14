@@ -741,8 +741,246 @@ V4_RESOLVE_RETRY_DELAY_S = float(os.getenv("V4_RESOLVE_RETRY_DELAY_S", "1.5"))
 # message instead of filling at a dead price.
 V4_QUOTE_MAX_AGE_S = float(os.getenv("V4_QUOTE_MAX_AGE_S", "120"))
 
+# ── V4 hook inspection (the tax-hook guard) ──────────────────────────────────
+# A V4 "hook" is arbitrary code the pool calls on every swap, and it is allowed
+# to take value out of the trade. The AXIS/ETH pool on Robinhood Chain
+# (pool 0xe784b69b…b1e2, 2026-10-14) is the worked example: the token is a plain
+# ERC20, sells are NEVER blocked, liquidity and volume look healthy, and every
+# price feed shows the untaxed price — because the skim happens in the hook,
+# outside the AMM price. Its hook declares taxBps()=9999 against
+# BPS_DENOMINATOR()=10000, i.e. 99.99% of the native-ETH side is redirected to
+# taxRecipient() (a plain EOA that also owns the hook). The aggregator sees the
+# gap between the pool's marginal price and the post-tax output and mislabels it
+# "price impact" (-83.81% in the UI). Honeypot checkers call it clean: nothing
+# reverts.
+#
+# The only defence is to read the hook BEFORE trading it. This guard:
+#   * no hook, or address(0)         -> safe, zero extra RPC;
+#   * hook in V4_ALLOWED_HOOKS       -> safe, no RPC (explicit operator trust);
+#   * hook answers taxBps()          -> reject when the tax exceeds
+#                                       MAX_ALLOWED_TAX (percent);
+#   * hook does not answer taxBps()  -> reject (fail closed) unless
+#                                       V4_ALLOW_UNKNOWN_HOOKS=true. A hook we
+#                                       cannot describe is exactly the case where
+#                                       a beforeSwap/afterSwap delta can skim
+#                                       silently.
+# The pool's own fee tier is checked too (V4_MAX_FEE_PCT): the two AXIS/USDG
+# decoy pools are hookless but carry 70.1% and 99.01% fees.
+V4_HOOK_ZERO = "0x0000000000000000000000000000000000000000"
 
-async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
+_V4_HOOK_ABI = [
+    {"inputs": [], "name": "taxBps", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}]},
+    {"inputs": [], "name": "BPS_DENOMINATOR", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}]},
+    {"inputs": [], "name": "taxCurrency", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "address", "name": "", "type": "address"}]},
+    {"inputs": [], "name": "taxRecipient", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "address", "name": "", "type": "address"}]},
+    {"inputs": [], "name": "taxThreshold", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}]},
+    {"inputs": [], "name": "owner", "stateMutability": "view", "type": "function",
+     "outputs": [{"internalType": "address", "name": "", "type": "address"}]},
+]
+
+# A hook's tax rate is set by an owner and can be raised between the alert and
+# the fill, so a cached "safe" verdict goes stale. Cached for the alert path;
+# anything about to sign a transaction asks for a fresh read.
+V4_HOOK_TAX_TTL_S = _env_float("V4_HOOK_TAX_TTL_S", 300.0)
+V4_HOOK_TAX_RETRIES = max(1, int(_env_float("V4_HOOK_TAX_RETRIES", 2)))
+V4_HOOK_TAX_CACHE_MAX = max(16, int(_env_float("V4_HOOK_TAX_CACHE_MAX", 512)))
+_V4_HOOK_TAX_CACHE: Dict[Tuple[str, str], Tuple[float, dict]] = {}
+
+# Hooks the operator has vetted by hand (comma-separated addresses): skip the
+# on-chain lookups and trust them.
+V4_ALLOWED_HOOKS = {
+    a.strip().lower() for a in os.getenv("V4_ALLOWED_HOOKS", "").split(",") if a.strip()
+}
+# Fail closed on a hook whose tax cannot be read. Only set this if you accept
+# that an undescribable hook may skim via beforeSwap/afterSwap deltas.
+V4_ALLOW_UNKNOWN_HOOKS = os.getenv("V4_ALLOW_UNKNOWN_HOOKS", "false").lower() == "true"
+# V4 pool fee is denominated in hundredths of a bip: percent = fee / 10_000.
+# 3000 = 0.30%; the AXIS/USDG decoys are 701000 (70.1%) and 990101 (99.01%).
+V4_MAX_FEE_PCT = _env_float("V4_MAX_FEE_PCT", 5.0)
+# Sell into a pool the guard flagged anyway. Off by default: on a 99.99% hook
+# the sell burns gas to recover dust, which is worse than a clear refusal.
+V4_ALLOW_TAXED_SELLS = os.getenv("V4_ALLOW_TAXED_SELLS", "false").lower() == "true"
+
+
+def v4_fee_pct(fee) -> float:
+    """A V4 fee tier as a percentage (fee is in hundredths of a bip)."""
+    try:
+        return float(fee) / 10_000.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _v4_hook_cache_put(cache_key: Tuple[str, str], verdict: dict) -> None:
+    """Bounded write-through cache. Oldest entry is dropped at the cap."""
+    if len(_V4_HOOK_TAX_CACHE) >= V4_HOOK_TAX_CACHE_MAX:
+        oldest = min(_V4_HOOK_TAX_CACHE, key=lambda k: _V4_HOOK_TAX_CACHE[k][0])
+        _V4_HOOK_TAX_CACHE.pop(oldest, None)
+    _V4_HOOK_TAX_CACHE[cache_key] = (time.time(), verdict)
+
+
+async def v4_hook_verdict(chain: str, hooks: str, force: bool = False) -> dict:
+    """Inspect a V4 hook for a swap tax, failing closed on an unknown hook.
+
+    Returns ``{safe, reason, tax_pct, tax_currency, tax_recipient, owner,
+    unknown, inspected}``. ``safe`` is False whenever the hook may take value
+    out of a swap: a declared tax above MAX_ALLOWED_TAX, a hook that does not
+    answer taxBps()/BPS_DENOMINATOR(), or a hook address with no code at all.
+
+    Never raises: an RPC failure is reported as an unknown hook, which is
+    rejected unless V4_ALLOW_UNKNOWN_HOOKS=true. Reads are cached for
+    V4_HOOK_TAX_TTL_S; ``force=True`` re-reads before a transaction is signed.
+    """
+    verdict = {
+        "safe": True, "reason": "no_hook", "tax_pct": None, "tax_currency": None,
+        "tax_recipient": None, "owner": None, "unknown": False, "inspected": False,
+    }
+    hook = str(hooks or "").strip()
+    if not hook or hook.lower() == V4_HOOK_ZERO or not Web3.is_address(hook):
+        return verdict
+    hook = Web3.to_checksum_address(hook)
+    if hook.lower() in V4_ALLOWED_HOOKS:
+        return {**verdict, "reason": "allowlisted"}
+
+    cache_key = (chain, hook.lower())
+    if not force:
+        hit = _V4_HOOK_TAX_CACHE.get(cache_key)
+        if hit and (time.time() - hit[0]) <= V4_HOOK_TAX_TTL_S:
+            return hit[1]
+
+    if not WEB3_AVAILABLE:
+        return {**verdict, "safe": False, "unknown": True,
+                "reason": "hook_uninspectable_no_web3"}
+    w3 = w3_instances.get(chain)
+    if not w3:
+        return {**verdict, "safe": False, "unknown": True,
+                "reason": "hook_uninspectable_no_rpc"}
+
+    def _read() -> dict:
+        code = w3.eth.get_code(hook)
+        if len(code) == 0:
+            return {"kind": "no_code"}
+        contract = w3.eth.contract(address=hook, abi=_V4_HOOK_ABI)
+        try:
+            bps = int(contract.functions.taxBps().call())
+            denom = int(contract.functions.BPS_DENOMINATOR().call())
+        except Exception:
+            # Not a tax hook, or not introspectable. Either way we cannot say
+            # what it does on a swap.
+            return {"kind": "no_tax_getter"}
+        out = {"kind": "ok", "taxBps": bps, "BPS_DENOMINATOR": denom}
+        for fn in ("taxCurrency", "taxRecipient", "owner", "taxThreshold"):
+            try:
+                out[fn] = getattr(contract.functions, fn)().call()
+            except Exception:
+                out[fn] = None
+        return out
+
+    raw = None
+    last_err = None
+    for attempt in range(1, V4_HOOK_TAX_RETRIES + 1):
+        try:
+            raw = await asyncio.to_thread(_read)
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < V4_HOOK_TAX_RETRIES:
+                await asyncio.sleep(V4_RESOLVE_RETRY_DELAY_S * attempt)
+    if raw is None:
+        res = {**verdict, "safe": bool(V4_ALLOW_UNKNOWN_HOOKS), "unknown": True,
+               "reason": f"hook_unreadable:{type(last_err).__name__}"}
+        _v4_hook_cache_put(cache_key, res)
+        return res
+    if raw["kind"] == "no_code":
+        res = {**verdict, "safe": False, "reason": "hook_has_no_code"}
+        _v4_hook_cache_put(cache_key, res)
+        return res
+    if raw["kind"] == "no_tax_getter":
+        res = {**verdict, "safe": bool(V4_ALLOW_UNKNOWN_HOOKS), "unknown": True,
+               "reason": "hook_no_taxBps"}
+        _v4_hook_cache_put(cache_key, res)
+        return res
+
+    denom = raw.get("BPS_DENOMINATOR") or 10000
+    tax_pct = (raw["taxBps"] / denom * 100.0) if denom else None
+    tax_ccy = raw.get("taxCurrency")
+    res = {
+        "safe": True, "reason": "hook_tax_within_limit", "tax_pct": tax_pct,
+        "tax_currency": tax_ccy, "tax_recipient": raw.get("taxRecipient"),
+        "owner": raw.get("owner"), "tax_threshold": raw.get("taxThreshold"),
+        "unknown": False, "inspected": True,
+    }
+    if tax_pct is not None and tax_pct > MAX_ALLOWED_TAX:
+        res["safe"] = False
+        res["reason"] = f"hook_tax_{tax_pct:.2f}pct"
+        logger.warning(
+            f"V4 tax hook rejected on {chain}: hook={hook} takes {tax_pct:.2f}% of "
+            f"{'native' if str(tax_ccy).lower() == V4_HOOK_ZERO else tax_ccy} "
+            f"(recipient {raw.get('taxRecipient')}, owner {raw.get('owner')}); "
+            f"MAX_ALLOWED_TAX={MAX_ALLOWED_TAX}")
+    _v4_hook_cache_put(cache_key, res)
+    return res
+
+
+def v4_pool_route_reason(key: Optional[dict]) -> Optional[str]:
+    """Why a resolved V4 pool must not be traded, or None when it is fine.
+
+    Covers both halves of the same trick: an absurd fee tier (the AXIS/USDG
+    decoys are 70.1% and 99.01%) and a hook that taxes the swap. Returns None
+    for a pool with no hook and an ordinary fee.
+    """
+    if not key:
+        return None
+    fee_pct = v4_fee_pct(key.get("fee"))
+    if fee_pct > V4_MAX_FEE_PCT:
+        return (f"v4 fee tier {fee_pct:.2f}% exceeds V4_MAX_FEE_PCT="
+                f"{V4_MAX_FEE_PCT:.2f}%")
+    hv = key.get("hook_verdict") or {}
+    if hv.get("safe") is False:
+        tax_pct = hv.get("tax_pct")
+        if tax_pct is not None:
+            detail = (f" (takes {tax_pct:.2f}% of the swap -> "
+                      f"{hv.get('tax_recipient') or 'unknown recipient'})")
+        else:
+            detail = f" ({hv.get('reason')})"
+        return f"v4 hook {key.get('hooks')} taxes swaps{detail}"
+    return None
+
+
+async def v4_route_guard(chain: str, token_address: str, fresh_hook: bool = False) -> dict:
+    """Guard a token's deepest V4 pool: ``{reason, tax_pct, key}``.
+
+    For callers that have no pool key yet — the paper-trading paths, which used
+    to fill at the DexScreener price and so never noticed the hook at all.
+    ``reason`` is None when the route is fine, when the token has no V4 pool
+    (V2/V3 routes are judged by dex_is_supported), or when web3 is unavailable
+    so the offline paper mode keeps working.
+    """
+    out: dict = {"reason": None, "tax_pct": 0.0, "key": None, "verdict": None}
+    try:
+        key = await v4_pool_key_for_token(chain, token_address, fresh_hook=fresh_hook)
+    except Exception as e:
+        logger.warning(f"V4 route guard lookup failed for {chain} "
+                       f"{token_address[:10]}...: {e}")
+        return out
+    if not key:
+        return out
+    out["key"] = key
+    out["verdict"] = key.get("hook_verdict") or {}
+    try:
+        out["tax_pct"] = float(out["verdict"].get("tax_pct") or 0.0)
+    except (TypeError, ValueError):
+        out["tax_pct"] = 0.0
+    out["reason"] = v4_pool_route_reason(key)
+    return out
+
+
+async def resolve_v4_pool_key(chain: str, pool_id: str,
+                              fresh_hook: bool = False) -> Optional[dict]:
     """PoolKey for a V4 pool id via PositionManager.poolKeys (read-only).
 
     Returns {currency0, currency1, fee, tickSpacing, hooks} or None. Pure
@@ -757,6 +995,7 @@ async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
         logger.warning(f"V4 pool-key resolve skipped for {chain}: no w3/position manager")
         return None
     last_err = None
+    key = None
     for attempt in range(1, max(1, V4_RESOLVE_RETRIES) + 1):
         try:
             contract = w3.eth.contract(
@@ -773,10 +1012,11 @@ async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
                     and res[1] == "0x0000000000000000000000000000000000000000"):
                 logger.info(f"V4 poolKeys empty for {chain} {pool_id[:10]}... (not a V4 pool)")
                 return None
-            return {
+            key = {
                 "currency0": res[0], "currency1": res[1], "fee": int(res[2]),
                 "tickSpacing": int(res[3]), "hooks": res[4],
             }
+            break
         except Exception as e:
             last_err = e
             if attempt < V4_RESOLVE_RETRIES:
@@ -784,9 +1024,19 @@ async def resolve_v4_pool_key(chain: str, pool_id: str) -> Optional[dict]:
                     f"V4 pool-key resolve attempt {attempt}/{V4_RESOLVE_RETRIES} "
                     f"failed for {chain} {pool_id[:10]}...: {e} — retrying")
                 await asyncio.sleep(V4_RESOLVE_RETRY_DELAY_S * attempt)
-    logger.warning(f"V4 pool-key resolve failed for {chain} {pool_id[:10]}... "
-                   f"after {V4_RESOLVE_RETRIES} attempts: {last_err}")
-    return None
+    if key is None:
+        logger.warning(f"V4 pool-key resolve failed for {chain} {pool_id[:10]}... "
+                       f"after {V4_RESOLVE_RETRIES} attempts: {last_err}")
+        return None
+    # Inspect the hook here rather than in each caller: every V4 path goes
+    # through this function, so a new caller cannot forget the guard. Reading the
+    # hook is deliberately OUTSIDE the resolve retry loop — a slow hook lookup
+    # must not be retried as if the pool key itself had failed.
+    key["hook_verdict"] = await v4_hook_verdict(chain, key["hooks"], force=fresh_hook)
+    route_reason = v4_pool_route_reason(key)
+    if route_reason:
+        logger.warning(f"V4 pool {pool_id[:10]}... on {chain} is not tradable: {route_reason}")
+    return key
 
 SCAN_INTERVAL = max(5, int(_env_float("SCAN_INTERVAL", 30.0)))  # seconds between cycles
 HEARTBEAT_INTERVAL = 3600
@@ -1673,7 +1923,48 @@ def db_watchlist_prune(now=None):
 
 def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, amount_native,
                     trailing_stop, tp_levels, tx_hash, paper=0, entry_mcap=None):
+    """Insert a position, or MERGE into the open one for the same token.
+
+    Buying the same (chain, token) twice used to create two rows that both
+    claimed shares of one wallet balance — /positions showed the token twice
+    and closing one row drained both. One open row per token instead: entry
+    price is the token-weighted average, amounts and native spent are summed,
+    the trailing stop follows the newest setting, and TP levels keep their
+    executed flags (levels already taken are not re-armed for the added size).
+
+    Returns (pos_id, merged) or (None, False) on failure.
+    """
     try:
+        existing = db_conn.execute(
+            "SELECT id, entry_price, amount_tokens, amount_native, remaining_pct, "
+            "remaining_tokens, highest_price FROM positions "
+            "WHERE chain=? AND token_address=? COLLATE NOCASE AND status='open' "
+            "ORDER BY entry_time LIMIT 1",
+            (chain, token_address),
+        ).fetchone()
+        if existing:
+            pos_id, old_entry, old_amount, old_native, old_rem_pct, old_rem_tokens, old_high = existing
+            old_amount = float(old_amount or 0.0)
+            old_rem_tokens = float(old_rem_tokens if old_rem_tokens is not None
+                                   else old_amount * float(old_rem_pct or 0.0) / 100.0)
+            new_amount = old_amount + float(amount_tokens)
+            new_rem_tokens = old_rem_tokens + float(amount_tokens)
+            new_entry = ((old_entry * old_amount) + (entry_price * float(amount_tokens))) / new_amount \
+                if new_amount > 0 else entry_price
+            new_rem_pct = (100.0 * new_rem_tokens / new_amount) if new_amount > 0 else 0.0
+            db_conn.execute(
+                "UPDATE positions SET entry_price=?, highest_price=?, amount_tokens=?, "
+                "amount_native=?, remaining_tokens=?, remaining_pct=?, trailing_stop_pct=? "
+                "WHERE id=?",
+                (new_entry, max(float(old_high or 0.0), entry_price), new_amount,
+                 float(old_native or 0.0) + float(amount_native), new_rem_tokens, new_rem_pct,
+                 trailing_stop, pos_id)
+            )
+            db_conn.commit()
+            logger.info(
+                f"Merged buy into position {pos_id}: +{amount_tokens} {symbol} "
+                f"-> {new_amount:.4f} total, avg entry ${new_entry:.8f}")
+            return pos_id, True
         db_conn.execute(
             "INSERT INTO positions (chain, token_address, symbol, entry_price, highest_price, "
             "amount_tokens, amount_native, remaining_pct, remaining_tokens, trailing_stop_pct, take_profit_levels, "
@@ -1684,10 +1975,10 @@ def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, am
              entry_mcap)
         )
         db_conn.commit()
-        return db_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return db_conn.execute("SELECT last_insert_rowid()").fetchone()[0], False
     except Exception as e:
         logger.error(f"DB add position failed: {e}")
-        return None
+        return None, False
 
 def db_get_open_positions():
     cur = db_conn.execute(
@@ -3752,6 +4043,14 @@ async def v4_quote_min_out(chain: str, token_address: str, amount_native: float,
     key = await v4_pool_key_for_token(chain, token_address)
     if not key:
         return None, None
+    # Refuse to quote a pool the hook guard flagged. This is the gate that
+    # matters most: the quote is derived from DexScreener's *marginal* price, so
+    # a hook tax is invisible here — the buy looks cheap, fills, and the exit is
+    # then taxed to nothing (the AXIS case).
+    route_reason = v4_pool_route_reason(key)
+    if route_reason:
+        logger.warning(f"V4 quote refused for {chain} {token_address[:10]}...: {route_reason}")
+        return None, None
     price_native, price_ts = await v4_quote_price(session, chain, token_address)
     if not price_native or price_native <= 0:
         return None, None
@@ -3785,12 +4084,18 @@ async def v4_quote_price(session, chain: str, token_address: str) -> Tuple[float
     return 0.0, None
 
 
-async def v4_pool_key_for_token(chain: str, token_address: str) -> Optional[dict]:
+async def v4_pool_key_for_token(chain: str, token_address: str,
+                               fresh_hook: bool = False) -> Optional[dict]:
     """PoolKey for the token's deepest V4 pool, via DexScreener + PositionManager.
 
     DexScreener's /tokens/v1/{chain}/{address} response carries each pool's
     address; the deepest-liquidity pool wins (same rule as _deepest_pair). The
     pool id resolves to a PoolKey on-chain. Returns None when no V4 pool exists.
+
+    The returned key carries a ``hook_verdict`` (see v4_hook_verdict), so a pool
+    whose hook taxes swaps is visible to the caller instead of looking like an
+    ordinary deep pool. ``fresh_hook=True`` re-reads the hook's tax rate for
+    callers about to sign a transaction.
 
     Retried like the resolution itself: one DexScreener 429 used to read as
     "token has no pool".
@@ -3817,7 +4122,7 @@ async def v4_pool_key_for_token(chain: str, token_address: str) -> Optional[dict
         logger.warning(f"V4 pool discovery failed for {chain} {token_address[:10]}... "
                        f"after {V4_RESOLVE_RETRIES} attempts: {last_err}")
         return None
-    return await resolve_v4_pool_key(chain, pair_address)
+    return await resolve_v4_pool_key(chain, pair_address, fresh_hook=fresh_hook)
 
 
 def build_v4_swap_calldata(pool_key: dict, zero_for_one: bool, amount_in: int,
@@ -3860,6 +4165,14 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
     amount_out_min, so an empty/thin pool fails before any transaction. Native
     input settles currency0 == address(0); token input needs a Permit2 approval
     to the Universal Router first (sells).
+
+    The hook guard runs before anything is signed, with a fresh (uncached) tax
+    read: a pool whose hook taxes swaps is refused outright on the buy side, and
+    on the sell side unless V4_ALLOW_TAXED_SELLS=true. Note how badly the old
+    behaviour failed here — the sell floor was computed from the untaxed
+    DexScreener price, so on a taxed pool amountOutMinimum could never be met and
+    every sell reverted with a bare slippage error while the UI insisted the
+    price was fine.
     """
     if not V4_TRADING or not V4_CODEC_AVAILABLE:
         return False, "V4 trading disabled (V4_TRADING=true to enable)", 0
@@ -3869,9 +4182,26 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
     if not WALLET_ADDRESS:
         return False, "No wallet loaded", 0
 
-    key = await v4_pool_key_for_token(chain, token_address)
+    key = await v4_pool_key_for_token(chain, token_address, fresh_hook=True)
     if not key:
         return False, f"No V4 pool found for {chain} {token_address[:10]}...", 0
+
+    verdict = key.get("hook_verdict") or {}
+    try:
+        hook_tax_pct = float(verdict.get("tax_pct") or 0.0)
+    except (TypeError, ValueError):
+        hook_tax_pct = 0.0
+    route_reason = v4_pool_route_reason(key)
+    if route_reason:
+        if is_eth_input or not V4_ALLOW_TAXED_SELLS:
+            logger.error(f"V4 {'buy' if is_eth_input else 'sell'} refused for {chain} "
+                         f"{token_address[:10]}...: {route_reason}")
+            knob = "" if is_eth_input else " Set V4_ALLOW_TAXED_SELLS=true to sell anyway."
+            return False, f"V4 route refused: {route_reason}.{knob}", 0
+        logger.warning(
+            f"V4 SELL into a flagged pool {chain} {token_address[:10]}...: {route_reason} "
+            f"— proceeding because V4_ALLOW_TAXED_SELLS=true. The hook keeps "
+            f"~{hook_tax_pct:.2f}% of the output.")
 
     c0 = Web3.to_checksum_address(key["currency0"])
     c1 = Web3.to_checksum_address(key["currency1"])
@@ -3912,6 +4242,18 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
             decimals = await get_token_decimals(chain, token_address)
             tokens_in = amount_in / (10 ** decimals)
             min_out = int(tokens_in * (price_native or 0) * max(0.0, 1 - slippage / 100) * 1e18)
+            if min_out > 0 and hook_tax_pct > 0:
+                # price_native is DexScreener's MARGINAL price and knows nothing
+                # about the hook, so on a taxed pool the floor above is
+                # unreachable and the swap would revert on amountOutMinimum
+                # instead of executing. Discount the floor by the declared tax
+                # (the operator opted in via V4_ALLOW_TAXED_SELLS) so the sale
+                # actually goes through and the position can be closed.
+                keep = max(0.0, 1.0 - hook_tax_pct / 100.0)
+                min_out = int(min_out * keep)
+                logger.warning(f"V4 sell floor for {chain} {token_address[:10]}... "
+                               f"discounted by the {hook_tax_pct:.2f}% hook tax "
+                               f"(min_out={min_out})")
             if min_out <= 0:
                 logger.warning(f"V4 sell quote calculation resulted in min_out=0 for {chain} {token_address[:10]}... price_native={price_native}")
                 return False, "V4 sell quote has no price", 0
@@ -4072,6 +4414,18 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
     # Paper mode is handled first: it must work with no web3/wallet at all.
     if PAPER_TRADING:
+        # A paper fill must describe a route that could really be taken. It used
+        # to be priced straight off DexScreener, so a hook-taxed V4 pool filled
+        # happily in paper mode and the fake position then looked profitable
+        # until a real sell was attempted (the AXIS case: the paper buy reported
+        # success while the live exit returned ~10% of the trade). v4_route_guard
+        # returns no reason when web3 is unavailable, so offline paper mode is
+        # unaffected.
+        block = (await v4_route_guard(chain, token_address))["reason"]
+        if block:
+            logger.error(f"PAPER BUY refused for {chain} {token_address[:10]}...: {block}")
+            return False, (f"Paper buy refused — the only V4 route is a trap: {block}. "
+                           f"A real fill would be unsellable."), 0.0
         tokens = paper_fill_tokens(amount_native, price_native or 0.0, slippage)
         if tokens is None:
             logger.warning("Paper buy without price_native; using nominal 1000 tokens/native")
@@ -4155,6 +4509,17 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
             price_native = await get_token_price_native(None, chain, token_address)
             if price_native > 0:
                 native_received = tokens_sold * price_native * (1 - PAPER_FEE_PCT / 100.0)
+                # Paper P&L must not pretend a taxed exit pays the marginal
+                # price: apply the hook tax the live route would charge, so the
+                # fake result matches what a real sell would return.
+                guard = await v4_route_guard(chain, token_address)
+                if guard["tax_pct"] > 0:
+                    keep = max(0.0, 1.0 - guard["tax_pct"] / 100.0)
+                    native_received *= keep
+                    logger.warning(
+                        f"PAPER SELL for {chain} {token_address[:10]}... discounted by the "
+                        f"{guard['tax_pct']:.2f}% V4 hook tax -> "
+                        f"~{native_received:.6f} {NATIVE_SYMBOL[chain]}")
         db_log_paper_trade(chain, token_address, "???", "SELL", native_received, 0.0, 0.0)
         logger.info(f"PAPER SELL: {tokens_sold:.4f} tokens on {chain} -> ~{native_received:.6f} {NATIVE_SYMBOL[chain]}")
         return True, "PAPER_TRADE", float(native_received)
@@ -4247,7 +4612,7 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd,
     if not success:
         await tg_send(f"❌ <b>Buy failed for {esc(symbol)}</b>\n{esc(tx_hash)}", parse_mode=ParseMode.HTML)
         return None
-    pos_id = db_add_position(
+    pos_id, merged = db_add_position(
         chain, token_address, symbol, price_usd, tokens_received,
         amount_native, trailing_stop, tp_levels, tx_hash,
         paper=1 if PAPER_TRADING else 0, entry_mcap=market_cap_usd,
@@ -4268,16 +4633,30 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd,
         )
         return None
     mode = "📄 PAPER" if PAPER_TRADING else "💰 LIVE"
-    await tg_send(
-        f"{mode} <b>Position Opened</b>\n"
-        f"{esc(symbol)} on {chain.upper()}\n"
-        f"Spent: {amount_native} {NATIVE_SYMBOL[chain]}\n"
-        f"Received: {tokens_received:.4f} {esc(symbol)}\n"
-        f"Entry: ${price_usd:.6f}\n"
-        f"Trailing stop: {trailing_stop}%\n"
-        f"Tx: <code>{esc(tx_hash)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    if merged:
+        merged_pos = db_get_position(pos_id)
+        await tg_send(
+            f"{mode} <b>Position Increased</b> 🔼\n"
+            f"{esc(symbol)} on {chain.upper()}\n"
+            f"Added: {tokens_received:.4f} {esc(symbol)} for {amount_native} {NATIVE_SYMBOL[chain]}\n"
+            f"Now holding: {merged_pos['amount_tokens']:,.2f} {esc(symbol)}\n"
+            f"Avg entry: ${merged_pos['entry_price']:.6f}\n"
+            f"Trailing stop: {trailing_stop}%\n"
+            f"Tx: <code>{esc(tx_hash)}</code>\n"
+            f"<i>Merged into position #{pos_id} — one row per token.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await tg_send(
+            f"{mode} <b>Position Opened</b>\n"
+            f"{esc(symbol)} on {chain.upper()}\n"
+            f"Spent: {amount_native} {NATIVE_SYMBOL[chain]}\n"
+            f"Received: {tokens_received:.4f} {esc(symbol)}\n"
+            f"Entry: ${price_usd:.6f}\n"
+            f"Trailing stop: {trailing_stop}%\n"
+            f"Tx: <code>{esc(tx_hash)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
     return pos_id
 
 def _position_remaining_tokens(pos_or_row) -> float:
