@@ -666,6 +666,8 @@ V2_HOP_STABLES = {
     "ethereum": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
     "bsc": ["0x55d398326f99059fF775485246999027B3197955", "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"],
     "base": ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"],
+    # Robinhood stablecoins (USDC, USDT) - add if available on Robinhood
+    # These need to be verified/updated as Robinhood chain matures
     "robinhood": [],
 }
 
@@ -1024,6 +1026,37 @@ async def tg_send(text: str, *, retries: int = 3, **kwargs):
 def esc(value) -> str:
     """Escape untrusted text (token names/symbols) for ParseMode.HTML (issue 5.5)."""
     return html_escape(str(value), quote=False)
+
+
+def format_age(age_minutes=None, *, age_seconds=None) -> str:
+    """Human-readable age using d/h/m/s instead of raw minute counts.
+
+    Examples: 38s, 4m 12s, 7h 5m, 3d 2h 41m. Unknown stays "?".
+    """
+    if age_seconds is None:
+        if age_minutes is None:
+            return "?"
+        try:
+            age_seconds = float(age_minutes) * 60.0
+        except (TypeError, ValueError):
+            return "?"
+    try:
+        total = max(0, int(round(float(age_seconds))))
+    except (TypeError, ValueError):
+        return "?"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
 
 security_cache: Dict[str, Tuple[dict, float]] = {}
 holder_cache: Dict[str, Tuple[Tuple[float, float, float], float]] = {}
@@ -1735,7 +1768,7 @@ def _first_sight_note(chain, token, symbol, pair, *, liquidity, market_cap, age_
         "age_minutes": age_minutes, "v5": v5, "source": src,
     }
     _first_sight[key] = record
-    age_txt = f"{age_minutes:.1f}m" if age_minutes is not None else "?"
+    age_txt = format_age(age_minutes)
     logger.info(
         f"FIRST SIGHT {symbol}@{chain} age={age_txt} mcap=${market_cap:,.0f} "
         f"liq=${liquidity:,.0f} v5=${v5:,.0f} [{src}]"
@@ -3162,7 +3195,7 @@ async def evaluate_token(session, pair):
     # GeckoTerminal has no 51-100 band, so top100 is legitimately None. Format
     # defensively: a ":.1f" on None raises and, inside the scanner, silently
     # drops the token.
-    age_display = f"{age_minutes:.0f}" if age_minutes is not None else "?"
+    age_display = format_age(age_minutes)
     t100 = f"{top100:.1f}%" if top100 is not None else "n/a"
 
     cex_count, has_perps, tier1 = await get_cex_listings(session, chain, token)
@@ -3213,7 +3246,7 @@ async def evaluate_token(session, pair):
         if not early_reasons:
             early_ok = True
             if VERBOSE_LOGGING:
-                logger.info(f"Early-runner lane {symbol}@{chain} age={age_display}m score={total_score:.0f}")
+                logger.info(f"Early-runner lane {symbol}@{chain} age={age_display} score={total_score:.0f}")
     feat["early_runner"] = 1 if early_ok else 0
 
     # Abnormal-volume lane. Same AND-gated shape as the early lane, but the
@@ -3257,7 +3290,7 @@ async def evaluate_token(session, pair):
             f"vol={vol_5m/liquidity:.2f}xliq 5m/1h={vol_5m/vol_1h if vol_1h>0 else 0:.2f} "
             f"1h/6h={vol_1h/vol_6h if vol_6h>0 else 0:.2f} 6h/24h={vol_6h/vol_24h if vol_24h>0 else 0:.2f} | "
             f"buy5m={buys_5m}/{sells_5m} buy1h={buys_1h}/{sells_1h} | "
-            f"age={age_display}m | holders top10={top10:.1f}% top50={top50:.1f}% top100={t100} "
+            f"age={age_display} | holders top10={top10:.1f}% top50={top50:.1f}% top100={t100} "
             f"({holders.source or 'unavailable'}) | "
             f"cex={cex_count} perps={has_perps} | base={base_score:.1f} penalties={penalties} "
             f"signal=+{signal_bonus:.0f}/-{signal_penalty:.0f}"
@@ -3437,14 +3470,18 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
     allowance" — a guaranteed failure that still cost gas.
     """
     w3 = w3_instances.get(chain)
-    if not w3 or not PRIVATE_KEY: return False
+    if not w3 or not PRIVATE_KEY:
+        logger.error(f"ensure_token_approval: No Web3 instance or PRIVATE_KEY for {chain}")
+        return False
     try:
         token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         async with web3_semaphore:
             allowance = await asyncio.to_thread(
                 token.functions.allowance(WALLET_ADDRESS, Web3.to_checksum_address(spender)).call
             )
-        if allowance >= amount: return True
+        logger.debug(f"ensure_token_approval: Current allowance={allowance}, required={amount} for {chain} {token_address[:10]}...")
+        if allowance >= amount: 
+            return True
         # Approve only what this sell needs (issue 2.5) instead of 2**256-1.
         # APPROVAL_MULTIPLIER > 1 reduces approval transactions but leaves a
         # larger standing allowance that a router bug could drain — keep it at
@@ -3461,17 +3498,17 @@ async def ensure_token_approval(chain: str, token_address: str, spender: str, am
             signed = w3.eth.account.sign_transaction(approve_tx, PRIVATE_KEY)
             raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
             if raw_tx is None:
-                logger.error("Approval failed: could not get raw transaction bytes")
+                logger.error(f"Approval failed: could not get raw transaction bytes for {chain} {token_address[:10]}...")
                 return False
             tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, raw_tx)
         receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
         if receipt.status == 1:
-            logger.info(f"Approval confirmed: {tx_hash.hex()} (allowance {approve_amount})")
+            logger.info(f"Approval confirmed: {tx_hash.hex()} (allowance {approve_amount}) for {chain} {token_address[:10]}...")
             return True
-        logger.error(f"Approval tx REVERTED: {tx_hash.hex()}")
+        logger.error(f"Approval tx REVERTED: {tx_hash.hex()} for {chain} {token_address[:10]}...")
         return False
     except Exception as e:
-        logger.error(f"Approval failed: {e}")
+        logger.error(f"Approval failed for {chain} {token_address[:10]}...: {e}")
         return False
 
 async def quote_exact_output_v3(w3, chain, token_in, token_out, amount_in, fee_tier):
@@ -3848,13 +3885,17 @@ async def try_v4_swap(w3, chain, token_address: str, amount_in: int,
     else:
         # Sell side: price the output (native) from the token price.
         try:
-            px = price_native or await get_token_price_native(None, chain, token_address)
+            if price_native is None or price_native <= 0:
+                # Use shared session if available, otherwise create temp one
+                price_native = await get_token_price_native(None, chain, token_address)
             decimals = await get_token_decimals(chain, token_address)
             tokens_in = amount_in / (10 ** decimals)
-            min_out = int(tokens_in * (px or 0) * max(0.0, 1 - slippage / 100) * 1e18)
+            min_out = int(tokens_in * (price_native or 0) * max(0.0, 1 - slippage / 100) * 1e18)
             if min_out <= 0:
+                logger.warning(f"V4 sell quote calculation resulted in min_out=0 for {chain} {token_address[:10]}... price_native={price_native}")
                 return False, "V4 sell quote has no price", 0
         except Exception as e:
+            logger.error(f"V4 sell quote failed for {chain} {token_address[:10]}...: {e}")
             return False, f"V4 sell quote failed: {e}", 0
     if not min_out or min_out <= 0:
         return False, "V4 quote has no price (DexScreener)", 0
@@ -4105,9 +4146,10 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
     if not await ensure_token_approval(chain, token_address, router_addr, sell_amount):
         # Stop here: without an allowance the router can only revert with STF,
         # which burns gas and tells you nothing.
+        logger.error(f"Token approval failed for {chain} {token_address[:10]}... - cannot proceed with sell")
         return False, (f"Approval to the {chain} V3 router did not land, so the "
                        f"sell would revert (STF). Check the token's approve() "
-                       f"behaviour and the wallet's allowance."), 0.0
+                       f"behaviour and the wallet's allowance. See logs for details."), 0.0
     success, tx_hash, weth_received = await try_v3_swap(
         w3, chain, token_address, weth_address, sell_amount,
         is_eth_input=False, slippage=slippage
@@ -4117,21 +4159,34 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
         logger.info(f"V3 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
         return True, tx_hash, float(native_received)
     else:
-        # Fallback to V2
+        # Fallback to V2. The V2 router is a DIFFERENT spender from the V3
+        # router approved above — selling through it without its own allowance
+        # reverts with STF (this was the silent trailing-stop/TP killer).
         logger.info(f"V3 sell failed, trying V2 fallback for {chain} {token_address[:10]}...")
-        success2, tx_hash2, weth_received2 = await try_v2_swap(
-            w3, chain, token_address, weth_address, sell_amount,
-            is_eth_input=False, slippage=slippage
-        )
+        v2_router_addr = get_v2_router(chain)
+        if v2_router_addr and Web3.is_address(v2_router_addr):
+            if not await ensure_token_approval(chain, token_address, v2_router_addr, sell_amount):
+                logger.error(f"V2 router approval failed for {chain} {token_address[:10]}...")
+                tx_hash2 = f"Approval to the {chain} V2 router did not land (STF risk)"
+                success2, weth_received2 = False, 0
+            else:
+                success2, tx_hash2, weth_received2 = await try_v2_swap(
+                    w3, chain, token_address, weth_address, sell_amount,
+                    is_eth_input=False, slippage=slippage
+                )
+        else:
+            success2, tx_hash2, weth_received2 = False, f"No V2 router configured for {chain}", 0
         if success2:
             native_received = w3.from_wei(weth_received2, 'ether') if weth_received2 > 0 else 0
             logger.info(f"V2 Sell confirmed: {percentage}% sold, received {native_received} W{NATIVE_SYMBOL[chain]}")
             return True, tx_hash2, float(native_received)
         if V4_TRADING:
             logger.info(f"V2 sell failed, trying V4 fallback for {chain} {token_address[:10]}...")
+            # Fetch price_native for V4 sell quote calculation
+            price_native = await get_token_price_native(None, chain, token_address)
             success4, tx_hash4, weth_received4 = await try_v4_swap(
                 w3, chain, token_address, sell_amount,
-                is_eth_input=False, slippage=slippage,
+                is_eth_input=False, slippage=slippage, price_native=price_native,
             )
             if success4:
                 native_received = w3.from_wei(weth_received4, 'ether') if weth_received4 > 0 else 0
@@ -4374,9 +4429,10 @@ async def monitor_positions(session):
                         if actual_sell > 0:
                             success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], actual_sell)
                             if not success:
-                                logger.error(f"take-profit sell FAILED for {pos['id']}: {tx_hash}")
+                                logger.error(f"take-profit sell FAILED for {pos['id']} ({pos.get('symbol')} on {pos['chain']}): {tx_hash}")
                                 await _notify_positions_problem(
                                     pos, "Take profit could not sell", str(tx_hash))
+                                # Don't mark as executed if sell failed - will retry next cycle
                             if success:
                                 level['executed'] = True
                                 db_reduce_position(pos['id'], actual_sell, pnl_pct, tx_hash)
@@ -4398,7 +4454,7 @@ async def monitor_positions(session):
                 if drop_from_peak >= trailing_stop and pos['remaining_pct'] > 0:
                     success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], 100.0)
                     if not success:
-                        logger.error(f"trailing stop sell FAILED for {pos['id']}: {tx_hash}")
+                        logger.error(f"trailing stop sell FAILED for {pos['id']} ({pos.get('symbol')} on {pos['chain']}): {tx_hash}")
                         await _notify_positions_problem(
                             pos, "Trailing stop could not sell", str(tx_hash))
                     if success:
@@ -5470,7 +5526,7 @@ async def send_alert(alert):
             f"  Sell Tax: {sell_tax:.1f}%\n"
         )
 
-    age_display = f"{alert['age_minutes']:.0f}" if alert.get("age_minutes") is not None else "?"
+    age_display = format_age(alert.get("age_minutes"))
 
     # ── Route honesty ────────────────────────────────────────────────────────
     # A pool on a DEX we hold no router for (Uniswap V4, a V3 fork, Pons,
@@ -5504,9 +5560,9 @@ async def send_alert(alert):
     fs_ts = alert.get("first_sight_ts")
     first_text = ""
     if fs_mcap:
-        mins = (time.time() - fs_ts) / 60.0 if fs_ts else None
+        ago_secs = (time.time() - fs_ts) if fs_ts else None
         mult = (alert["market_cap"] / fs_mcap) if fs_mcap else 0
-        ago = f"{mins:.0f}m ago" if mins is not None else "earlier"
+        ago = f"{format_age(age_seconds=ago_secs)} ago" if ago_secs is not None else "earlier"
         first_text = (
             f"👀 <b>First seen:</b> {ago} at ${fs_mcap:,.0f} mcap "
             f"-> now ${alert['market_cap']:,.0f} ({mult:.1f}x)\n\n"
@@ -5515,7 +5571,7 @@ async def send_alert(alert):
         f"🚨 <b>ONCHAIN PUMP — Score {alert['total_score']:.0f}/100</b>\n\n"
         f"<b>{esc(alert['name'])}</b> ({esc(alert['symbol'])})\n"
         f"🔗 Chain: <b>{alert['chain'].upper()}</b>\n"
-        f"🕒 Age: <b>{age_display} min</b>\n\n"
+        f"🕒 Age: <b>{age_display}</b>\n\n"
         f"{surge_text}"
         f"{first_text}"
         f"{route_text}"
