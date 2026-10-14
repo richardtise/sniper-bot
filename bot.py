@@ -1445,9 +1445,14 @@ def ensure_position_columns(conn: sqlite3.Connection):
     has been running since before a column existed would never gain it.
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
-    for name, coltype in (("entry_mcap", "REAL"),):
+    for name, coltype in (("entry_mcap", "REAL"), ("remaining_tokens", "REAL")):
         if name not in existing:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {coltype}")
+    # Backfill: rows from before absolute tracking have remaining_pct only.
+    conn.execute(
+        "UPDATE positions SET remaining_tokens = amount_tokens * remaining_pct / 100.0 "
+        "WHERE remaining_tokens IS NULL"
+    )
     conn.commit()
 
 
@@ -1467,7 +1472,7 @@ def init_db() -> sqlite3.Connection:
             chain TEXT NOT NULL, token_address TEXT NOT NULL, symbol TEXT,
             entry_price REAL, highest_price REAL,
             amount_tokens REAL, amount_native REAL,
-            remaining_pct REAL DEFAULT 100.0,
+            remaining_pct REAL DEFAULT 100.0, remaining_tokens REAL,
             trailing_stop_pct REAL, take_profit_levels TEXT,
             status TEXT DEFAULT 'open', entry_time REAL, close_time REAL,
             pnl_pct REAL, tx_hash_buy TEXT, tx_hash_sell TEXT, paper_trade INTEGER DEFAULT 0,
@@ -1671,11 +1676,11 @@ def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, am
     try:
         db_conn.execute(
             "INSERT INTO positions (chain, token_address, symbol, entry_price, highest_price, "
-            "amount_tokens, amount_native, remaining_pct, trailing_stop_pct, take_profit_levels, "
+            "amount_tokens, amount_native, remaining_pct, remaining_tokens, trailing_stop_pct, take_profit_levels, "
             "status, entry_time, tx_hash_buy, paper_trade, entry_mcap) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (chain, token_address, symbol, entry_price, entry_price, amount_tokens, amount_native,
-             100.0, trailing_stop, json.dumps(tp_levels), "open", time.time(), tx_hash, paper,
+             100.0, amount_tokens, trailing_stop, json.dumps(tp_levels), "open", time.time(), tx_hash, paper,
              entry_mcap)
         )
         db_conn.commit()
@@ -1687,7 +1692,7 @@ def db_add_position(chain, token_address, symbol, entry_price, amount_tokens, am
 def db_get_open_positions():
     cur = db_conn.execute(
         "SELECT id, chain, token_address, symbol, entry_price, highest_price, amount_tokens, "
-        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
+        "remaining_pct, remaining_tokens, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
         "FROM positions WHERE status='open' ORDER BY entry_time DESC"
     )
     cols = [c[0] for c in cur.description]
@@ -1696,7 +1701,7 @@ def db_get_open_positions():
 def db_get_position(pos_id):
     cur = db_conn.execute(
         "SELECT id, chain, token_address, symbol, entry_price, highest_price, amount_tokens, "
-        "remaining_pct, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
+        "remaining_pct, remaining_tokens, trailing_stop_pct, take_profit_levels, paper_trade, entry_mcap "
         "FROM positions WHERE id=?", (pos_id,)
     )
     cols = [c[0] for c in cur.description]
@@ -1710,22 +1715,38 @@ def db_update_position_price(pos_id, current_price, highest_price):
     )
     db_conn.commit()
 
-def db_reduce_position(pos_id, sell_pct, pnl_pct, tx_hash):
-    cur = db_conn.execute("SELECT remaining_pct FROM positions WHERE id=?", (pos_id,))
+def db_reduce_position(pos_id, tokens_sold, pnl_pct, tx_hash):
+    """Record a sell by ABSOLUTE token amount; derive the percentage from it.
+
+    Percent-of-remaining bookkeeping ("subtract 25 from remaining_pct") desynced
+    from the wallet the moment two positions shared one token: a 100% sell of
+    one dumped both. Absolute amounts keep every row anchored to real tokens.
+    Returns the new remaining token count.
+    """
+    cur = db_conn.execute(
+        "SELECT remaining_tokens, amount_tokens FROM positions WHERE id=?", (pos_id,))
     row = cur.fetchone()
     if not row:
-        return
-    new_remaining = max(0, row[0] - sell_pct)
-    status = "closed" if new_remaining <= 0 else "open"
+        return 0.0
+    remaining_tokens = float(row[0] or 0.0)
+    amount_tokens = float(row[1] or 0.0)
+    new_remaining_tokens = max(0.0, remaining_tokens - float(tokens_sold))
+    # Treat dust (<0.1% of the original buy) as closed.
+    dust = amount_tokens * 0.001
+    if new_remaining_tokens <= dust:
+        new_remaining_tokens = 0.0
+    new_remaining_pct = (100.0 * new_remaining_tokens / amount_tokens) if amount_tokens > 0 else 0.0
+    status = "closed" if new_remaining_tokens <= 0 else "open"
     db_conn.execute(
-        "UPDATE positions SET remaining_pct=?, status=?, pnl_pct=?, tx_hash_sell=? WHERE id=?",
-        (new_remaining, status, pnl_pct, tx_hash, pos_id)
+        "UPDATE positions SET remaining_tokens=?, remaining_pct=?, status=?, pnl_pct=?, tx_hash_sell=? WHERE id=?",
+        (new_remaining_tokens, new_remaining_pct, status, pnl_pct, tx_hash, pos_id)
     )
     db_conn.commit()
+    return new_remaining_tokens
 
 def db_close_position(pos_id, pnl_pct, tx_hash):
     db_conn.execute(
-        "UPDATE positions SET status='closed', remaining_pct=0, close_time=?, pnl_pct=?, tx_hash_sell=? WHERE id=?",
+        "UPDATE positions SET status='closed', remaining_pct=0, remaining_tokens=0, close_time=?, pnl_pct=?, tx_hash_sell=? WHERE id=?",
         (time.time(), pnl_pct, tx_hash, pos_id)
     )
     db_conn.commit()
@@ -4104,26 +4125,38 @@ async def execute_buy(chain: str, token_address: str, amount_native: float, slip
             return False, f"V3: {tx_hash} | V2: {tx_hash2} | V4: {tx_hash4}", 0.0
         return False, f"V3: {tx_hash} | V2: {tx_hash2}", 0.0
 
-async def execute_sell(chain: str, token_address: str, percentage: float = 100.0, slippage: float = None):
+async def execute_sell(chain: str, token_address: str, percentage: float = 100.0,
+                       slippage: float = None, amount_tokens: float = None):
+    """Sell tokens. ``amount_tokens`` is the preferred, position-accurate form.
+
+    Percentage mode is kept only as a legacy fallback; it sizes off the raw
+    wallet balance, which is WRONG when two positions share one token (closing
+    one at "100%" used to dump both). Position-aware callers pass the exact
+    number of tokens their row owns.
+    """
     if slippage is None:
         slippage = float(db_get_setting("slippage", DEFAULT_SLIPPAGE))
     # Paper mode first so it works with no web3/wallet.
     if PAPER_TRADING:
         # Value the sold tokens at the live native price so paper P&L is no
         # longer fiction (issue 4.16).
-        pos_row = db_conn.execute(
-            "SELECT amount_tokens FROM positions WHERE chain=? AND token_address=? "
-            "AND status='open' ORDER BY entry_time DESC LIMIT 1",
-            (chain, token_address),
-        ).fetchone()
+        tokens_sold = float(amount_tokens or 0.0)
+        if tokens_sold <= 0:
+            # Legacy percentage fallback: size off the newest open position.
+            pos_row = db_conn.execute(
+                "SELECT amount_tokens FROM positions WHERE chain=? AND token_address=? "
+                "AND status='open' ORDER BY entry_time DESC LIMIT 1",
+                (chain, token_address),
+            ).fetchone()
+            if pos_row and pos_row[0]:
+                tokens_sold = float(pos_row[0]) * (percentage / 100.0)
         native_received = 0.0
-        if pos_row and pos_row[0]:
-            tokens_sold = float(pos_row[0]) * (percentage / 100.0)
+        if tokens_sold > 0:
             price_native = await get_token_price_native(None, chain, token_address)
             if price_native > 0:
                 native_received = tokens_sold * price_native * (1 - PAPER_FEE_PCT / 100.0)
         db_log_paper_trade(chain, token_address, "???", "SELL", native_received, 0.0, 0.0)
-        logger.info(f"PAPER SELL: {percentage}% on {chain} -> ~{native_received:.6f} {NATIVE_SYMBOL[chain]}")
+        logger.info(f"PAPER SELL: {tokens_sold:.4f} tokens on {chain} -> ~{native_received:.6f} {NATIVE_SYMBOL[chain]}")
         return True, "PAPER_TRADE", float(native_received)
     w3 = w3_instances.get(chain)
     router_addr = get_router_v3(chain)
@@ -4141,7 +4174,17 @@ async def execute_sell(chain: str, token_address: str, percentage: float = 100.0
     except Exception as e:
         return False, f"Balance check failed: {e}", 0.0
     if bal == 0: return False, "Zero balance", 0.0
-    sell_amount = int(bal * (percentage / 100))
+    if amount_tokens is not None and amount_tokens > 0:
+        sell_amount = int(float(amount_tokens) * (10 ** decimals))
+        if sell_amount > bal:
+            # The position row claims more tokens than the wallet holds
+            # (manual transfer-out, or a stale row). Sell what exists.
+            logger.warning(
+                f"Position says {amount_tokens} {token_address[:10]}... but wallet holds "
+                f"{bal / (10 ** decimals)} — selling wallet balance instead")
+            sell_amount = bal
+    else:
+        sell_amount = int(bal * (percentage / 100))
     if sell_amount == 0: return False, "Sell amount too small", 0.0
     if not await ensure_token_approval(chain, token_address, router_addr, sell_amount):
         # Stop here: without an allowance the router can only revert with STF,
@@ -4237,23 +4280,46 @@ async def open_position(chain, token_address, symbol, amount_native, price_usd,
     )
     return pos_id
 
+def _position_remaining_tokens(pos_or_row) -> float:
+    """Absolute tokens a position still owns (pre-migration rows fall back to pct)."""
+    if isinstance(pos_or_row, dict):
+        rt = pos_or_row.get("remaining_tokens")
+        if rt is not None:
+            return float(rt)
+        amt = float(pos_or_row.get("amount_tokens") or 0)
+        return amt * float(pos_or_row.get("remaining_pct") or 0) / 100.0
+    return 0.0
+
+
 async def close_position_manual(pos_id: int):
     cur = db_conn.execute(
-        "SELECT chain, token_address, symbol, remaining_pct FROM positions WHERE id=?",
+        "SELECT chain, token_address, symbol, remaining_pct, remaining_tokens, "
+        "entry_price, paper_trade FROM positions WHERE id=?",
         (pos_id,)
     )
     row = cur.fetchone()
     if not row: return False, "Position not found"
-    chain, token_address, symbol, remaining_pct = row
+    chain, token_address, symbol, remaining_pct, remaining_tokens, entry_price, paper = row
     if remaining_pct <= 0: return False, "Position already closed"
-    success, tx_hash, native_received = await execute_sell(chain, token_address, 100.0)
+    # Sell only what THIS position owns — not the whole wallet balance, which
+    # is how a 100%-close of a duplicate position used to dump the other one.
+    tokens_to_sell = float(remaining_tokens or 0.0)
+    if tokens_to_sell <= 0:
+        amt_row = db_conn.execute(
+            "SELECT amount_tokens FROM positions WHERE id=?", (pos_id,)).fetchone()
+        tokens_to_sell = float(amt_row[0] or 0.0) * remaining_pct / 100.0
+    success, tx_hash, native_received = await execute_sell(
+        chain, token_address, 100.0, amount_tokens=tokens_to_sell)
     if not success: return False, f"Sell failed: {tx_hash}"
-    db_close_position(pos_id, 0.0, tx_hash)
-    mode = "📄 PAPER" if PAPER_TRADING else "💰 LIVE"
+    current_price = await get_token_price_usd(None, chain, token_address)
+    pnl = ((current_price - entry_price) / entry_price * 100) if entry_price and current_price > 0 else 0.0
+    db_close_position(pos_id, pnl, tx_hash)
+    mode = "📄 PAPER" if (PAPER_TRADING or paper) else "💰 LIVE"
     await tg_send(
         f"{mode} <b>Position Closed</b>\n"
         f"{esc(symbol)} on {chain.upper()}\n"
-        f"Sold: {remaining_pct:.1f}%\n"
+        f"Sold: {remaining_pct:.1f}% ({tokens_to_sell:,.2f} tokens)\n"
+        f"P&L: {pnl:+.1f}%\n"
         f"Received: {native_received:.4f} W{NATIVE_SYMBOL[chain]}\n"
         f"Tx: <code>{esc(tx_hash)}</code>",
         parse_mode=ParseMode.HTML,
@@ -4265,16 +4331,22 @@ async def sell_position_pct(pos_id: int, pct: float):
     if not pos: return False, "Position not found"
     if pos['remaining_pct'] <= 0: return False, "Already closed"
     actual_pct = min(pct, pos['remaining_pct'])
-    success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], actual_pct)
+    remaining_tokens = _position_remaining_tokens(pos)
+    tokens_to_sell = remaining_tokens * (pct / 100.0)  # pct of what THIS position holds
+    if tokens_to_sell <= 0: return False, "Nothing left to sell"
+    success, tx_hash, native_received = await execute_sell(
+        pos['chain'], pos['token_address'], actual_pct, amount_tokens=tokens_to_sell)
     if not success: return False, f"Sell failed: {tx_hash}"
     entry = pos['entry_price']
     current_price = await get_token_price_usd(None, pos['chain'], pos['token_address'])
     pnl = ((current_price - entry) / entry * 100) if entry > 0 and current_price > 0 else 0
-    db_reduce_position(pos_id, actual_pct, pnl, tx_hash)
+    new_remaining_tokens = db_reduce_position(pos_id, tokens_to_sell, pnl, tx_hash)
+    new_remaining_pct = (100.0 * new_remaining_tokens / pos['amount_tokens']) if pos['amount_tokens'] else 0.0
     mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
     await tg_send(
-        f"{mode} <b>Sold {actual_pct:.0f}% of {esc(pos['symbol'])}</b>\n"
-        f"Remaining: {pos['remaining_pct'] - actual_pct:.1f}%\n"
+        f"{mode} <b>Sold {pct:.0f}% of {esc(pos['symbol'])}</b>\n"
+        f"Remaining: {new_remaining_pct:.1f}% ({new_remaining_tokens:,.2f} tokens)\n"
+        f"P&L: {pnl:+.1f}%\n"
         f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
         f"Tx: <code>{esc(tx_hash)}</code>",
         parse_mode=ParseMode.HTML,
@@ -4391,6 +4463,18 @@ async def monitor_positions(session):
     while not shutdown_flag:
         try:
             positions = db_get_open_positions()
+            # Prune bookkeeping for positions that no longer exist, so these
+            # dicts cannot grow unbounded over a long deployment.
+            open_ids = {p['id'] for p in positions}
+            for key in list(_sell_alert_sent):
+                try:
+                    if int(key.split(":", 1)[0]) not in open_ids:
+                        _sell_alert_sent.pop(key, None)
+                except (ValueError, IndexError):
+                    _sell_alert_sent.pop(key, None)
+            for pid in list(_no_price_strikes):
+                if pid not in open_ids:
+                    _no_price_strikes.pop(pid, None)
             for pos in positions:
                 current_price = await get_token_price_usd(session, pos['chain'], pos['token_address'])
                 if current_price <= 0:
@@ -4419,23 +4503,35 @@ async def monitor_positions(session):
                 drop_from_peak = ((highest_price - current_price) / highest_price) * 100 if highest_price > 0 else 0
                 trailing_stop = trailing_stop_pct_for(pos)
                 tp_levels = json.loads(pos['take_profit_levels'])
+                remaining_tokens = _position_remaining_tokens(pos)
                 tp_triggered = False
+                tp_failed = False
                 for level in tp_levels:
                     if level.get('executed'): continue
                     if pnl_pct >= level['pct']:
                         sell_pct = level['sell_pct']
-                        remaining = pos['remaining_pct']
-                        actual_sell = min(sell_pct, remaining)
-                        if actual_sell > 0:
-                            success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], actual_sell)
+                        # TP sell_pct is a share of the ORIGINAL position
+                        # (25/25/50 sums to 100), clipped to what is left.
+                        tokens_to_sell = min(
+                            float(pos['amount_tokens'] or 0.0) * sell_pct / 100.0,
+                            remaining_tokens)
+                        if tokens_to_sell > 0:
+                            success, tx_hash, native_received = await execute_sell(
+                                pos['chain'], pos['token_address'],
+                                100.0 * (tokens_to_sell / remaining_tokens) if remaining_tokens > 0 else 100.0,
+                                amount_tokens=tokens_to_sell)
                             if not success:
                                 logger.error(f"take-profit sell FAILED for {pos['id']} ({pos.get('symbol')} on {pos['chain']}): {tx_hash}")
                                 await _notify_positions_problem(
                                     pos, "Take profit could not sell", str(tx_hash))
-                                # Don't mark as executed if sell failed - will retry next cycle
+                                # Don't mark as executed, and DON'T fall through
+                                # to the trailing-stop check this cycle — one
+                                # failed sell followed immediately by a 100%
+                                # sell just burns gas twice.
+                                tp_failed = True
                             if success:
                                 level['executed'] = True
-                                db_reduce_position(pos['id'], actual_sell, pnl_pct, tx_hash)
+                                left = db_reduce_position(pos['id'], tokens_to_sell, pnl_pct, tx_hash)
                                 db_conn.execute("UPDATE positions SET take_profit_levels=? WHERE id=?", (json.dumps(tp_levels), pos['id']))
                                 db_conn.commit()
                                 mode = "📄 PAPER" if pos['paper_trade'] else "💰 LIVE"
@@ -4443,16 +4539,19 @@ async def monitor_positions(session):
                                     f"🎯 {mode} <b>Take Profit Hit!</b>\n"
                                     f"{esc(pos['symbol'])} on {pos['chain'].upper()}\n"
                                     f"P&L: +{pnl_pct:.1f}%\n"
-                                    f"Sold: {actual_sell:.1f}%\n"
+                                    f"Sold: {tokens_to_sell:,.2f} tokens ({sell_pct:.0f}% of entry)\n"
+                                    f"Remaining: {left:,.2f} tokens\n"
                                     f"Received: {native_received:.4f} W{NATIVE_SYMBOL[pos['chain']]}\n"
                                     f"Tx: <code>{esc(tx_hash)}</code>",
                                     parse_mode=ParseMode.HTML,
                                 )
                                 tp_triggered = True
                                 break
-                if tp_triggered: continue
-                if drop_from_peak >= trailing_stop and pos['remaining_pct'] > 0:
-                    success, tx_hash, native_received = await execute_sell(pos['chain'], pos['token_address'], 100.0)
+                if tp_triggered or tp_failed: continue
+                if drop_from_peak >= trailing_stop and pos['remaining_pct'] > 0 and remaining_tokens > 0:
+                    success, tx_hash, native_received = await execute_sell(
+                        pos['chain'], pos['token_address'], 100.0,
+                        amount_tokens=remaining_tokens)
                     if not success:
                         logger.error(f"trailing stop sell FAILED for {pos['id']} ({pos.get('symbol')} on {pos['chain']}): {tx_hash}")
                         await _notify_positions_problem(
