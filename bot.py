@@ -905,8 +905,16 @@ async def v4_hook_verdict(chain: str, hooks: str, force: bool = False) -> dict:
         _v4_hook_cache_put(cache_key, res)
         return res
 
-    denom = raw.get("BPS_DENOMINATOR") or 10000
-    tax_pct = (raw["taxBps"] / denom * 100.0) if denom else None
+    denom = raw.get("BPS_DENOMINATOR")
+    if not denom:
+        # The hook declares a tax getter but no usable denominator: we cannot
+        # compute its rate, and a hook whose tax cannot be computed can skim
+        # via swap deltas we cannot see. Fail closed, same as no_tax_getter.
+        res = {**verdict, "safe": False, "unknown": True, "inspected": True,
+               "reason": "hook_bad_denominator"}
+        _v4_hook_cache_put(cache_key, res)
+        return res
+    tax_pct = raw["taxBps"] / denom * 100.0
     tax_ccy = raw.get("taxCurrency")
     res = {
         "safe": True, "reason": "hook_tax_within_limit", "tax_pct": tax_pct,
@@ -3619,6 +3627,23 @@ async def evaluate_token(session, pair):
     if total_score < threshold and not early_ok and not surge_ok:
         return reject("below_threshold")
 
+    # Surface a V4 hook tax in the alert itself. The trade paths already refuse
+    # these pools (v4_quote_min_out / try_v4_swap), but without the flag here
+    # the alert still shows a buy button that can only fail at execution — the
+    # AXIS case looked like an ordinary 100/100 alert. Runs only for alerts, so
+    # the extra on-chain read is not paid per candidate.
+    v4_guard_reason = None
+    v4_hook_tax = 0.0
+    if V4_TRADING and get_universal_router(chain) and re.search(r"uniswap", dex_id):
+        try:
+            guard = await v4_route_guard(chain, token)
+            v4_guard_reason = guard["reason"]
+            v4_hook_tax = float(guard["tax_pct"] or 0.0)
+            if v4_guard_reason:
+                logger.warning(f"Alert on guarded V4 pool {symbol}@{chain}: {v4_guard_reason}")
+        except Exception as e:
+            logger.warning(f"V4 hook guard in alert path failed for {symbol}@{chain}: {e}")
+
     return finish(None, {
         "chain": chain, "token_address": token, "symbol": symbol, "name": name,
         "pair_address": pair_id, "total_score": total_score,
@@ -3643,6 +3668,8 @@ async def evaluate_token(session, pair):
         "signal_bonus": verdict.bonus if verdict else 0.0,
         "signal_penalty": verdict.penalty if verdict else 0.0,
         "signal_notes": verdict.notes if verdict else [],
+        "v4_route_reason": v4_guard_reason,
+        "v4_hook_tax_pct": v4_hook_tax,
     })
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6012,7 +6039,21 @@ async def send_alert(alert):
     # buttons, is strictly better than offering buttons that fail at quote time.
     venue_ok = alert.get("venue_tradeable")
     dex_display = esc(alert.get("dex_id") or "unknown")
-    if venue_ok is False:
+    v4_reason = alert.get("v4_route_reason")
+    if v4_reason:
+        # Hook-tax trap: the pool's hook skims the swap OUTSIDE the AMM price,
+        # so every price feed and every security scanner shows it clean while
+        # the exit returns dust (the AXIS/ETH case, 99.99%). The buy buttons
+        # would only be refused at execution — withhold them here instead.
+        hook_tax = alert.get("v4_hook_tax_pct") or 0.0
+        route_text = (
+            f"🪝 <b>V4 HOOK TRAP — do not buy.</b>\n"
+            f"  <code>{esc(v4_reason)}</code>\n"
+            + (f"  Hook tax: <b>{hook_tax:.2f}%</b> of every swap\n" if hook_tax else "")
+            + f"  <i>Security scans and price feeds cannot see this: the skim\n"
+            f"  happens in the pool's hook, not in the token. Buttons withheld.</i>\n\n"
+        )
+    elif venue_ok is False:
         untradeable_alerts += 1
         needs = esc(alert.get("venue_requirement") or "unknown")
         route_text = (
@@ -6072,7 +6113,7 @@ async def send_alert(alert):
         + f"📝 <b>Contract:</b> <code>{esc(alert['token_address'])}</code>"
     )
 
-    if venue_ok is False:
+    if venue_ok is False or v4_reason:
         keyboard = build_no_route_keyboard(alert['chain'], alert['token_address'])
     else:
         keyboard = build_alert_keyboard(
